@@ -1,0 +1,17 @@
+[package]
+name = "p0-1-relay-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+publish = false
+
+[dependencies]
+iroh = "1.4.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
+anyhow = "1"
+# 可选诊断日志：仅在设置 RUST_LOG 时生效，用于定位 endpoint 上线卡在哪一步。
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+debug = 1

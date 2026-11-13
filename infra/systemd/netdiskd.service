@@ -1,0 +1,45 @@
+[Unit]
+Description=Personal netdisk daemon (iroh-based)
+Documentation=file:///mnt/datadisk/netdisk/code/docs/RUNNING.md
+After=network-online.target
+Wants=network-online.target
+# 关键：等数据盘挂载完成再启动。否则 systemd 会在系统盘上创建同名目录并往里写，
+# 看起来「正常」，实际数据全落在系统盘。
+RequiresMountsFor=/mnt/datadisk/netdisk
+
+[Service]
+Type=simple
+User=yuan
+Group=yuan
+WorkingDirectory=/mnt/datadisk/netdisk/code
+
+# 凭据放独立文件（0600、属主 yuan），不要写进 unit 或仓库。
+EnvironmentFile=/etc/netdisk/netdiskd.env
+# 软链到实际构建产物（build/target/debug/netdiskd）；换 release 只改软链，不用改 unit。
+ExecStart=/mnt/datadisk/netdisk/bin/netdiskd
+
+# R15：这台机器 ~/.bashrc 里的代理指向未运行的 127.0.0.1:7897，
+# 若被 HTTP 客户端读到会拖垮出站连接，必须显式清掉。
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+Environment=NO_PROXY=*
+Environment=no_proxy=*
+
+# 应用日志直接写数据盘，不经过 journald（系统盘）。
+# 注意：append: 模式不会自动轮转，需要 logrotate 或定期清理（见 docs/RUNNING.md）。
+StandardOutput=append:/mnt/datadisk/netdisk/logs/netdiskd.log
+StandardError=append:/mnt/datadisk/netdisk/logs/netdiskd.log
+
+# 进程异常退出后自动拉起。
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+# 系统盘只保护，不放任何可写数据。
+ProtectSystem=strict
+# 二进制、源码、数据都在 /mnt/datadisk，进程不需要访问 /home。
+ProtectHome=true
+ReadWritePaths=/mnt/datadisk/netdisk/data /mnt/datadisk/netdisk/secret /mnt/datadisk/netdisk/logs
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

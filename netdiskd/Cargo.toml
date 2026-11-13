@@ -1,0 +1,13 @@
+[package]
+name = "netdiskd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Personal netdisk daemon running on the home Linux server"
+
+[dependencies]
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+netdisk-core.workspace = true

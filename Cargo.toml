@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["netdisk-core", "netdiskd", "netdisk-cli", "netdisk-ffi"]
+# P0-1 的验证示例是独立 workspace，不要被根 workspace 自动纳入。
+exclude = ["tools/poc/p0-1"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+iroh = "1.4.1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+blake3 = "1"
+netdisk-core = { path = "netdisk-core" }

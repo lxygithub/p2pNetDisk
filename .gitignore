@@ -1,0 +1,41 @@
+# --- Rust ---
+/target
+**/target
+
+# --- 凭据与本地配置（绝不入库）---
+*.log
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+key.properties
+*.jks
+*.keystore
+
+# --- 运行时数据 ---
+data/
+!data/.gitkeep
+.DS_Store
+
+# --- Flutter 本地产物 ---
+app/.dart_tool/
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/android/.gradle/
+app/android/.kotlin/
+# 含本机 SDK 路径（sdk.dir / flutter.sdk），每个环境不同
+app/android/local.properties
+
+# --- Rust 交叉编译出的 Android 动态库（由 tools/build-android-ffi.sh 生成）---
+app/android/app/src/main/jniLibs/**/*.so
+!app/android/app/src/main/jniLibs/**/.gitkeep
+
+# --- IDE ---
+.idea/
+*.iml
+.vscode/
+
+# --- WorkBuddy 工作区数据（不是源码）---
+.workbuddy/

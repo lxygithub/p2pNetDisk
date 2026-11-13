@@ -1,0 +1,17 @@
+[package]
+name = "netdisk-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "C ABI dynamic library consumed by the Flutter client via dart:ffi"
+
+[lib]
+name = "netdisk_ffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+netdisk-core.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "netdisk-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Minimal CLI client used to validate the netdisk end-to-end loop"
+
+[dependencies]
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+netdisk-core.workspace = true

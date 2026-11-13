@@ -1,0 +1,75 @@
+# iroh-relay 配置模板（P0-pre）
+#
+# 用法：复制为 /etc/iroh/relay.toml，替换 relay.example.com / 邮箱 / <RELAY_TOKEN>，
+#       权限设为 0600，属主 iroh-relay:iroh-relay。
+# 启动：iroh-relay --config-path /etc/iroh/relay.toml
+#
+# 字段名与取值来自 iroh-relay/src/main.rs 的 Config / TlsConfig / Limits / AccessConfig，
+# 端口默认值来自 iroh-relay/src/defaults.rs。请勿照抄上游 docker/README.md 的字段名。
+#
+# 重要：Config::load() 在 --config-path 指向的文件不存在时会【静默回退默认配置】
+#       （plain HTTP :80、无 TLS、access = everyone），不会报错。
+#       配套的 systemd unit 用 AssertPathExists 兜住这个坑，部署后仍须核对启动日志。
+
+# --- 访问控制 ---------------------------------------------------------------
+# 必须放在任何 [table] 之前，否则会被解析进上一个表。
+# 也可写 access = "everyone"（默认值，生产禁用）、access.allowlist = ["<endpoint-id>"]、
+# access.denylist = [...]、access.http.url = "https://..."。
+# 注意：环境变量 IROH_RELAY_ACCESS_TOKEN 会用【单个 token 覆盖】下面整个列表。
+access.shared_token = ["<RELAY_TOKEN>"]
+
+# --- 顶层 -------------------------------------------------------------------
+enable_relay = true
+# HTTP 服务：ACME HTTP-01 挑战 + captive portal。TLS 启用后主服务跑到 443。
+http_bind_addr = "[::]:80"
+
+# 开启 QUIC 地址发现（相当于 STUN），必须同时配置 [tls]，否则启动报错。
+enable_quic_addr_discovery = true
+
+# metrics 默认开启，但务必只绑本机 / 内网，不要对公网开放。
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+
+# 默认 key cache 容量 1024*1024（约 56 MB），1C1G 机器够用，一般无需调整。
+# key_cache_capacity = 1048576
+
+# --- TLS --------------------------------------------------------------------
+[tls]
+# 必须与客户端 RelayUrl 完全一致，例如 https://relay.example.com
+hostname = "relay.example.com"
+
+# 大小写敏感：Manual / LetsEncrypt / Reloading
+# 内置 LetsEncrypt 使用 TLS-ALPN-01，必须独占 443 端口。
+# 若 443 已被 nginx 占用（本项目实际情况），改用 certbot --webroot (HTTP-01) 签发，
+# 并改成 cert_mode = "Manual"；证书放在 cert_dir/default.crt 与 default.key，
+# 属主必须是运行 iroh-relay 的非 root 用户。
+cert_mode = "LetsEncrypt"
+
+# LetsEncrypt 需要 hostname 与 contact；prod_tls = true 用生产 CA（默认 true）。
+contact = "ops@example.com"
+prod_tls = true
+
+# 证书存放目录，必须对运行用户可写（systemd unit 里用 StateDirectory + ReadWritePaths 放行）。
+cert_dir = "/var/lib/iroh-relay/certs"
+
+https_bind_addr = "[::]:443"
+quic_bind_addr = "[::]:7842"
+
+# Manual 模式改用以下两项（默认 <cert_dir>/default.crt 与 default.key）：
+# manual_cert_path = "/etc/iroh/cert.pem"
+# manual_key_path = "/etc/iroh/cert.key.pem"
+
+# 仅由 --dev 内部使用，不要手动设置。
+# dangerous_http_only = false
+
+# --- 限速 -------------------------------------------------------------------
+[limits]
+# 每秒接受的新连接数与突发值，不设则不限。按需开启：
+# accept_conn_limit = 50.0
+# accept_conn_burst = 100
+
+[limits.client.rx]
+# 单客户端上行速率，非零 u32。relay 流量双向计费，建议按 VPS 流量包定档。
+bytes_per_second = 2000000
+# 设置了 max_burst_bytes 就必须有 bytes_per_second，两者都须为非零 u32。
+max_burst_bytes = 4000000

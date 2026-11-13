@@ -1,0 +1,345 @@
+# Flutter 客户端（v0.1）
+
+> 目标：Android 优先、后续扩展其它端；Rust 侧能力统一由 `netdisk-core` 提供，Flutter 只通过 `dart:ffi` 调用 `netdisk-ffi` 导出的 C ABI。
+
+## 1. 当前状态（2026-11-13）
+
+| 项 | 状态 |
+| --- | --- |
+| Flutter 项目骨架（`app/`，android + windows） | ✅ 已创建，50 个文件 |
+| Rust `cdylib`（`netdisk_ffi.dll`） | ✅ 已编译 |
+| Dart FFI 绑定（`app/lib/src/netdisk_ffi.dart`） | ✅ 完成 |
+| 最小 UI：配置 / 连接 / 文件列表 / 上传 / 下载（`app/lib/main.dart`） | ✅ 完成 |
+| `flutter analyze` | ✅ **No issues found** |
+| 纯 Dart 冒烟测试 `ping / list / put / get` | ✅ **全 PASS**，跨 VPS relay 连家用服务器常驻服务 |
+| Gradle 依赖下载 | ✅ 已修：wrapper 换腾讯云镜像 + `systemProp.*` 走 Clash（§3.1） |
+| Android `.so`（arm64-v8a） | ✅ `cargo-ndk` 交叉编译，已打进 APK |
+| Android 真机 / 模拟器 | ✅ UI 启动、`netdisk_init` 成功（界面显示「已连接」） |
+| FFI 执行位置 | ✅ 已改为常驻后台 isolate（`netdisk_worker.dart`）；此前在 UI isolate 同步调用导致 **ANR**，见 §4.1 |
+| **Android `list`（真机）** | ✅ **已拿到文件列表**：n0 官方 relay（自动选中 `aps1-1`）+ 后台 isolate，一次成功 |
+| **上传 / 下载（UI）** | ✅ 已实现：`file_picker` 多选上传、列表项下载到 App 文档目录；待真机验证（§4.3） |
+| **传输路径显示** | ✅ 标题栏 Chip 显示「直连 · 5 ms」/「中继 · 1.2 s」，数据来自 `netdisk_paths()` |
+| **长连接复用** | ✅ FFI 侧改为复用一条 QUIC 连接（原来每条命令重连，打洞来不及完成、`paths()` 只能看到 relay） |
+| `.so` 版本防错配 | ✅ `netdisk_ffi_version()` + 连接前校验；旧库会提示「动态库过旧（不支持 n0）」 |
+| Windows 桌面实际构建 / 运行 | ⛔ 本机无 Visual Studio 2022 C++ 工具链 |
+
+冒烟测试实测输出：
+
+```
+ping: {Pong: null}
+put: {Stored: {path: e2e/ffi_smoke.bin, size: 65536, hash: 68d647e6...}}
+get: {Downloaded: {size: 65536, hash: 68d647e6...}}
+list: [(path: e2e/ffi_smoke.bin, size: 65536), (path: e2e/final.bin, ...), ...]
+FFI_SMOKE_OK
+```
+
+上传与下载 BLAKE3 一致、字节逐字节比对通过。测试会在服务端留下 `e2e/ffi_smoke.bin`（MVP 协议还没有删除命令）。
+
+## 2. 目录结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `netdisk-ffi/` | Rust `cdylib`，导出 C ABI；内部用全局 tokio runtime 驱动 iroh |
+| `app/lib/src/netdisk_ffi.dart` | `dart:ffi` 绑定、字符串分配/释放、`Entries` 解析 |
+| `app/lib/src/netdisk_worker.dart` | **常驻后台 isolate**：所有 FFI 调用在这里串行执行，UI 线程不被阻塞 |
+| `app/lib/main.dart` | 最小 Material 3 界面（全异步，带重试进度提示） |
+| `app/tool/ffi_smoke.dart` | 不启 UI、在主 isolate 直接调 C ABI 的底层冒烟测试 |
+| `app/tool/worker_smoke.dart` | 走 `NetdiskWorker` 的冒烟测试 —— 与 App 实际执行路径一致 |
+| `app/windows/CMakeLists.txt` | 构建时把 `netdisk_ffi.dll` 复制到 exe 同目录 |
+| `app/android/app/src/main/jniLibs/arm64-v8a/` | Android `.so` 落地目录（已有 `libnetdisk_ffi.so`，被 `.gitignore` 忽略） |
+| `tools/build-android-ffi.sh` | 交叉编译并放置 `.so` 的脚本 |
+
+## 3. 每次开终端必须先设代理
+
+Flutter 启动时会跑 `git fetch --tags`。当前 shell 被自动注入了 `127.0.0.1:60721`，它会破坏 git pack 传输，导致 `fatal: fetch-pack: invalid index-pack output` 后卡死。**必须显式覆盖为 Clash 的 7897**：
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7897 HTTP_PROXY=http://127.0.0.1:7897 \
+  https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
+  ALL_PROXY=http://127.0.0.1:7897 all_proxy=http://127.0.0.1:7897 \
+  NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1 \
+  FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn \
+  PUB_HOSTED_URL=https://pub.flutter-io.cn \
+  FLUTTER_SUPPRESS_ANALYTICS=true
+```
+
+验证：`flutter --version` 应在数十秒内返回 `Flutter 3.44.2 / Dart 3.12.2`。不要运行 `flutter doctor -v`，它的设备检查会调用 `wmic.exe` / `reg.exe`，在当前沙箱里被安全策略拦截。
+
+### 3.1 Gradle 的代理是独立配置的
+
+`flutter build` 会启动 Gradle（JVM），**它不读 shell 的 `HTTP_PROXY`**，只设环境变量仍会 `java.net.ConnectException: Connection timed out`。已做两处修改：
+
+- `app/android/gradle/wrapper/gradle-wrapper.properties`：发行版换成 `https://mirrors.cloud.tencent.com/gradle/gradle-9.1.0-bin.zip`。官方源会 `307` 跳到 GitHub releases；`-bin` 也比 `-all` 小一半以上（实测 21 秒下载完）；
+- `app/android/gradle.properties`：加 `systemProp.http(s).proxyHost/Port=127.0.0.1/7897` 与 `nonProxyHosts`，让 `google()` / `mavenCentral()` / `gradlePluginPortal()` 走 Clash。端口变了改这四个值即可。
+
+验证：`gradlew --version` 打印 `Gradle 9.1.0`，`flutter build apk --debug` 不再卡在 `ConnectException`。
+
+### 3.2 Android 插件版本坑：`checkDebugAarMetadata` / compileSdk 36
+
+**现象**：
+
+```
+Execution failed for task ':file_picker:checkDebugAarMetadata'.
+Dependency ':flutter_plugin_android_lifecycle' requires ... compile against version 36 or later.
+:file_picker is currently compiled against android-34.
+```
+
+**原因**：`file_picker 8.x` 的 Android 模块编译在 `android-34`，而它依赖的 `flutter_plugin_android_lifecycle` 新版要求消费方 compileSdk ≥ 36。这是插件自身的问题，**改 app 的 compileSdk 治不了**。
+
+**修复**：升到 `file_picker: ^13.3.3`。v12 起改为联邦插件架构，**不再依赖 `flutter_plugin_android_lifecycle`**，冲突消失。同时 `app/android/app/build.gradle.kts` 里把 compileSdk 写成 `maxOf(flutter.compileSdkVersion, 36)` 兜底。
+
+**API 也跟着变了**（v12/v13 破坏性变更，必须同步改代码）：
+
+| 旧（≤ v11） | 新（v13） |
+| --- | --- |
+| `FilePicker.platform.pickFiles(allowMultiple: true)` | `FilePicker.pickFiles()`（`pickFile()` 是单选） |
+| 返回 `FilePickerResult?`，取 `.files` | 直接返回 `List<PlatformFile>`，取消时是空列表 |
+| `file.size` | `await file.length()` 或 `file.lengthSync()` |
+| `withData` / `withReadStream` | `file.readAsBytes()` / `file.readAsByteStream()` |
+
+`file.path` 与 `file.name` 仍在，直接用即可。
+
+### 3.3 Kotlin 增量编译：跨盘路径导致 build 失败
+
+**现象**：
+
+```
+java.lang.AssertionError: Could not close incremental caches in
+  ...\app\build\android_file_picker\kotlin\compileDebugKotlin\cacheable\caches-jvm\jvm\kotlin
+Caused by: java.lang.IllegalArgumentException: this and base files have different roots:
+  C:\Users\...\AppData\Local\Pub\Cache\hosted\...\CompressedBitmapWriter.kt and D:\workdbuddy\...\app\android
+```
+
+**原因**：pub 缓存在 **C 盘**、项目在 **D 盘**。Kotlin 增量编译器用 `relativeTo()` 记录源文件相对路径，跨盘时抛异常，写缓存失败 → 整个 build 失败。**与代码无关**，是工具链在 Windows 双盘布局下的缺陷。
+
+**修复**（`app/android/gradle.properties`）：
+
+```properties
+kotlin.incremental=false
+kotlin.incremental.useClasspathSnapshot=false
+```
+
+并清掉已损坏的缓存目录：`rm -rf app/build`（约 1.1G，下次构建自动重建）。
+
+Flutter 侧 Kotlin 代码极少，全量编译的代价可以忽略；换来的是稳定性。
+
+**更彻底的做法**（可选）：把 pub 缓存也放到 D 盘，让所有源文件同根。
+
+```powershell
+$env:PUB_CACHE = "D:\pub-cache"
+```
+
+但这会影响机器上所有 Flutter 项目，需要重新下载依赖，一般不必。
+
+### 3.4 `Running Gradle task 'assembleDebug'...` 长时间不动
+
+**不是编译慢，是依赖下载断了。** 判断方法（三条一起看）：
+
+```powershell
+# 1) build 目录还动吗（app/build 是 AGP 的 buildDirectory）
+Get-ChildItem D:\workdbuddy\workspace\iroh\app\build -Recurse -File |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 3 LastWriteTime,Name
+
+# 2) 有没有正在下载的临时文件
+Get-ChildItem "$env:USERPROFILE\.gradle\caches" -Recurse -Include *.part,*.tmp |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 5
+
+# 3) daemon 的网络连接状态
+$p = (Get-Process java | Sort-Object CPU -Descending)[0].Id
+Get-NetTCPConnection -OwningProcess $p | Group-Object State | Select-Object Name,Count
+```
+
+判断依据：
+
+| 观察 | 含义 |
+| --- | --- |
+| build 目录几分钟不更新 | 已经不在编译 |
+| 没有 `.part` 文件 | 下载也已停止（不是在慢慢下） |
+| 大量 `CloseWait`、极少 `Established` | 连接被对端断开，daemon 卡在等超时 |
+
+这时 build 已经死了，等下去不会成功。
+
+**处理**：
+
+```powershell
+cd D:\workdbuddy\workspace\iroh\app\android
+.\gradlew.bat --stop      # 杀掉僵死的 daemon
+```
+
+然后重跑。为减少对代理的依赖，项目已加阿里云镜像（`settings.gradle.kts` 的 `pluginManagement` 与根 `build.gradle.kts` 的 `allprojects`），并在 `gradle.properties` 里把 `*.aliyun.com` 加入 `nonProxyHosts` 走直连；官方源保留兜底，镜像缺包时 Gradle 会自动回落。
+
+## 4. 冒烟测试（已可复现）
+
+默认走 **n0 官方公共 relay**，不需要 token，地址只给 EndpointId（由 `dns.iroh.link` 解析）：
+
+```bash
+cd app
+
+export NETDISK_FFI_DLL="D:/workdbuddy/workspace/iroh/tools/poc/p0-1/target/debug/netdisk_ffi.dll"
+export NETDISK_RELAY_URL=n0
+export NETDISK_RELAY_TOKEN=
+export NETDISK_SERVER_ADDR='{"id":"YOUR_ENDPOINT_ID","addrs":[]}'
+dart run tool/ffi_smoke.dart
+```
+
+切回自建 relay 时才需要这几步：
+
+```bash
+TOKEN="$(ssh -p 2222 root@203.0.113.10 \
+  "awk -F '\"' '/^access.shared_token/ {print \$2}' /etc/iroh/relay.toml")"
+TOKEN="$(printf '%s' "$TOKEN" | tr -d '\r\n')"   # Windows SSH 会带 CRLF
+export NETDISK_RELAY_URL="https://relay.example.com:8443"
+export NETDISK_RELAY_TOKEN="$TOKEN"
+export NETDISK_SERVER_ADDR='{"id":"YOUR_ENDPOINT_ID","addrs":[{"Relay":"https://relay.example.com:8443/"}]}'
+```
+
+> `addrs` 字段是必填的（`EndpointAddr` 的 serde 没有 `#[serde(default)]`），只给 id 时要写 `"addrs":[]`。
+
+`NETDISK_SERVER_ADDR` 只保留 `Relay` 项，强制流量经 VPS，便于跨网络复现；服务端固定身份见 `docs/RUNNING.md`。
+
+再跑一次**与 App 完全同路径**的测试（后台 isolate + 重试）：
+
+```bash
+dart run tool/worker_smoke.dart
+```
+
+期望输出（n0 模式实测值）：
+
+```
+start    : OK (16 ms)
+init     : OK (54 ms) running=true
+list     : OK (2154 ms) count=4
+WORKER_SMOKE_OK
+```
+
+`list` 一次成功、无重试。对比切 n0 之前：自建港服 relay 下单次握手只有 2/8，`list` 3 次重试仍超时。
+
+### 4.1 为什么 FFI 必须跑在后台 isolate（ANR 复盘）
+
+**现象**：真机点「刷新列表」后界面完全无响应，几秒后系统弹出 ANR。
+
+**根因**：`netdisk_list` 等 C ABI 是**同步阻塞**的（Rust 侧 `RT.block_on(...)`），而 Dart 侧原来直接在 UI isolate 上调用：
+
+```dart
+// 错误写法：listFiles() 内部要 connect + open_bi + 等 RPC，可能几秒到几十秒
+final res = client.listFiles();
+```
+
+一次跨网 `connect + RPC` 在 R14 这条链路上常常要数秒，丢包时还要等 iroh 的 10s 拨号超时。期间主线程被占死，Android 5 秒无输入响应即判 ANR —— 连 `CircularProgressIndicator` 都不会转。
+
+**为什么不能简单套 `Isolate.run` / `compute`**：`Pointer`（FFI 句柄）不能跨 isolate 传递，每次新建 isolate 都要重新 `init`（重建 endpoint），代价不可接受。
+
+**采用的方案**：常驻 worker isolate（`netdisk_worker.dart`）。
+
+| 位置 | 职责 |
+| --- | --- |
+| UI isolate | 只发命令 + 收 JSON 字符串，用 `Completer` 等结果，完全不阻塞 |
+| worker isolate | `DynamicLibrary.open` → `netdisk_init` → 持有 `Pointer<Handle>` → 串行执行 ping/list/put/get |
+
+消息协议：主 → worker `[id, op, ...args]`；worker → 主 `['res', id, payload, error]`。全部是可跨 isolate 传的基本类型，句柄始终留在 worker 内。
+
+**同时补上的重试**：原来 UI 走的是裸调用（只有 `netdisk-cli` 有 3 次重试），所以链路上一次抖动就直接报 `timeout`。现在 `list` 默认 3 次（退避 1s / 2s），`put` / `get` 2 次，且**只对链路类错误重试**（`timed out` / `connection` / `reset`），token 被拒、路径不存在这类确定性错误立即抛出。
+
+> 改动只涉及 Dart，`libnetdisk_ffi.so` 不需要重新交叉编译；但必须 `flutter build apk` 重新打包安装才生效。
+
+### 4.2 典型故障：`.so` 与 UI 版本错配
+
+**现象**：界面出现 `连接失败: invalid relay URL n0: Failed to parse relay URL`。
+
+**原因**：`n0` 这个特殊值的判断在 Rust 的 `netdisk-core` 里（`is_n0_relay`），编进 `.so` 才生效。当时 UI（Dart）是新的、`jniLibs/libnetdisk_ffi.so` 还是旧的，于是 `n0` 被直接当 URL 解析。
+
+**判断方法**：比对时间戳。
+
+```powershell
+dir app\android\app\src\main\jniLibs\arm64-v8a\libnetdisk_ffi.so   # 应为最近编译时间
+dir app\build\app\outputs\flutter-apk\app-debug.apk
+```
+
+**规则**：只要改了 `netdisk-core` / `netdisk-ffi` / `netdiskd` 里任意 Rust 代码，就必须重跑一次交叉编译，顺序不能反：
+
+```powershell
+cargo ndk -t arm64-v8a -o app\android\app\src\main\jniLibs build -p netdisk-ffi --release
+cd app; flutter build apk --debug; flutter install
+```
+
+`flutter build apk` 只会把 `jniLibs` 里**现有**的 `.so` 打进包，它不会帮你重编 Rust。
+
+**已加防呆**：`netdisk_ffi_version()` 导出能力标记，UI 在 `init` 之前校验；旧库缺该符号或返回值里没有 `n0` 时，直接提示「动态库过旧（不支持 n0）：请重新交叉编译 .so 后再打 APK」。
+
+### 4.3 上传 / 下载 / 路径显示（2026-11-13）
+
+**上传**：`file_picker` 多选 → 逐个 `put` 到服务端**根目录**，文件名取本地 basename。重名按服务端既有语义覆盖（架构 D4：同路径同 hash 幂等、同条目并发写 LWW）。逐个上传，失败不中断后续文件，最后汇总「完成 N 个，失败 M 个」。
+
+**下载**：点列表项右侧的下载按钮 → 落到 `getApplicationDocumentsDirectory()/downloads/<basename>`，完整路径显示在状态栏。
+
+**为什么下载不直接写「下载」目录**：Android 10+ 分区存储下，写公共目录要走 MediaStore 或 SAF（用户选目录），MVP 先用 App 私有目录把链路跑通。后续接 `share_plus` 让用户「分享 / 另存到文件」，或改用 SAF 选目录。
+
+**路径显示**：标题栏 Chip 显示「直连 · 5 ms」或「中继 · 1.2 s」，数据来自 `netdisk_paths()`。列表刷新后会立刻读一次，并在 4 秒后再读一次——因为打洞要几秒才完成，第一次通常还是中继。
+
+**长连接复用（重要改动）**：原来每条 `ping/list/put/get` 都 `ep.connect()` 新建连接、用完即关，有两个代价：
+
+1. 每次都重新握手，跨网 1–2 秒，列表刷新很慢；
+2. 连接活不过 1 秒，**NAT 打洞根本来不及完成**，`paths()` 永远只看到 relay。
+
+现在 `Handle` 里缓存一条 `Connection`（`close_reason().is_none()` 才复用），操作失败时清缓存下次重连。收益：握手只在首次发生；打洞几秒内完成，之后命令走直连。
+
+| 场景 | 改前 | 改后 |
+| --- | --- | --- |
+| 第二次及以后的命令 | 重新握手 1–2 s | 复用连接，直接开流 |
+| 打洞 | 来不及完成，一直走 relay | 几秒后切直连，`paths()` 能读到 |
+| 连接失效 | 每条都是新连接，天然规避 | 靠 `close_reason()` + 失败清缓存重连 |
+
+## 5. 平台落地（待工具链）
+
+**Windows 桌面**（本机缺 VS 2022）：
+
+1. 安装 Visual Studio 2022，勾选「使用 C++ 的桌面开发」；
+2. `cargo build -p netdisk-ffi`（产物在 `tools/poc/p0-1/target/debug/netdisk_ffi.dll`）；
+3. `flutter build windows` —— CMake 会自动把 dll 装到 exe 同目录；
+4. `flutter run -d windows`，界面里填 Relay Token 后点「连接 / 刷新列表」。
+
+也可跳过 CMake 安装步骤，直接给应用设 `NETDISK_FFI_DLL=<dll 绝对路径>`。
+
+**Android**（工具链已就绪：SDK `D:\Sdk`、NDK `28.2.13676358`、`aarch64-linux-android` target、`cargo-ndk 4.1.2`）：
+
+```powershell
+$env:ANDROID_HOME="D:\Sdk"
+$env:ANDROID_NDK_HOME="D:\Sdk\ndk\28.2.13676358"
+cargo ndk -t arm64-v8a -o app\android\app\src\main\jniLibs build -p netdisk-ffi --release
+cd app
+flutter build apk --debug
+```
+
+产物 `libnetdisk_ffi.so` 会被 Flutter 自动打进 APK 的 `lib/arm64-v8a/`。**首次 release 交叉编译约 10–15 分钟**（新 target 缓存全空，约 300 个 crate），之后增量约 1 分钟；不要把输出 pipe 给 `tail`，否则中途看不到进度会误以为卡死。
+
+> **P0-2 风险**：Android release 包首次 `Endpoint::bind()` 可能因 JNI Context 未初始化而崩溃（社区 `iroh_flutter` 1.0.2 修的正是这个）。若真机复现，需要在 `Application.onCreate` / `MainActivity` 里补 Kotlin 侧的 Context 初始化，再用 MethodChannel 或 JNI 传给 Rust 侧。当前 debug 包已在 Android 上验证 `netdisk_init` 成功；**release 包与长连接稳定性**仍未验证。
+
+## 6. C ABI 契约
+
+| 函数 | 说明 |
+| --- | --- |
+| `netdisk_init(relay_url, token, server_addr) -> handle` | 建 endpoint；失败返回 null，用 `netdisk_last_error` 取原因 |
+| `netdisk_ping(handle)` | 返回 `Response` JSON |
+| `netdisk_list(handle)` | 返回 `{"Entries":{"entries":[...]}}` |
+| `netdisk_put(handle, remote, local)` | 返回 `{"Stored":{path,size,hash}}`；本地与服务端 hash 不一致会报错 |
+| `netdisk_get(handle, remote, local)` | 返回 `{"Downloaded":{size,hash}}` |
+| `netdisk_last_error()` | 最近一次错误文本 |
+| `netdisk_paths(handle)` | 当前连接路径：`{"Paths":{"desc":"relay ... | direct* ...","direct":true}}` |
+| `netdisk_ffi_version()` | 能力标记，如 `netdisk-ffi 0.1.0 (relay-modes: n0,custom; proto: netdisk/0)` |
+| `netdisk_string_free(ptr)` | 释放 Rust 返回的字符串（Dart 侧已封装） |
+| `netdisk_close(handle)` | 释放 endpoint 与缓存的连接 |
+
+约定：所有导出函数同步返回；字符串由 Rust 分配、Dart 释放；无字段枚举（`Pong` / `Ready`）被 serde 序列化成裸字符串，Dart 侧会包成 `{名称: null}`。`netdisk_paths` 与 `netdisk_ffi_version` 是后加的，旧库缺符号时 Dart 侧返回 null 而不是报错。
+
+`handle` 内部缓存一条 QUIC 连接（`ping/list/put/get` 复用），失败时清缓存、下次自动重连。
+
+## 7. 已知限制 / 下一步
+
+- **下载文件在 App 私有目录**：`.../AppDocuments/downloads/`，用户需通过文件管理器或后续接「分享 / 另存」（`share_plus`）才能拿到。
+- **无上传进度**：Rust 侧是一次性阻塞调用，只有开始/结束两个状态；要做真实进度条需要在 `copy_exact_with_hash` 里加回调/事件。
+- **token 与地址未持久化**：退出应用后要重填（n0 模式只需点「连接」，痛点已减轻）。
+- **无删除 / 重命名命令**：冒烟测试留下的 `e2e/*.bin` 只能到服务器上手工删。
+- **Windows 桌面仍未验证**（缺 VS 2022 C++ 工具链）；Android 已跑通到「连接」，`list / put / get` 待实测。
+- **「已连接」≠ 可用**：`netdisk_init` 只建 endpoint，不校验 token、不发 RPC。真正的验证是点「刷新列表」。
+
+相关：`docs/RUNNING.md`（服务端与常驻部署）、`docs/ARCHITECTURE.md`（R1 FFI 风险、R14 链路、R15 环境）。

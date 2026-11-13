@@ -1,0 +1,16 @@
+[package]
+name = "netdisk-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "iroh connection layer and minimal file protocol for the personal netdisk"
+
+[dependencies]
+iroh.workspace = true
+iroh-base = "1.4.1"
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+blake3.workspace = true
