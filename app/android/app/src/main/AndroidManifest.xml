@@ -1,4 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Android 13+ 发送通知需要运行时授权（在 MainActivity 里请求）。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:label="netdisk_app"
         android:name="${applicationName}"

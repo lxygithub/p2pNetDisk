@@ -45,3 +45,8 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // MainActivity 里的通知用 NotificationCompat（androidx.core）。
+    implementation("androidx.core:core-ktx:1.13.1")
+}

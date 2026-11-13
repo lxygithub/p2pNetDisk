@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../models/transfer_task.dart';
+import '../services/transfer_notifications.dart';
 import '../src/netdisk_worker.dart';
 
 /// 默认走 n0 官方公共 relay（实测 aps1-1/euc1-1 握手 8/8，自建港服仅 2/8）。
@@ -44,6 +45,8 @@ class AppState extends ChangeNotifier {
     if (_booting) return;
     _booting = true;
     try {
+      // Android 13+ 需要运行时授权才能发通知；拒绝也不影响传输本身。
+      await TransferNotifications.ensurePermission();
       for (var attempt = 1; attempt <= 3; attempt++) {
         await connect();
         if (connected) {
@@ -352,6 +355,7 @@ class AppState extends ChangeNotifier {
       ..startedAt = DateTime.now();
     task.meter.reset();
     notifyListeners();
+    _notifyTransfers(force: true);
 
     unawaited(() async {
       try {
@@ -360,6 +364,7 @@ class AppState extends ChangeNotifier {
             ..sent = sent
             ..speed = task.meter.sample(sent);
           notifyListeners();
+          _notifyTransfers();
         }
 
         final Map<String, dynamic> res = task.kind == TransferKind.upload
@@ -393,6 +398,7 @@ class AppState extends ChangeNotifier {
           ..speed = 0;
         _running--;
         notifyListeners();
+        _notifyTransfers(force: true);
       }
     }());
   }
@@ -404,6 +410,53 @@ class AppState extends ChangeNotifier {
           t.status == TransferStatus.done || t.status == TransferStatus.failed,
     );
     notifyListeners();
+  }
+
+  /// 把整个队列的状态汇总成**一条**通知。
+  ///
+  /// 不按任务发多条：5 个并发会瞬间刷出 5 条通知，用户还得挨个清。
+  /// 汇总成「进行中 2 · 排队 1（已完成 3/6）」反而一眼能看懂。
+  void _notifyTransfers({bool force = false}) {
+    final running = tasks
+        .where((t) => t.status == TransferStatus.running)
+        .length;
+    final queued = tasks.where((t) => t.status == TransferStatus.queued).length;
+    final done = tasks.where((t) => t.status == TransferStatus.done).length;
+    final failed = tasks.where((t) => t.status == TransferStatus.failed).length;
+
+    if (running + queued == 0) {
+      if (done + failed == 0) {
+        unawaited(TransferNotifications.cancel());
+        return;
+      }
+      unawaited(
+        TransferNotifications.show(
+          title: failed == 0 ? '传输完成' : '部分传输失败',
+          text: failed == 0 ? '$done 个文件已完成' : '$done 个完成，$failed 个失败',
+          // 结束后不再显示进度条
+          ongoing: false,
+          force: true,
+        ),
+      );
+      return;
+    }
+
+    final total = running + queued + done + failed;
+    final finished = done + failed;
+    final parts = <String>[
+      if (running > 0) '进行中 $running',
+      if (queued > 0) '排队 $queued',
+    ];
+
+    unawaited(
+      TransferNotifications.show(
+        title: '正在传输',
+        text: '${parts.join(' · ')}（已完成 $finished/$total）',
+        progress: total > 0 ? finished * 100 ~/ total : null,
+        ongoing: true,
+        force: force,
+      ),
+    );
   }
 
   void retryTask(TransferTask task) {

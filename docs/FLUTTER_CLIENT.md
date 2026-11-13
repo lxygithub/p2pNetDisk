@@ -29,6 +29,7 @@
 | **文件预览** | ✅ 图片（可缩放）与文本（截断 200KB）；其他类型明确提示不支持 |
 | **毛玻璃 UI** | ✅ 渐变背景 + 半透明卡片；列表项不做实时模糊（性能取舍见 §4.9） |
 | **自动连接 / 下拉刷新** | ✅ 启动即自动连接并拉列表（失败退避重试 3 次）；列表下拉即刷新，掉线自动切回未连接态（§4.10） |
+| **传输通知** | ✅ 一条汇总通知（进行中/排队/已完成/失败），原生 MethodChannel 实现（§4.11） |
 | **长连接复用** | ✅ FFI 侧改为复用一条 QUIC 连接（原来每条命令重连，打洞来不及完成、`paths()` 只能看到 relay） |
 | `.so` 版本防错配 | ✅ `netdisk_ffi_version()` + 连接前校验；旧库会提示「动态库过旧（不支持 n0）」 |
 | Windows 桌面实际构建 / 运行 | ⛔ 本机无 Visual Studio 2022 C++ 工具链 |
@@ -504,6 +505,35 @@ files = ['photos/a.jpg', 'photos/2026/b.jpg', 'notes.txt']
 **掉线检测**：`refresh` 捕获到链路类错误（timeout / connection / reset / broken pipe）时，把 `connected` 置回 false。否则会停在「显示已连接、但什么都刷不出来」的矛盾状态——用户无法判断是网络问题还是服务端问题。
 
 **widget 测试的坑**：`bootstrap` 里的 `Future.delayed` 会在测试结束时留下 pending timer 导致失败。所以 `NetdiskApp` 加了 `autoConnect` 开关，测试传 `false`。
+
+### 4.11 传输通知：为什么自己写原生，而不是用插件
+
+`flutter_local_notifications` 当前是 23.x，代价不小：
+
+| 要求 | 我们的情况 |
+| --- | --- |
+| `compileSdk = 37` | 当前 36（`maxOf(flutter.compileSdkVersion, 36)`） |
+| AGP ≥ 9.1.1 | 项目是 9.0.1 |
+| core library desugaring + Java 17 + multidex | 未开启，且 desugaring 有 Android 12L 崩溃的已知问题 |
+
+而需求只是「一条可更新的进度通知」。所以改为在 `MainActivity` 里写一个 `MethodChannel`（`netdisk/notifications`），用 `NotificationCompat` 直接发通知 —— 几十行代码，零额外依赖，也避开了版本地狱。
+
+**只发一条汇总通知**。5 个并发任务如果各发一条，通知栏瞬间被刷满，用户还得挨个清。汇总成：
+
+```
+正在传输
+进行中 2 · 排队 1（已完成 3/6）      [进度条 50%]
+```
+
+结束后变成「传输完成 / 5 个文件已完成」，`ongoing: false` 使其可被划掉。
+
+**节流是必须的**。传输回调 250ms 一次，5 个并发就是 20 次/秒的跨语言调用。通知层限制为 800ms 一次，但状态变化（开始/完成/失败）走 `force: true` 立即更新 —— 否则「完成了」要等最多 0.8 秒才反映。
+
+**渠道重要性设为 `IMPORTANCE_LOW`**，不响铃、不弹横幅、不显示角标。进度通知应该安静。
+
+**权限**：Android 13+ 需要 `POST_NOTIFICATIONS` 运行时授权，已在 `bootstrap()` 里请求。**被拒绝不影响传输本身**，只是没有通知。
+
+**为下一步留的接口**：`ForegroundService` 必须绑定一条通知，届时直接复用这个渠道和 `notificationId`，不用再改协议层。
 
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：
