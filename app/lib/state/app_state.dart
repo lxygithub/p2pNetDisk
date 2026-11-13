@@ -34,6 +34,33 @@ class AppState extends ChangeNotifier {
   bool connected = false;
   bool busy = false;
   String status = '未连接';
+  bool _booting = false;
+
+  /// 启动时的自动初始化：连接 → 拉列表。
+  ///
+  /// 冷启动时网络、DNS、relay 都可能还没就绪，直接把「连接失败」甩给用户很糟。
+  /// 所以失败后按 2s / 4s 退避重试，三次都失败才停在错误态，此时仍可手动重试。
+  Future<void> bootstrap() async {
+    if (_booting) return;
+    _booting = true;
+    try {
+      for (var attempt = 1; attempt <= 3; attempt++) {
+        await connect();
+        if (connected) {
+          await refresh();
+          return;
+        }
+        if (attempt < 3) {
+          final wait = Duration(seconds: attempt * 2);
+          status = '连接失败，${wait.inSeconds} 秒后重试（$attempt/3）…';
+          notifyListeners();
+          await Future<void>.delayed(wait);
+        }
+      }
+    } finally {
+      _booting = false;
+    }
+  }
 
   /// 「直连 · 8 ms」/「中继 · 1.2 s」，未连接或旧库不支持时为 null。
   String? pathSummary;
@@ -176,7 +203,14 @@ class AppState extends ChangeNotifier {
       }
       if (!silent) status = '共 ${files.length} 个文件';
     } catch (e) {
-      if (!silent) status = '刷新失败: $e';
+      // 链路类错误视为掉线：置为未连接，UI 会给出「重试」，下拉也能重连。
+      // 否则 connected 一直是 true，用户看到的是「已连接但什么都刷不出来」。
+      if (_looksOffline(e)) {
+        connected = false;
+        status = '连接已断开，下拉或点「重试」重新连接';
+      } else if (!silent) {
+        status = '刷新失败: $e';
+      }
     } finally {
       if (!silent) busy = false;
       notifyListeners();
@@ -184,6 +218,18 @@ class AppState extends ChangeNotifier {
     await _updatePath();
     // 打洞要几秒才完成，稍后再读一次路径让「中继」能变成「直连」。
     Future<void>.delayed(const Duration(seconds: 4), _updatePath);
+  }
+
+  /// 粗判是否为链路类错误。与 worker 内部的重试判断保持一致的取向：
+  /// 宁可多给一次重连机会，也不要把「超时」当成业务失败。
+  static bool _looksOffline(Object e) {
+    final t = e.toString().toLowerCase();
+    return t.contains('timed out') ||
+        t.contains('timeout') ||
+        t.contains('connection') ||
+        t.contains('unreachable') ||
+        t.contains('reset') ||
+        t.contains('broken pipe');
   }
 
   /// 读取当前连接路径，压成「直连 · 8 ms」这种短文本。

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -38,7 +40,6 @@ class FilesPage extends StatelessWidget {
       ),
       body: Column(
         children: [
-          if (!s.connected) const _ConnectHint(),
           const Breadcrumb(),
           Expanded(child: _FileList(state: s)),
           _StatusBar(text: s.status),
@@ -116,34 +117,6 @@ class FilesPage extends StatelessWidget {
   }
 }
 
-class _ConnectHint extends StatelessWidget {
-  const _ConnectHint();
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: GlassCard(
-        blur: 8,
-        padding: const EdgeInsets.all(14),
-        child: Row(
-          children: [
-            Icon(Icons.info_outline, size: 20, color: scheme.primary),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                '尚未连接。到「设置」页确认地址后点「连接」。',
-                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _FileList extends StatelessWidget {
   const _FileList({required this.state});
 
@@ -151,25 +124,76 @@ class _FileList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!state.connected) return const SizedBox.shrink();
+    return RefreshIndicator(
+      onRefresh: () async {
+        if (!state.connected) {
+          await state.connect();
+        }
+        await state.refresh(silent: true);
+      },
+      child: _content(context),
+    );
+  }
 
-    if (state.files.isEmpty) {
-      return const _EmptyState(
-        icon: Icons.cloud_off,
-        title: '还没有文件',
-        subtitle: '点右下角「上传」把文件传上来',
+  /// 未连接与空状态也用可滚动容器包住，否则下拉刷新在空白页上失效。
+  Widget _content(BuildContext context) {
+    if (!state.connected) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
+        children: [
+          const _EmptyState(
+            icon: Icons.cloud_off,
+            title: '未连接',
+            subtitle: '下拉刷新，或点下面的「重试」',
+          ),
+          const SizedBox(height: 16),
+          Center(
+            child: FilledButton.icon(
+              onPressed: state.busy
+                  ? null
+                  : () {
+                      unawaited(state.bootstrap());
+                    },
+              icon: const Icon(Icons.refresh),
+              label: const Text('重试'),
+            ),
+          ),
+        ],
       );
     }
+
+    if (state.files.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
+        children: const [
+          _EmptyState(
+            icon: Icons.cloud_off,
+            title: '还没有文件',
+            subtitle: '点右下角「上传」把文件传上来',
+          ),
+        ],
+      );
+    }
+
     final entries = state.entries;
     if (entries.isEmpty) {
-      return const _EmptyState(
-        icon: Icons.folder_open,
-        title: '此目录为空',
-        subtitle: '上传的文件会放到当前目录',
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
+        children: const [
+          _EmptyState(
+            icon: Icons.folder_open,
+            title: '此目录为空',
+            subtitle: '上传的文件会放到当前目录',
+          ),
+        ],
       );
     }
 
     return ListView.separated(
+      physics: const AlwaysScrollableScrollPhysics(),
       padding: kPagePadding,
       itemCount: entries.length,
       separatorBuilder: (_, _) => const SizedBox(height: 8),
