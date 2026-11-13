@@ -21,7 +21,7 @@ relay 默认用 n0 官方公共节点（握手 8/8），自建 relay 保留为�
 | 路径 | 说明 |
 | --- | --- |
 | `netdisk-core/` | 协议与连接层：iroh endpoint、ALPN `netdisk/0` 帧协议、BLAKE3 校验、路径防护 |
-| `netdiskd/` | 服务端 daemon：`ping / list / put / get`，原子落盘 |
+| `netdiskd/` | 服务端 daemon：`ping / list / put / get / delete / rename / copy / mkdir`，原子落盘 |
 | `netdisk-cli/` | 命令行客户端，用于端到端验证与路径诊断 |
 | `netdisk-ffi/` | C ABI 动态库（供 Flutter 调用），复用长连接 |
 | `app/` | Flutter 客户端：`dart:ffi` + 常驻 worker isolate |
@@ -45,18 +45,21 @@ NETDISK_RELAY_URL=n0 NETDISK_DATA_DIR=./data ./target/release/netdiskd
 ```bash
 cd app
 flutter pub get
-flutter run            # 需要设备或模拟器
+flutter run \
+  --dart-define=NETDISK_DEFAULT_ADDR='{"id":"<你的 EndpointId>","addrs":[]}'
 ```
 
-Relay 填 `n0`、Token 留空、地址填 `{"id":"<EndpointId>","addrs":[]}`，点「连接」→「刷新列表」。
+Relay 填 `n0`、Token 留空；也可以不注入，直接在设置页手填地址（当前版本参数不持久化，重启需重填）。点「连接」→「刷新列表」。
 
 更完整的部署（systemd 常驻、数据盘、日志轮转）见 `docs/RUNNING.md`；Android 交叉编译与打包见 `docs/FLUTTER_CLIENT.md`。
 
 ## 当前状态
 
-已完成：协议闭环、跨机传输、systemd 常驻（数据/代码/日志均在数据盘）、Android 真机拿到文件列表、上传下载（文件选择器）、直连/中继路径显示。
+已完成：连接 / 启动自动连接 / 下拉刷新、目录浏览（含新建、重命名、移动）、上传下载（多选、实时进度与速度、5 并发）、断点续传、复制 / 删除（回收站）、图片与文本预览、多选批量操作、传输通知、前台服务保活与厂商后台适配、大文件（按磁盘可用空间判断，实测 600 MB 通过）。
 
-未完成：断点续传、真实上传进度、删除/重命名、release 包验证、Windows 桌面构建。
+未验证 / 未完成：release 包与 JNI Context、Windows 桌面构建（缺 VS2022）、华为真机锁屏后的后台保活实测、配置持久化。
+
+各次事故复盘与设计取舍见 `docs/FLUTTER_CLIENT.md`（§4.1 起）。
 
 ## 文档
 
@@ -68,4 +71,6 @@ Relay 填 `n0`、Token 留空、地址填 `{"id":"<EndpointId>","addrs":[]}`，�
 
 ## 注意
 
-仓库内的 `infra/README.md`、`docs/*` 含部署时的真实域名与服务器地址，**开源前需要替换为占位符**。真实 token、密钥、`local.properties`、编译产物均已在 `.gitignore` 中排除。
+文档与示例中的域名、IP、端口、`EndpointId` **均为占位符**（`relay.example.com`、`203.0.113.0/24`、`YOUR_ENDPOINT_ID` 等），部署时请替换为你自己的值。真实 token、密钥、`local.properties`、编译产物（含 `jniLibs/*.so`）均已在 `.gitignore` 中排除，Android 端克隆后需自行 `cargo ndk` 重编动态库，见 `docs/FLUTTER_CLIENT.md` §4.15。
+
+> ⚠️ **安全提示**：默认使用 n0 公共 relay 时，服务端**没有应用层鉴权** —— 任何知道 `EndpointId` 的人都能连接并读写文件。因此不要把真实 `EndpointId` 写进公开仓库、日志或截图；生产部署应自行增加认证与访问控制。若曾公开过，请删除服务端 `secret.key` 并重启以轮换设备身份，然后重新配对所有客户端。

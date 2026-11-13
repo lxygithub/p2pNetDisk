@@ -123,7 +123,7 @@ NETDISK_RELAY_URL=n0 \
 | 编译产物 | `/mnt/datadisk/netdisk/build/target`（约 4.6G） |
 | 应用日志 | `/mnt/datadisk/netdisk/logs/netdiskd.log`（logrotate 每日轮转，保留 7 份） |
 | 可执行文件 | `/mnt/datadisk/netdisk/bin/netdiskd` → 软链到 `build/target/debug/netdiskd` |
-| 固定 EndpointId | `YOUR_ENDPOINT_ID`（重启不变） |
+| 固定 EndpointId | 由 `secret.key` 决定，服务启动时打印（重启不变）；不要写进公开仓库 |
 
 unit 关键设计：
 

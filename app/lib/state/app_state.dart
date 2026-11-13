@@ -12,11 +12,20 @@ import '../src/netdisk_worker.dart';
 /// 默认走 n0 官方公共 relay（实测 aps1-1/euc1-1 握手 8/8，自建港服仅 2/8）。
 const kDefaultRelay = 'n0';
 
-/// 常驻服务的固定身份。n0 模式经 dns.iroh.link 解析出完整地址（含 relay），
-/// 所以这里只需要 EndpointId，服务端换 relay 也不用改。
-const kDefaultAddr =
-    '{"id":"YOUR_ENDPOINT_ID",'
-    '"addrs":[]}';
+/// 默认连接地址。公开仓库里**只放占位符**：n0 模式没有应用层鉴权，
+/// 把真实 EndpointId 写进版本控制等于把网盘地址公开。
+///
+/// 私有部署用编译期注入，不必改源码（地址也不会进仓库）：
+/// ```bash
+/// flutter build apk --debug \
+///   --dart-define=NETDISK_DEFAULT_ADDR='{"id":"<EndpointId>","addrs":[]}'
+/// ```
+/// n0 模式经 dns.iroh.link 解析出完整地址（含 relay），所以只需 EndpointId；
+/// 服务端换 relay 也不用改。不注入时可在设置页手填（当前参数不持久化）。
+const kDefaultAddr = String.fromEnvironment(
+  'NETDISK_DEFAULT_ADDR',
+  defaultValue: '{"id":"YOUR_ENDPOINT_ID","addrs":[]}',
+);
 
 /// 应用级状态：连接、文件浏览、传输队列。
 ///
