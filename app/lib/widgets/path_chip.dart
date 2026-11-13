@@ -13,7 +13,9 @@ class PathChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final direct = text.startsWith('直连');
-    final bg = direct ? scheme.tertiaryContainer : scheme.surfaceContainerHighest;
+    final bg = direct
+        ? scheme.tertiaryContainer
+        : scheme.surfaceContainerHighest;
     final fg = direct ? scheme.onTertiaryContainer : scheme.onSurfaceVariant;
 
     return Center(

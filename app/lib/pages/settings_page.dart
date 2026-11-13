@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
 
 /// 设置页：连接参数、连接状态、链路信息。
@@ -52,8 +53,10 @@ class _SettingsPageState extends State<SettingsPage> {
             title: '连接',
             trailing: s.connected
                 ? Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
                     decoration: BoxDecoration(
                       color: scheme.primaryContainer,
                       borderRadius: BorderRadius.circular(20),
@@ -174,9 +177,10 @@ class _SectionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Card(
+    return GlassCard(
+      padding: const EdgeInsets.all(16),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: EdgeInsets.zero,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -224,9 +228,7 @@ class _InfoRow extends StatelessWidget {
               style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
             ),
           ),
-          Expanded(
-            child: Text(value, style: const TextStyle(fontSize: 13)),
-          ),
+          Expanded(child: Text(value, style: const TextStyle(fontSize: 13))),
         ],
       ),
     );

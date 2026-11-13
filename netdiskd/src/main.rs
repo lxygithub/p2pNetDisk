@@ -12,8 +12,9 @@ use iroh::{
 };
 use netdisk_core::{
     addr_to_json, build_endpoint_with_secret, copy_exact_with_hash, describe_paths, list_entries,
-    load_or_create_secret, move_to_trash, public_addr, read_frame, rename_entry, safe_path,
-    write_frame, FileEntry, Request, Response, ALPN, DEFAULT_RELAY_URL, MAX_FILE_SIZE,
+    copy_entry, load_or_create_secret, make_dir, move_to_trash, public_addr, read_frame,
+    rename_entry, safe_path, write_frame, FileEntry, Request, Response, ALPN, DEFAULT_RELAY_URL,
+    MAX_FILE_SIZE,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -176,6 +177,22 @@ where
             Ok(()) => {
                 println!("[netdiskd] renamed {from} -> {to}");
                 write_frame(&mut send, &Response::Renamed { from, to }).await
+            }
+            Err(e) => write_frame(&mut send, &Response::Error(e.to_string())).await,
+        },
+
+        Request::Copy { from, to } => match copy_entry(&root, &from, &to) {
+            Ok(()) => {
+                println!("[netdiskd] copied {from} -> {to}");
+                write_frame(&mut send, &Response::Copied { from, to }).await
+            }
+            Err(e) => write_frame(&mut send, &Response::Error(e.to_string())).await,
+        },
+
+        Request::Mkdir { path } => match make_dir(&root, &path) {
+            Ok(()) => {
+                println!("[netdiskd] mkdir {path}");
+                write_frame(&mut send, &Response::DirCreated { path }).await
             }
             Err(e) => write_frame(&mut send, &Response::Error(e.to_string())).await,
         },

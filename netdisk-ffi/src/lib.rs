@@ -48,24 +48,38 @@ pub struct Handle {
     /// 2. 连接活不过 1 秒，NAT 打洞根本来不及完成，`paths()` 永远只看到 relay。
     /// 现在改成复用一条连接（按需重连），打洞能在几秒内完成，后续命令走直连。
     conn: Mutex<Option<Connection>>,
+    /// 串行化「首次建连」。
+    ///
+    /// 客户端最多 5 个传输并发，若都看到空缓存就会各建一条连接（多余且浪费握手）。
+    /// 这里用双检锁：快路径只碰 std Mutex，慢路径才排队建连。
+    connect_lock: tokio::sync::Mutex<()>,
 }
 
 impl Handle {
     /// 取一条可用连接：优先复用，失效则重建。
     async fn connection(&self) -> Result<Connection> {
-        {
-            let guard = self.conn.lock().map_err(|_| anyhow!("conn mutex poisoned"))?;
-            if let Some(c) = guard.as_ref() {
-                if c.close_reason().is_none() {
-                    return Ok(c.clone());
-                }
-            }
+        if let Some(c) = self.cached_conn() {
+            return Ok(c);
+        }
+        // 双重检查：拿到建连锁后可能已被别的任务建好。
+        let _guard = self.connect_lock.lock().await;
+        if let Some(c) = self.cached_conn() {
+            return Ok(c);
         }
         let conn = self.ep.connect(self.addr.clone(), ALPN).await?;
         if let Ok(mut guard) = self.conn.lock() {
             *guard = Some(conn.clone());
         }
         Ok(conn)
+    }
+
+    /// 快速路径：只短暂持有 std Mutex，不参与异步等待。
+    fn cached_conn(&self) -> Option<Connection> {
+        let guard = self.conn.lock().ok()?;
+        match guard.as_ref() {
+            Some(c) if c.close_reason().is_none() => Some(c.clone()),
+            _ => None,
+        }
     }
 
     fn drop_conn(&self) {
@@ -121,6 +135,7 @@ pub extern "C" fn netdisk_init(
             ep,
             addr,
             conn: Mutex::new(None),
+            connect_lock: tokio::sync::Mutex::new(()),
         })
     })();
     match r {
@@ -161,6 +176,31 @@ fn delete_inner(h: *mut Handle, path: *const c_char) -> Result<String> {
         let conn = h.connection().await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         write_frame(&mut send, &Request::Delete { path }).await?;
+        let r: Response = read_frame(&mut recv).await?;
+        Ok(serde_json::to_string(&r)?)
+    })
+}
+
+fn copy_inner(h: *mut Handle, from: *const c_char, to: *const c_char) -> Result<String> {
+    let h = handle_ref(h)?;
+    let from = unsafe { take_str(from, "from")? };
+    let to = unsafe { take_str(to, "to")? };
+    RT.block_on(async {
+        let conn = h.connection().await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &Request::Copy { from, to }).await?;
+        let r: Response = read_frame(&mut recv).await?;
+        Ok(serde_json::to_string(&r)?)
+    })
+}
+
+fn mkdir_inner(h: *mut Handle, path: *const c_char) -> Result<String> {
+    let h = handle_ref(h)?;
+    let path = unsafe { take_str(path, "path")? };
+    RT.block_on(async {
+        let conn = h.connection().await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &Request::Mkdir { path }).await?;
         let r: Response = read_frame(&mut recv).await?;
         Ok(serde_json::to_string(&r)?)
     })
@@ -302,6 +342,22 @@ pub extern "C" fn netdisk_get_progress(
     progress: *mut u64,
 ) -> *mut c_char {
     finish(h, get_inner(h, remote, local, progress))
+}
+
+/// 复制文件（服务端内部复制，不走网络）。
+#[no_mangle]
+pub extern "C" fn netdisk_copy(
+    h: *mut Handle,
+    from: *const c_char,
+    to: *const c_char,
+) -> *mut c_char {
+    finish(h, copy_inner(h, from, to))
+}
+
+/// 新建目录（支持多级）。
+#[no_mangle]
+pub extern "C" fn netdisk_mkdir(h: *mut Handle, path: *const c_char) -> *mut c_char {
+    finish(h, mkdir_inner(h, path))
 }
 
 /// 删除文件（移入服务端回收站，不是硬删）。

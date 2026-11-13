@@ -39,7 +39,7 @@ class AppState extends ChangeNotifier {
   String? pathSummary;
 
   // ---- 文件浏览 ----
-  List<({String path, int size})> files = [];
+  List<({String path, int size, bool isDir})> files = [];
 
   /// 当前目录，空串表示根，否则以 `/` 结尾。
   String cwd = '';
@@ -50,9 +50,11 @@ class AppState extends ChangeNotifier {
   bool _pumping = false;
 
   int get activeCount => tasks
-      .where((t) =>
-          t.status == TransferStatus.queued ||
-          t.status == TransferStatus.running)
+      .where(
+        (t) =>
+            t.status == TransferStatus.queued ||
+            t.status == TransferStatus.running,
+      )
       .length;
 
   int get failedCount =>
@@ -95,6 +97,9 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   /// 当前目录下的直接子项：目录在前、文件在后，各自按名称排序。
+  ///
+  /// 目录名有两个来源：服务端显式返回的目录项（能覆盖空目录），
+  /// 以及从文件路径里推断出的父目录（兼容不返回目录项的旧服务端）。
   List<({String name, bool isDir, int size, String path})> get entries {
     final fileItems = <({String name, bool isDir, int size, String path})>[];
     final dirNames = <String>{};
@@ -104,10 +109,12 @@ class AppState extends ChangeNotifier {
       final rest = f.path.substring(cwd.length);
       if (rest.isEmpty) continue;
       final slash = rest.indexOf('/');
-      if (slash < 0) {
-        fileItems.add((name: rest, isDir: false, size: f.size, path: f.path));
-      } else {
+      if (slash >= 0) {
         dirNames.add(rest.substring(0, slash));
+      } else if (f.isDir) {
+        dirNames.add(rest);
+      } else {
+        fileItems.add((name: rest, isDir: false, size: f.size, path: f.path));
       }
     }
 
@@ -183,8 +190,9 @@ class AppState extends ChangeNotifier {
   Future<void> _updatePath() async {
     final info = await _worker.paths();
     if (info == null) return;
-    final m =
-        RegExp(r'(direct|relay)\*\s+(\S+)\s+rtt=(\d+)ms').firstMatch(info.desc);
+    final m = RegExp(
+      r'(direct|relay)\*\s+(\S+)\s+rtt=(\d+)ms',
+    ).firstMatch(info.desc);
     pathSummary = m == null
         ? (info.direct ? '直连' : '中继')
         : '${m.group(1) == 'direct' ? '直连' : '中继'} · ${m.group(3)} ms';
@@ -241,76 +249,114 @@ class AppState extends ChangeNotifier {
     await _pump();
   }
 
-  /// 串行消费队列。
+  /// 最大并发传输数。
   ///
-  /// 不并发是有意的：FFI 句柄内部只有一条 QUIC 连接和一个 Mutex，
-  /// 同时发多个 put/get 只会在锁上互相等待，还会把进度回调搅乱。
+  /// iroh 的一条 QUIC 连接支持多流并发，Rust 侧 `connection()` 用双检锁保证
+  /// 只会建一条连接，所以多个 put/get 可以真正并行。上限设 5 是为了避免
+  /// 手机网络下过多流互相挤占带宽，反而让每个任务都变慢。
+  static const int maxConcurrency = 5;
+
+  int _running = 0;
+  bool _anyDone = false;
+
+  /// 消费队列：最多同时跑 [maxConcurrency] 个，其余保持 queued。
+  ///
+  /// 用轮询而不是 Completer 池，是因为任务的完成时间不固定，
+  /// 60ms 的调度间隔对 UI 完全无感，代码却简单得多。
   Future<void> _pump() async {
     if (_pumping) return;
     _pumping = true;
-    var anyDone = false;
     try {
       while (true) {
-        TransferTask? task;
+        TransferTask? next;
         for (final t in tasks) {
           if (t.status == TransferStatus.queued) {
-            task = t;
+            next = t;
             break;
           }
         }
-        if (task == null) break;
+        if (next == null) break;
 
-        task.status = TransferStatus.running;
-        task.startedAt = DateTime.now();
-        task.meter.reset();
-        notifyListeners();
-
-        try {
-          void onProgress(int sent, int total) {
-            task!.sent = sent;
-            task.speed = task.meter.sample(sent);
-            notifyListeners();
-          }
-
-          final Map<String, dynamic> res = task.kind == TransferKind.upload
-              ? await _worker.put(
-                  task.remote,
-                  task.local,
-                  totalBytes: task.total,
-                  onProgress: onProgress,
-                )
-              : await _worker.get(
-                  task.remote,
-                  task.local,
-                  totalBytes: task.total,
-                  onProgress: onProgress,
-                );
-
-          final err = res['Error'];
-          if (err != null) throw Exception(err);
-
-          task.sent = task.total;
-          task.status = TransferStatus.done;
-          anyDone = true;
-        } catch (e) {
-          task.status = TransferStatus.failed;
-          task.error = '$e';
-        } finally {
-          task.finishedAt = DateTime.now();
-          task.speed = 0;
-          notifyListeners();
+        if (_running >= maxConcurrency) {
+          await Future<void>.delayed(const Duration(milliseconds: 60));
+          continue;
         }
+        _startTask(next);
+      }
+
+      // 等所有在途任务结束，再决定是否刷新列表。
+      while (_running > 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 60));
       }
     } finally {
       _pumping = false;
     }
-    if (anyDone) await refresh(silent: true);
+
+    if (_anyDone) {
+      _anyDone = false;
+      await refresh(silent: true);
+    }
+  }
+
+  /// 启动单个任务（不等待完成，由调用方通过 `_running` 计数感知）。
+  void _startTask(TransferTask task) {
+    _running++;
+    task
+      ..status = TransferStatus.running
+      ..startedAt = DateTime.now();
+    task.meter.reset();
+    notifyListeners();
+
+    unawaited(() async {
+      try {
+        void onProgress(int sent, int total) {
+          task
+            ..sent = sent
+            ..speed = task.meter.sample(sent);
+          notifyListeners();
+        }
+
+        final Map<String, dynamic> res = task.kind == TransferKind.upload
+            ? await _worker.put(
+                task.remote,
+                task.local,
+                totalBytes: task.total,
+                onProgress: onProgress,
+              )
+            : await _worker.get(
+                task.remote,
+                task.local,
+                totalBytes: task.total,
+                onProgress: onProgress,
+              );
+
+        final err = res['Error'];
+        if (err != null) throw Exception(err);
+
+        task
+          ..sent = task.total
+          ..status = TransferStatus.done;
+        _anyDone = true;
+      } catch (e) {
+        task
+          ..status = TransferStatus.failed
+          ..error = '$e';
+      } finally {
+        task
+          ..finishedAt = DateTime.now()
+          ..speed = 0;
+        _running--;
+        notifyListeners();
+      }
+    }());
   }
 
   /// 清掉已完成/失败的任务，保留进行中的。
   void clearFinishedTasks() {
-    tasks.removeWhere((t) =>
-        t.status == TransferStatus.done || t.status == TransferStatus.failed);
+    tasks.removeWhere(
+      (t) =>
+          t.status == TransferStatus.done || t.status == TransferStatus.failed,
+    );
     notifyListeners();
   }
 
@@ -360,6 +406,60 @@ class AppState extends ChangeNotifier {
       busy = false;
       notifyListeners();
     }
+  }
+
+  /// 复制文件：服务端本地 copy，数据不过网络。
+  Future<void> copyFile(String from, String to) async {
+    busy = true;
+    status = '正在复制到 $to …';
+    notifyListeners();
+    try {
+      await _worker.copy(from, to);
+      status = '已复制：$from → $to';
+      await refresh(silent: true);
+    } catch (e) {
+      status = '复制失败: $e';
+    } finally {
+      busy = false;
+      notifyListeners();
+    }
+  }
+
+  /// 在当前目录下新建目录。返回是否成功。
+  Future<bool> createDir(String name) async {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return false;
+
+    busy = true;
+    status = '正在创建目录 $trimmed …';
+    notifyListeners();
+    try {
+      await _worker.mkdir('$cwd$trimmed');
+      status = '已创建目录：$cwd$trimmed';
+      await refresh(silent: true);
+      return true;
+    } catch (e) {
+      status = '创建目录失败: $e';
+      return false;
+    } finally {
+      busy = false;
+      notifyListeners();
+    }
+  }
+
+  /// 把远程文件下载到临时目录，用于预览。返回本地路径。
+  ///
+  /// 预览是「用完即弃」的，所以落到 `getTemporaryDirectory()` 而不是 App 文档目录，
+  /// 避免重复预览时占满用户空间（系统会自行回收）。
+  Future<String> downloadForPreview(String remote) async {
+    final dir = await getTemporaryDirectory();
+    final local = p.join(dir.path, 'preview', p.basename(remote));
+    await Directory(p.dirname(local)).create(recursive: true);
+
+    final res = await _worker.get(remote, local);
+    final err = res['Error'];
+    if (err != null) throw Exception(err);
+    return local;
   }
 
   void setStatus(String value) {

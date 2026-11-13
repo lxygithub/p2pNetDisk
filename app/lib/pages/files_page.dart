@@ -6,9 +6,11 @@ import '../models/transfer_task.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/breadcrumb.dart';
+import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
+import 'preview_page.dart';
 
-/// 文件浏览页：面包屑 + 目录/文件列表 + 上传入口。
+/// 文件浏览页：面包屑 + 目录/文件列表 + 上传/新建目录入口。
 class FilesPage extends StatelessWidget {
   const FilesPage({super.key});
 
@@ -17,10 +19,16 @@ class FilesPage extends StatelessWidget {
     final s = context.watch<AppState>();
 
     return Scaffold(
+      backgroundColor: Colors.transparent,
       appBar: AppBar(
         title: const Text('文件'),
         actions: [
           if (s.pathSummary != null) PathChip(text: s.pathSummary!),
+          IconButton(
+            tooltip: '新建目录',
+            onPressed: s.busy || !s.connected ? null : () => _newDir(context),
+            icon: const Icon(Icons.create_new_folder_outlined),
+          ),
           IconButton(
             tooltip: '刷新',
             onPressed: s.busy || !s.connected ? null : () => s.refresh(),
@@ -31,7 +39,7 @@ class FilesPage extends StatelessWidget {
       body: Column(
         children: [
           if (!s.connected) const _ConnectHint(),
-          Breadcrumb(),
+          const Breadcrumb(),
           Expanded(child: _FileList(state: s)),
           _StatusBar(text: s.status),
         ],
@@ -73,6 +81,39 @@ class FilesPage extends StatelessWidget {
     }
     await state.enqueueUploads(files);
   }
+
+  Future<void> _newDir(BuildContext context) async {
+    final state = context.read<AppState>();
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('新建目录'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '目录名',
+            helperText: '可带子路径，例如 photos/2026',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('创建'),
+          ),
+        ],
+      ),
+    );
+    final trimmed = name?.trim() ?? '';
+    controller.dispose();
+    if (trimmed.isEmpty) return;
+    await state.createDir(trimmed);
+  }
 }
 
 class _ConnectHint extends StatelessWidget {
@@ -81,24 +122,23 @@ class _ConnectHint extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: scheme.secondaryContainer,
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.info_outline, color: scheme.onSecondaryContainer),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              '尚未连接。到「设置」页确认地址后点「连接」。',
-              style: TextStyle(color: scheme.onSecondaryContainer),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: GlassCard(
+        blur: 8,
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          children: [
+            Icon(Icons.info_outline, size: 20, color: scheme.primary),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                '尚未连接。到「设置」页确认地址后点「连接」。',
+                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -111,9 +151,8 @@ class _FileList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!state.connected) {
-      return const SizedBox.shrink();
-    }
+    if (!state.connected) return const SizedBox.shrink();
+
     if (state.files.isEmpty) {
       return const _EmptyState(
         icon: Icons.cloud_off,
@@ -136,21 +175,74 @@ class _FileList extends StatelessWidget {
       separatorBuilder: (_, _) => const SizedBox(height: 8),
       itemBuilder: (context, i) {
         final e = entries[i];
-        return e.isDir
-            ? _DirTile(
-                name: e.name,
-                onTap: state.busy ? null : () => state.enterDir(e.name),
-              )
-            : _FileTile(
-                name: e.name,
-                size: e.size,
-                busy: state.busy,
-                onDownload: () => state.enqueueDownload(e.path, e.size),
-                onRename: () => _renameDialog(context, state, e.path),
-                onDelete: () => _deleteConfirm(context, state, e.path),
-              );
+        if (e.isDir) {
+          return _DirTile(
+            name: e.name,
+            onTap: state.busy ? null : () => state.enterDir(e.name),
+            onRename: () => _renameDialog(context, state, e.path),
+          );
+        }
+        return _FileTile(
+          name: e.name,
+          size: e.size,
+          busy: state.busy,
+          onPreview: () => _openPreview(context, e.path),
+          onDownload: () => state.enqueueDownload(e.path, e.size),
+          onCopy: () => _copyDialog(context, state, e.path),
+          onRename: () => _renameDialog(context, state, e.path),
+          onDelete: () => _deleteConfirm(context, state, e.path),
+        );
       },
     );
+  }
+
+  void _openPreview(BuildContext context, String path) {
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => PreviewPage(remote: path)));
+  }
+
+  Future<void> _copyDialog(
+    BuildContext context,
+    AppState state,
+    String source,
+  ) async {
+    // 预填「同目录 + _copy 后缀」，比让用户从零输入省事。
+    final dot = source.lastIndexOf('.');
+    final slash = source.lastIndexOf('/');
+    final suggested = dot > slash
+        ? '${source.substring(0, dot)}_copy${source.substring(dot)}'
+        : '${source}_copy';
+
+    final controller = TextEditingController(text: suggested);
+    final target = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('复制到'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '目标路径',
+            helperText: '服务端本地复制，不消耗流量',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('复制'),
+          ),
+        ],
+      ),
+    );
+    final trimmed = target?.trim() ?? '';
+    controller.dispose();
+    if (trimmed.isEmpty || trimmed == source) return;
+    await state.copyFile(source, trimmed);
   }
 
   Future<void> _deleteConfirm(
@@ -178,12 +270,13 @@ class _FileList extends StatelessWidget {
     if (ok == true) await state.deleteFile(path);
   }
 
+  /// 重命名与移动共用：改整条相对路径，换目录即移动。
   Future<void> _renameDialog(
     BuildContext context,
     AppState state,
-    String current,
+    String path,
   ) async {
-    final controller = TextEditingController(text: current);
+    final controller = TextEditingController(text: path);
     final next = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -192,8 +285,8 @@ class _FileList extends StatelessWidget {
           controller: controller,
           autofocus: true,
           decoration: const InputDecoration(
-            labelText: '新路径（可含子目录）',
-            helperText: '目标已存在时不会覆盖，会直接报错',
+            labelText: '新路径',
+            helperText: '改目录即移动；目标已存在时不会覆盖',
           ),
         ),
         actions: [
@@ -210,43 +303,48 @@ class _FileList extends StatelessWidget {
     );
     final target = next?.trim() ?? '';
     controller.dispose();
-    if (target.isEmpty || target == current) return;
-    await state.renameFile(current, target);
+    if (target.isEmpty || target == path) return;
+    await state.renameFile(path, target);
   }
 }
 
 class _DirTile extends StatelessWidget {
-  const _DirTile({required this.name, this.onTap});
+  const _DirTile({required this.name, this.onTap, required this.onRename});
 
   final String name;
   final VoidCallback? onTap;
+  final VoidCallback onRename;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Material(
-      color: scheme.surfaceContainerLow,
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          child: Row(
-            children: [
-              Icon(Icons.folder, color: scheme.primary),
-              const SizedBox(width: 12),
-              Expanded(
+    return GlassCard(
+      padding: const EdgeInsets.fromLTRB(14, 4, 4, 4),
+      onTap: onTap,
+      child: Row(
+        children: [
+          Icon(Icons.folder_rounded, color: scheme.primary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: SizedBox(
+              height: 44,
+              child: Align(
+                alignment: Alignment.centerLeft,
                 child: Text(
                   name,
                   style: const TextStyle(fontWeight: FontWeight.w500),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              Icon(Icons.chevron_right, size: 18, color: scheme.outline),
-            ],
+            ),
           ),
-        ),
+          IconButton(
+            tooltip: '重命名 / 移动',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.more_vert, size: 20),
+            onPressed: onRename,
+          ),
+        ],
       ),
     );
   }
@@ -257,7 +355,9 @@ class _FileTile extends StatelessWidget {
     required this.name,
     required this.size,
     required this.busy,
+    required this.onPreview,
     required this.onDownload,
+    required this.onCopy,
     required this.onRename,
     required this.onDelete,
   });
@@ -265,83 +365,139 @@ class _FileTile extends StatelessWidget {
   final String name;
   final int size;
   final bool busy;
+  final VoidCallback onPreview;
   final VoidCallback onDownload;
+  final VoidCallback onCopy;
   final VoidCallback onRename;
   final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Material(
-      color: scheme.surfaceContainerLow,
-      borderRadius: BorderRadius.circular(14),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 10, 4, 10),
-        child: Row(
-          children: [
-            Icon(Icons.insert_drive_file_outlined, color: scheme.onSurfaceVariant),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(name, overflow: TextOverflow.ellipsis),
-                  const SizedBox(height: 2),
-                  Text(
-                    humanSize(size),
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            PopupMenuButton<String>(
-              enabled: !busy,
-              tooltip: '更多操作',
-              icon: const Icon(Icons.more_vert, size: 20),
-              onSelected: (v) {
-                switch (v) {
-                  case 'download':
-                    onDownload();
-                  case 'rename':
-                    onRename();
-                  case 'delete':
-                    onDelete();
-                }
-              },
-              itemBuilder: (_) => const [
-                PopupMenuItem(
-                  value: 'download',
-                  child: ListTile(
-                    dense: true,
-                    leading: Icon(Icons.download),
-                    title: Text('下载'),
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'rename',
-                  child: ListTile(
-                    dense: true,
-                    leading: Icon(Icons.drive_file_rename_outline),
-                    title: Text('重命名'),
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'delete',
-                  child: ListTile(
-                    dense: true,
-                    leading: Icon(Icons.delete_outline),
-                    title: Text('删除'),
+
+    return GlassCard(
+      padding: const EdgeInsets.fromLTRB(14, 10, 4, 10),
+      child: Row(
+        children: [
+          Icon(_iconFor(name), color: scheme.onSurfaceVariant),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(name, overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 2),
+                Text(
+                  humanSize(size),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: scheme.onSurfaceVariant,
                   ),
                 ),
               ],
             ),
-          ],
-        ),
+          ),
+          PopupMenuButton<String>(
+            enabled: !busy,
+            tooltip: '更多操作',
+            icon: const Icon(Icons.more_vert, size: 20),
+            onSelected: (v) {
+              switch (v) {
+                case 'preview':
+                  onPreview();
+                case 'download':
+                  onDownload();
+                case 'copy':
+                  onCopy();
+                case 'rename':
+                  onRename();
+                case 'delete':
+                  onDelete();
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'preview',
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(Icons.visibility_outlined),
+                  title: Text('预览'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'download',
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(Icons.download),
+                  title: Text('下载'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'copy',
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(Icons.copy_outlined),
+                  title: Text('复制'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'rename',
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(Icons.drive_file_rename_outline),
+                  title: Text('重命名 / 移动'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'delete',
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(Icons.delete_outline),
+                  title: Text('删除'),
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
+  }
+
+  static IconData _iconFor(String name) {
+    final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+    if (const {
+      'jpg',
+      'jpeg',
+      'png',
+      'gif',
+      'webp',
+      'bmp',
+      'heic',
+    }.contains(ext)) {
+      return Icons.image_outlined;
+    }
+    if (const {'mp4', 'mkv', 'mov', 'avi', 'webm'}.contains(ext)) {
+      return Icons.movie_outlined;
+    }
+    if (const {'mp3', 'flac', 'wav', 'aac', 'm4a'}.contains(ext)) {
+      return Icons.audiotrack_outlined;
+    }
+    if (const {'zip', 'rar', '7z', 'tar', 'gz'}.contains(ext)) {
+      return Icons.folder_zip_outlined;
+    }
+    if (ext == 'pdf') return Icons.picture_as_pdf_outlined;
+    if (const {
+      'txt',
+      'md',
+      'json',
+      'yaml',
+      'yml',
+      'log',
+      'csv',
+    }.contains(ext)) {
+      return Icons.description_outlined;
+    }
+    return Icons.insert_drive_file_outlined;
   }
 }
 
@@ -385,9 +541,8 @@ class _StatusBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
       child: Text(
         text,
         style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),

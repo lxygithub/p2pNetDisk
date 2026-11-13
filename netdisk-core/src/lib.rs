@@ -47,6 +47,10 @@ pub enum Request {
     Delete { path: String },
     /// 重命名 / 移动。`to` 是目标相对路径，可与 `from` 不同目录。
     Rename { from: String, to: String },
+    /// 复制文件（服务端内部 copy，不经过网络）。
+    Copy { from: String, to: String },
+    /// 新建目录（含多级，父目录自动创建）。
+    Mkdir { path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +65,8 @@ pub enum Response {
     /// 删除成功。`trash` 是回收站内的相对路径，保留以便将来实现恢复。
     Deleted { path: String, trash: String },
     Renamed { from: String, to: String },
+    Copied { from: String, to: String },
+    DirCreated { path: String },
     Error(String),
 }
 
@@ -68,6 +74,12 @@ pub enum Response {
 pub struct FileEntry {
     pub path: String,
     pub size: u64,
+    /// 目录项（`size` 恒为 0）。
+    ///
+    /// 以前只返回文件，导致**空目录在客户端完全不可见**，建了也白建。
+    /// 这里显式带上类型，客户端不必再靠路径里有没有 `/` 去猜。
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 /// 写一个「u32 大端长度 + JSON」帧。
@@ -417,6 +429,33 @@ pub fn rename_entry(root: &Path, from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
+/// 复制文件。
+///
+/// 在服务端本地完成 `copy`，数据不经过网络 —— 相比「下载再上传」省掉两次全量传输。
+/// 目标已存在时报错，与 [`rename_entry`] 保持一致的「不静默覆盖」语义。
+pub fn copy_entry(root: &Path, from: &str, to: &str) -> Result<()> {
+    let src = safe_path(root, from)?;
+    let dst = safe_path(root, to)?;
+    if !src.is_file() {
+        bail!("not a file: {from}");
+    }
+    if dst.exists() {
+        bail!("target already exists: {to}");
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&src, &dst)?;
+    Ok(())
+}
+
+/// 新建目录，支持多级（父目录自动创建）。目录已存在时不报错。
+pub fn make_dir(root: &Path, rel: &str) -> Result<()> {
+    let dir = safe_path(root, rel)?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(())
+}
+
 pub fn list_entries(root: &Path) -> Result<Vec<FileEntry>> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> Result<()> {
         if !dir.exists() {
@@ -431,17 +470,24 @@ pub fn list_entries(root: &Path) -> Result<Vec<FileEntry>> {
                 continue;
             }
             let ft = entry.file_type()?;
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             if ft.is_dir() {
+                // 目录本身也要返回，否则空目录在列表里不存在。
+                out.push(FileEntry {
+                    path: rel,
+                    size: 0,
+                    is_dir: true,
+                });
                 walk(base, &path, out)?;
             } else if ft.is_file() {
-                let rel = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
                 out.push(FileEntry {
                     path: rel,
                     size: entry.metadata()?.len(),
+                    is_dir: false,
                 });
             }
         }

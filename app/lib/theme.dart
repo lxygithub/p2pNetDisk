@@ -10,12 +10,14 @@ ThemeData buildAppTheme(Brightness brightness) {
   return ThemeData(
     useMaterial3: true,
     colorScheme: scheme,
-    scaffoldBackgroundColor: scheme.surface,
+    // 透明，让 GlassBackground 的渐变透上来。
+    scaffoldBackgroundColor: Colors.transparent,
     appBarTheme: AppBarTheme(
       centerTitle: false,
       elevation: 0,
-      scrolledUnderElevation: 0.5,
-      backgroundColor: scheme.surface,
+      scrolledUnderElevation: 0,
+      backgroundColor: Colors.transparent,
+      surfaceTintColor: Colors.transparent,
       foregroundColor: scheme.onSurface,
       titleTextStyle: TextStyle(
         fontSize: 20,
@@ -25,8 +27,8 @@ ThemeData buildAppTheme(Brightness brightness) {
     ),
     cardTheme: CardThemeData(
       elevation: 0,
-      color: scheme.surfaceContainerLow,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      color: scheme.surface.withValues(alpha: 0.55),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       margin: EdgeInsets.zero,
     ),
     listTileTheme: const ListTileThemeData(
@@ -61,13 +63,13 @@ ThemeData buildAppTheme(Brightness brightness) {
         borderRadius: BorderRadius.circular(12),
         borderSide: BorderSide(color: scheme.primary, width: 1.5),
       ),
-      contentPadding:
-          const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
     ),
     navigationBarTheme: NavigationBarThemeData(
       height: 66,
       elevation: 0,
-      backgroundColor: scheme.surfaceContainer,
+      backgroundColor: Colors.transparent,
+      surfaceTintColor: Colors.transparent,
       indicatorColor: scheme.secondaryContainer,
       labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
     ),

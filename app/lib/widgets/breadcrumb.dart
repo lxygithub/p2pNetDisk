@@ -44,15 +44,18 @@ class Breadcrumb extends StatelessWidget {
                       child: const Text('/'),
                     ),
                     for (var i = 0; i < parts.length; i++) ...[
-                      Icon(Icons.chevron_right, size: 16, color: scheme.outline),
+                      Icon(
+                        Icons.chevron_right,
+                        size: 16,
+                        color: scheme.outline,
+                      ),
                       TextButton(
                         style: TextButton.styleFrom(
                           visualDensity: VisualDensity.compact,
                           minimumSize: const Size(0, 32),
                           padding: const EdgeInsets.symmetric(horizontal: 8),
                         ),
-                        onPressed:
-                            s.busy ? null : () => s.goToDepth(i + 1),
+                        onPressed: s.busy ? null : () => s.goToDepth(i + 1),
                         child: Text(
                           parts[i],
                           style: TextStyle(

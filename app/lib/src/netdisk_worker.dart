@@ -91,7 +91,9 @@ class NetdiskWorker {
           // serde 把无字段枚举序列化成裸字符串（Pong / Ready）。
           completer.complete(<String, dynamic>{payload: null});
         } else {
-          completer.complete(<String, dynamic>{'Error': 'unexpected payload: $payload'});
+          completer.complete(<String, dynamic>{
+            'Error': 'unexpected payload: $payload',
+          });
         }
         return;
       }
@@ -162,7 +164,7 @@ class NetdiskWorker {
   ///
   /// 家宽 → 港服这条链路存在间歇性丢包（架构 R14），单次 connect 常直接超时，
   /// 因此这里默认重试，和 `netdisk-cli` 的行为保持一致。
-  Future<List<({String path, int size})>> list({
+  Future<List<({String path, int size, bool isDir})>> list({
     void Function(int attempt)? onAttempt,
   }) async {
     final res = await _retry('list', const <Object?>[], onAttempt: onAttempt);
@@ -223,21 +225,33 @@ class NetdiskWorker {
   Future<Map<String, dynamic>> delete(
     String path, {
     void Function(int attempt)? onAttempt,
-  }) =>
-      _retry('delete', <Object?>[path], maxAttempts: 2, onAttempt: onAttempt);
+  }) => _retry('delete', <Object?>[path], maxAttempts: 2, onAttempt: onAttempt);
 
   /// 重命名 / 移动。目标已存在时服务端返回错误（不覆盖）。
   Future<Map<String, dynamic>> rename(
     String from,
     String to, {
     void Function(int attempt)? onAttempt,
+  }) => _retry(
+    'rename',
+    <Object?>[from, to],
+    maxAttempts: 2,
+    onAttempt: onAttempt,
+  );
+
+  /// 复制文件（服务端本地复制）。
+  Future<Map<String, dynamic>> copy(
+    String from,
+    String to, {
+    void Function(int attempt)? onAttempt,
   }) =>
-      _retry(
-        'rename',
-        <Object?>[from, to],
-        maxAttempts: 2,
-        onAttempt: onAttempt,
-      );
+      _retry('copy', <Object?>[from, to], maxAttempts: 2, onAttempt: onAttempt);
+
+  /// 新建目录（支持多级）。
+  Future<Map<String, dynamic>> mkdir(
+    String path, {
+    void Function(int attempt)? onAttempt,
+  }) => _retry('mkdir', <Object?>[path], maxAttempts: 2, onAttempt: onAttempt);
 
   /// 只对「链路类」错误重试（超时 / 连接失败）。
   ///
@@ -408,6 +422,10 @@ void _workerMain(List<Object?> boot) {
           payload = _require(client).delete(msg[2] as String);
         case 'rename':
           payload = _require(client).rename(msg[2] as String, msg[3] as String);
+        case 'copy':
+          payload = _require(client).copy(msg[2] as String, msg[3] as String);
+        case 'mkdir':
+          payload = _require(client).mkdir(msg[2] as String);
         default:
           throw NetdiskWorkerException('unknown op: $op');
       }

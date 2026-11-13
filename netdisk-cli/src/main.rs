@@ -14,7 +14,7 @@ use netdisk_core::{
 };
 
 fn usage() -> String {
-    "usage: netdisk-cli <ping|list|put <local> <remote>|get <remote> <local>|delete <remote>|rename <from> <to>>"
+    "usage: netdisk-cli <ping|list|put <local> <remote>|get <remote> <local>|delete <remote>|rename <from> <to>|copy <from> <to>|mkdir <path>>"
         .to_string()
 }
 
@@ -157,6 +157,35 @@ async fn run_command(conn: Connection, cmd: &[String]) -> Result<()> {
         }
 
 
+        "copy" => {
+            if cmd.len() != 3 {
+                bail!("{}", usage());
+            }
+            let from = cmd[1].clone();
+            let to = cmd[2].clone();
+            write_frame(&mut send, &Request::Copy { from: from.clone(), to: to.clone() }).await?;
+            let r: Response = read_frame(&mut recv).await?;
+            match r {
+                Response::Copied { .. } => println!("copied {from} -> {to}"),
+                Response::Error(e) => bail!("server: {e}"),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+
+        "mkdir" => {
+            if cmd.len() != 2 {
+                bail!("{}", usage());
+            }
+            let path = cmd[1].clone();
+            write_frame(&mut send, &Request::Mkdir { path: path.clone() }).await?;
+            let r: Response = read_frame(&mut recv).await?;
+            match r {
+                Response::DirCreated { .. } => println!("mkdir {path}"),
+                Response::Error(e) => bail!("server: {e}"),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+
         other => bail!("unknown command '{other}'. {}", usage()),
     }
     Ok(())
@@ -211,6 +240,7 @@ async fn main() -> Result<()> {
                 last_error.unwrap_or_default()
             )),
         }
+
     };
 
     ep.close().await;

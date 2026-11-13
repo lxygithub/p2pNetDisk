@@ -13,14 +13,28 @@ import 'package:ffi/ffi.dart';
 /// 不透明句柄，对应 Rust 侧的 `Handle`。
 final class NetdiskHandle extends Opaque {}
 
-typedef _InitFn = Pointer<NetdiskHandle> Function(
-    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _InitFn =
+    Pointer<NetdiskHandle> Function(
+      Pointer<Utf8>,
+      Pointer<Utf8>,
+      Pointer<Utf8>,
+    );
 typedef _Call1Fn = Pointer<Utf8> Function(Pointer<NetdiskHandle>);
-typedef _Call2Fn = Pointer<Utf8> Function(Pointer<NetdiskHandle>, Pointer<Utf8>);
-typedef _Call3Fn = Pointer<Utf8> Function(
-    Pointer<NetdiskHandle>, Pointer<Utf8>, Pointer<Utf8>);
-typedef _Call4Fn = Pointer<Utf8> Function(
-    Pointer<NetdiskHandle>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint64>);
+typedef _Call2Fn =
+    Pointer<Utf8> Function(Pointer<NetdiskHandle>, Pointer<Utf8>);
+typedef _Call3Fn =
+    Pointer<Utf8> Function(
+      Pointer<NetdiskHandle>,
+      Pointer<Utf8>,
+      Pointer<Utf8>,
+    );
+typedef _Call4Fn =
+    Pointer<Utf8> Function(
+      Pointer<NetdiskHandle>,
+      Pointer<Utf8>,
+      Pointer<Utf8>,
+      Pointer<Uint64>,
+    );
 typedef _LastErrorFn = Pointer<Utf8> Function();
 typedef _VersionFn = Pointer<Utf8> Function();
 typedef _PathsFn = Pointer<Utf8> Function(Pointer<NetdiskHandle>);
@@ -45,12 +59,15 @@ class NetdiskClient {
   late final _LastErrorFn _lastError;
   late final _FreeStrDart _freeString;
   late final _CloseDart _closeHandle;
+
   /// 旧库可能没有这个符号（可选能力）。
   _PathsFn? _paths;
   _Call2Fn? _deleteFn;
   _Call3Fn? _renameFn;
   _Call4Fn? _putProgressFn;
   _Call4Fn? _getProgressFn;
+  _Call2Fn? _mkdirFn;
+  _Call3Fn? _copyFn;
 
   Pointer<NetdiskHandle>? _handle;
 
@@ -62,9 +79,15 @@ class NetdiskClient {
     _list = lib.lookupFunction<_Call1Fn, _Call1Fn>('netdisk_list');
     _put = lib.lookupFunction<_Call3Fn, _Call3Fn>('netdisk_put');
     _get = lib.lookupFunction<_Call3Fn, _Call3Fn>('netdisk_get');
-    _lastError = lib.lookupFunction<_LastErrorFn, _LastErrorFn>('netdisk_last_error');
-    _freeString = lib.lookupFunction<_FreeStrNative, _FreeStrDart>('netdisk_string_free');
-    _closeHandle = lib.lookupFunction<_CloseNative, _CloseDart>('netdisk_close');
+    _lastError = lib.lookupFunction<_LastErrorFn, _LastErrorFn>(
+      'netdisk_last_error',
+    );
+    _freeString = lib.lookupFunction<_FreeStrNative, _FreeStrDart>(
+      'netdisk_string_free',
+    );
+    _closeHandle = lib.lookupFunction<_CloseNative, _CloseDart>(
+      'netdisk_close',
+    );
     try {
       _paths = lib.lookupFunction<_PathsFn, _PathsFn>('netdisk_paths');
     } catch (_) {
@@ -81,16 +104,28 @@ class NetdiskClient {
       _renameFn = null;
     }
     try {
-      _putProgressFn =
-          lib.lookupFunction<_Call4Fn, _Call4Fn>('netdisk_put_progress');
+      _putProgressFn = lib.lookupFunction<_Call4Fn, _Call4Fn>(
+        'netdisk_put_progress',
+      );
     } catch (_) {
       _putProgressFn = null;
     }
     try {
-      _getProgressFn =
-          lib.lookupFunction<_Call4Fn, _Call4Fn>('netdisk_get_progress');
+      _getProgressFn = lib.lookupFunction<_Call4Fn, _Call4Fn>(
+        'netdisk_get_progress',
+      );
     } catch (_) {
       _getProgressFn = null;
+    }
+    try {
+      _mkdirFn = lib.lookupFunction<_Call2Fn, _Call2Fn>('netdisk_mkdir');
+    } catch (_) {
+      _mkdirFn = null;
+    }
+    try {
+      _copyFn = lib.lookupFunction<_Call3Fn, _Call3Fn>('netdisk_copy');
+    } catch (_) {
+      _copyFn = null;
     }
   }
 
@@ -105,7 +140,9 @@ class NetdiskClient {
   /// 旧版库没有这个符号，返回 null —— 客户端可用它判断 `.so` 是否与 UI 版本匹配。
   String? version() {
     try {
-      final fn = _lib.lookupFunction<_VersionFn, _VersionFn>('netdisk_ffi_version');
+      final fn = _lib.lookupFunction<_VersionFn, _VersionFn>(
+        'netdisk_ffi_version',
+      );
       final p = fn();
       final s = p.toDartString();
       _freeString(p);
@@ -139,8 +176,7 @@ class NetdiskClient {
     return {'Error': 'unexpected response: $raw'};
   }
 
-  Map<String, dynamic> _call3(
-      _Call3Fn fn, String first, String second) {
+  Map<String, dynamic> _call3(_Call3Fn fn, String first, String second) {
     final a = first.toNativeUtf8();
     final b = second.toNativeUtf8();
     final res = fn(_h, a, b);
@@ -187,6 +223,27 @@ class NetdiskClient {
     final res = fn(_h, a, b, progress);
     malloc.free(a);
     malloc.free(b);
+    return _decode(res);
+  }
+
+  /// 复制文件（服务端本地复制，数据不过网络）。
+  Map<String, dynamic> copy(String from, String to) {
+    final fn = _copyFn;
+    if (fn == null) {
+      throw StateError('动态库缺少 netdisk_copy：请重新交叉编译 .so');
+    }
+    return _call3(fn, from, to);
+  }
+
+  /// 新建目录（支持多级）。
+  Map<String, dynamic> mkdir(String path) {
+    final fn = _mkdirFn;
+    if (fn == null) {
+      throw StateError('动态库缺少 netdisk_mkdir：请重新交叉编译 .so');
+    }
+    final a = path.toNativeUtf8();
+    final res = fn(_h, a);
+    malloc.free(a);
     return _decode(res);
   }
 
@@ -242,12 +299,20 @@ class NetdiskClient {
 }
 
 /// 把 `Entries` 响应解析成 (path, size) 记录列表。
-List<({String path, int size})> parseEntries(Map<String, dynamic> response) {
+List<({String path, int size, bool isDir})> parseEntries(
+  Map<String, dynamic> response,
+) {
   final err = response['Error'];
   if (err != null) throw StateError(err.toString());
-  final entries = response['Entries']?['entries'] as List<dynamic>? ?? <dynamic>[];
+  final entries =
+      response['Entries']?['entries'] as List<dynamic>? ?? <dynamic>[];
   return entries.map((e) {
     final m = Map<String, dynamic>.from(e as Map);
-    return (path: m['path'] as String, size: (m['size'] as num).toInt());
+    return (
+      path: m['path'] as String,
+      size: (m['size'] as num).toInt(),
+      // 旧服务端不返回该字段，默认按文件处理。
+      isDir: m['is_dir'] as bool? ?? false,
+    );
   }).toList();
 }

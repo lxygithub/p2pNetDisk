@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -28,36 +30,41 @@ class _HomeShellState extends State<HomeShell> {
         index: _index,
         children: const [FilesPage(), TransfersPage(), SettingsPage()],
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
-        destinations: [
-          const NavigationDestination(
-            icon: Icon(Icons.folder_outlined),
-            selectedIcon: Icon(Icons.folder),
-            label: '文件',
+      bottomNavigationBar: ClipRect(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          child: NavigationBar(
+            selectedIndex: _index,
+            onDestinationSelected: (i) => setState(() => _index = i),
+            destinations: [
+              const NavigationDestination(
+                icon: Icon(Icons.folder_outlined),
+                selectedIcon: Icon(Icons.folder),
+                label: '文件',
+              ),
+              NavigationDestination(
+                icon: active > 0
+                    ? Badge(
+                        label: Text('$active'),
+                        child: const Icon(Icons.swap_vert),
+                      )
+                    : const Icon(Icons.swap_vert),
+                selectedIcon: active > 0
+                    ? Badge(
+                        label: Text('$active'),
+                        child: const Icon(Icons.swap_vert),
+                      )
+                    : const Icon(Icons.swap_vert),
+                label: '传输',
+              ),
+              const NavigationDestination(
+                icon: Icon(Icons.settings_outlined),
+                selectedIcon: Icon(Icons.settings),
+                label: '设置',
+              ),
+            ],
           ),
-          NavigationDestination(
-            icon: active > 0
-                ? Badge(
-                    label: Text('$active'),
-                    child: const Icon(Icons.swap_vert),
-                  )
-                : const Icon(Icons.swap_vert),
-            selectedIcon: active > 0
-                ? Badge(
-                    label: Text('$active'),
-                    child: const Icon(Icons.swap_vert),
-                  )
-                : const Icon(Icons.swap_vert),
-            label: '传输',
-          ),
-          const NavigationDestination(
-            icon: Icon(Icons.settings_outlined),
-            selectedIcon: Icon(Icons.settings),
-            label: '设置',
-          ),
-        ],
+        ),
       ),
     );
   }

@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../models/transfer_task.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/glass.dart';
 
 /// 传输队列页：串行执行的上传/下载任务列表，含实时进度与速度。
 class TransfersPage extends StatelessWidget {
@@ -17,9 +18,11 @@ class TransfersPage extends StatelessWidget {
       appBar: AppBar(
         title: const Text('传输'),
         actions: [
-          if (s.tasks.any((t) =>
-              t.status == TransferStatus.done ||
-              t.status == TransferStatus.failed))
+          if (s.tasks.any(
+            (t) =>
+                t.status == TransferStatus.done ||
+                t.status == TransferStatus.failed,
+          ))
             IconButton(
               tooltip: '清除已完成',
               onPressed: s.clearFinishedTasks,
@@ -80,11 +83,10 @@ class _TaskTile extends StatelessWidget {
     final done = task.status == TransferStatus.done;
     final failed = task.status == TransferStatus.failed;
 
-    return Material(
-      color: scheme.surfaceContainerLow,
-      borderRadius: BorderRadius.circular(14),
+    return GlassCard(
+      padding: const EdgeInsets.all(14),
       child: Padding(
-        padding: const EdgeInsets.all(14),
+        padding: EdgeInsets.zero,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -98,8 +100,8 @@ class _TaskTile extends StatelessWidget {
                   color: done
                       ? scheme.primary
                       : failed
-                          ? scheme.error
-                          : scheme.onSurfaceVariant,
+                      ? scheme.error
+                      : scheme.onSurfaceVariant,
                 ),
                 const SizedBox(width: 10),
                 Expanded(
