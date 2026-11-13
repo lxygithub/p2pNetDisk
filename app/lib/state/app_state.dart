@@ -12,20 +12,23 @@ import '../src/netdisk_worker.dart';
 /// 默认走 n0 官方公共 relay（实测 aps1-1/euc1-1 握手 8/8，自建港服仅 2/8）。
 const kDefaultRelay = 'n0';
 
-/// 默认连接地址。公开仓库里**只放占位符**：n0 模式没有应用层鉴权，
+/// 默认 EndpointId。公开仓库里**只放占位符**：n0 模式没有应用层鉴权，
 /// 把真实 EndpointId 写进版本控制等于把网盘地址公开。
 ///
-/// 私有部署用编译期注入，不必改源码（地址也不会进仓库）：
+/// 私有部署用编译期注入，不必改源码（地址也不会进仓库）。只传纯 hex，
+/// 不带 JSON 引号 —— PowerShell 传原生程序时会吃掉参数里的双引号：
 /// ```bash
-/// flutter build apk --debug \
-///   --dart-define=NETDISK_DEFAULT_ADDR='{"id":"<EndpointId>","addrs":[]}'
+/// flutter build apk --debug --dart-define=NETDISK_ENDPOINT_ID=<你的 EndpointId>
 /// ```
-/// n0 模式经 dns.iroh.link 解析出完整地址（含 relay），所以只需 EndpointId；
-/// 服务端换 relay 也不用改。不注入时可在设置页手填（当前参数不持久化）。
-const kDefaultAddr = String.fromEnvironment(
-  'NETDISK_DEFAULT_ADDR',
-  defaultValue: '{"id":"YOUR_ENDPOINT_ID","addrs":[]}',
+/// 不注入时可在设置页手填完整地址（当前参数不持久化，重启需重填）。
+const kDefaultEndpointId = String.fromEnvironment(
+  'NETDISK_ENDPOINT_ID',
+  defaultValue: 'YOUR_ENDPOINT_ID',
 );
+
+/// n0 模式经 dns.iroh.link 解析出完整地址（含 relay），所以只需 EndpointId；
+/// 服务端换 relay 也不用改。
+const kDefaultAddr = '{"id":"$kDefaultEndpointId","addrs":[]}';
 
 /// 应用级状态：连接、文件浏览、传输队列。
 ///

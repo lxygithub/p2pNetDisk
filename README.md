@@ -45,9 +45,10 @@ NETDISK_RELAY_URL=n0 NETDISK_DATA_DIR=./data ./target/release/netdiskd
 ```bash
 cd app
 flutter pub get
-flutter run \
-  --dart-define=NETDISK_DEFAULT_ADDR='{"id":"<你的 EndpointId>","addrs":[]}'
+flutter run --dart-define=NETDISK_ENDPOINT_ID=<你的 EndpointId>
 ```
+
+注入值只是一串十六进制 ID，不含 JSON 引号，PowerShell / Bash 都能直接传。
 
 Relay 填 `n0`、Token 留空；也可以不注入，直接在设置页手填地址（当前版本参数不持久化，重启需重填）。点「连接」→「刷新列表」。
 
