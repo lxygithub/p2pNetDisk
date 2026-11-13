@@ -276,24 +276,33 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> enqueueDownload(String remote, int size) async {
+    await enqueueDownloads([(path: remote, size: size)]);
+  }
+
+  /// 批量下载：一次建好所有任务，再交给队列按并发上限调度。
+  Future<void> enqueueDownloads(List<({String path, int size})> items) async {
     if (!connected) {
       status = '请先连接';
       notifyListeners();
       return;
     }
-    final dir = await getApplicationDocumentsDirectory();
-    final local = p.join(dir.path, 'downloads', p.basename(remote));
-    await Directory(p.dirname(local)).create(recursive: true);
+    if (items.isEmpty) return;
 
-    tasks.add(
-      TransferTask(
-        id: _nextTaskId++,
-        kind: TransferKind.download,
-        remote: remote,
-        local: local,
-        total: size,
-      ),
-    );
+    final dir = await getApplicationDocumentsDirectory();
+    final target = p.join(dir.path, 'downloads');
+    await Directory(target).create(recursive: true);
+
+    for (final item in items) {
+      tasks.add(
+        TransferTask(
+          id: _nextTaskId++,
+          kind: TransferKind.download,
+          remote: item.path,
+          local: p.join(target, p.basename(item.path)),
+          total: item.size,
+        ),
+      );
+    }
     notifyListeners();
     await _pump();
   }
@@ -604,6 +613,97 @@ class AppState extends ChangeNotifier {
     final err = res['Error'];
     if (err != null) throw Exception(err);
     return local;
+  }
+
+  /// 目录规范化：去掉开头的 `/`，补上结尾的 `/`；空串表示根目录。
+  static String _normalizeDir(String raw) {
+    var d = raw.trim();
+    while (d.startsWith('/')) {
+      d = d.substring(1);
+    }
+    if (d.isEmpty) return '';
+    return d.endsWith('/') ? d : '$d/';
+  }
+
+  /// 批量删除。服务端只有单个 Delete，这里串行调用，最后统一刷新一次，
+  /// 避免每删一个都重拉整个列表。
+  Future<void> deleteMany(List<String> paths) async {
+    if (paths.isEmpty) return;
+    busy = true;
+    status = '正在删除 ${paths.length} 个文件…';
+    notifyListeners();
+
+    var ok = 0;
+    final failures = <String>[];
+    for (final path in paths) {
+      try {
+        await _worker.delete(path);
+        ok++;
+      } catch (e) {
+        failures.add('${p.basename(path)}（$e）');
+      }
+    }
+
+    status = failures.isEmpty
+        ? '已删除 $ok 个文件'
+        : '删除完成 $ok 个，失败 ${failures.length} 个：${failures.first}';
+    await refresh(silent: true);
+    busy = false;
+    notifyListeners();
+  }
+
+  /// 批量移动：目标是「目录 + 原文件名」。
+  Future<void> moveMany(List<String> paths, String targetDir) async {
+    if (paths.isEmpty) return;
+    final dir = _normalizeDir(targetDir);
+    busy = true;
+    status = '正在移动 ${paths.length} 个文件…';
+    notifyListeners();
+
+    var ok = 0;
+    final failures = <String>[];
+    for (final path in paths) {
+      try {
+        await _worker.rename(path, '$dir${p.basename(path)}');
+        ok++;
+      } catch (e) {
+        failures.add('${p.basename(path)}（$e）');
+      }
+    }
+
+    status = failures.isEmpty
+        ? '已移动 $ok 个文件'
+        : '移动完成 $ok 个，失败 ${failures.length} 个：${failures.first}';
+    await refresh(silent: true);
+    busy = false;
+    notifyListeners();
+  }
+
+  /// 批量复制：服务端本地复制，不走网络。
+  Future<void> copyMany(List<String> paths, String targetDir) async {
+    if (paths.isEmpty) return;
+    final dir = _normalizeDir(targetDir);
+    busy = true;
+    status = '正在复制 ${paths.length} 个文件…';
+    notifyListeners();
+
+    var ok = 0;
+    final failures = <String>[];
+    for (final path in paths) {
+      try {
+        await _worker.copy(path, '$dir${p.basename(path)}');
+        ok++;
+      } catch (e) {
+        failures.add('${p.basename(path)}（$e）');
+      }
+    }
+
+    status = failures.isEmpty
+        ? '已复制 $ok 个文件'
+        : '复制完成 $ok 个，失败 ${failures.length} 个：${failures.first}';
+    await refresh(silent: true);
+    busy = false;
+    notifyListeners();
   }
 
   void setStatus(String value) {

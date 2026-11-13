@@ -12,42 +12,120 @@ import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
 import 'preview_page.dart';
 
-/// 文件浏览页：面包屑 + 目录/文件列表 + 上传/新建目录入口。
-class FilesPage extends StatelessWidget {
+/// 条目类型（列表里目录与文件共用）。
+typedef _Entry = ({String name, bool isDir, int size, String path});
+
+/// 文件浏览页：面包屑 + 目录/文件列表 + 上传/新建目录/多选批量操作。
+///
+/// 交互约定：
+/// - **点击文件 = 直接预览**（不再经过 ⋮ 菜单）
+/// - **长按 = 进入多选**，此后点击变成勾选
+/// - 点击目录始终是「进入」
+class FilesPage extends StatefulWidget {
   const FilesPage({super.key});
+
+  @override
+  State<FilesPage> createState() => _FilesPageState();
+}
+
+class _FilesPageState extends State<FilesPage> {
+  bool _selectionMode = false;
+  final Set<String> _selected = <String>{};
+
+  AppState get _state => context.read<AppState>();
+
+  void _enterSelection(String path) {
+    setState(() {
+      _selectionMode = true;
+      _selected.add(path);
+    });
+  }
+
+  void _toggle(String path) {
+    setState(() {
+      if (!_selected.add(path)) {
+        _selected.remove(path);
+      }
+      if (_selected.isEmpty) _selectionMode = false;
+    });
+  }
+
+  void _exitSelection() {
+    if (!_selectionMode && _selected.isEmpty) return;
+    setState(() {
+      _selectionMode = false;
+      _selected.clear();
+    });
+  }
+
+  void _selectAll(List<_Entry> entries) {
+    setState(() {
+      _selected
+        ..clear()
+        ..addAll(entries.where((e) => !e.isDir).map((e) => e.path));
+    });
+  }
+
+  void _enterDir(String name) {
+    _exitSelection();
+    _state.enterDir(name);
+  }
+
+  void _openPreview(String path) {
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => PreviewPage(remote: path)));
+  }
 
   @override
   Widget build(BuildContext context) {
     final s = context.watch<AppState>();
+    final entries = s.entries;
+
+    // 切到别的目录后，之前勾选的路径已经不在视图里，顺手清理。
+    if (_selectionMode && _selected.isNotEmpty) {
+      final visible = entries.map((e) => e.path).toSet();
+      if (_selected.any((p) => !visible.contains(p))) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          setState(() {
+            _selected.removeWhere((p) => !visible.contains(p));
+            if (_selected.isEmpty) _selectionMode = false;
+          });
+        });
+      }
+    }
 
     return Scaffold(
       backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: const Text('文件'),
-        actions: [
-          if (s.pathSummary != null) PathChip(text: s.pathSummary!),
-          IconButton(
-            tooltip: '新建目录',
-            onPressed: s.busy || !s.connected ? null : () => _newDir(context),
-            icon: const Icon(Icons.create_new_folder_outlined),
-          ),
-          IconButton(
-            tooltip: '刷新',
-            onPressed: s.busy || !s.connected ? null : () => s.refresh(),
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
+      appBar: _selectionMode ? _selectionAppBar(entries) : _normalAppBar(s),
       body: Column(
         children: [
-          const Breadcrumb(),
-          Expanded(child: _FileList(state: s)),
-          _StatusBar(text: s.status),
+          if (!_selectionMode) const Breadcrumb(),
+          Expanded(
+            child: _FileList(
+              state: s,
+              selectionMode: _selectionMode,
+              selected: _selected,
+              onToggle: _toggle,
+              onLongPress: _enterSelection,
+              onEnterDir: _enterDir,
+              onPreview: _openPreview,
+              onCopy: (path) => _copyDialog(path),
+              onRename: (path) => _renameDialog(path),
+              onDelete: (path) => _deleteConfirm(path),
+              onDownload: (entry) => s.enqueueDownload(entry.path, entry.size),
+            ),
+          ),
+          if (!_selectionMode) _StatusBar(text: s.status),
         ],
       ),
-      floatingActionButton: s.connected
+      bottomNavigationBar: _selectionMode
+          ? _selectionBar(context, entries)
+          : null,
+      floatingActionButton: (!_selectionMode && s.connected)
           ? FloatingActionButton.extended(
-              onPressed: s.busy ? null : () => _pickAndUpload(context),
+              onPressed: s.busy ? null : _pickAndUpload,
               icon: const Icon(Icons.upload_file),
               label: const Text('上传'),
             )
@@ -55,8 +133,178 @@ class FilesPage extends StatelessWidget {
     );
   }
 
-  Future<void> _pickAndUpload(BuildContext context) async {
-    final state = context.read<AppState>();
+  AppBar _normalAppBar(AppState s) {
+    return AppBar(
+      title: const Text('文件'),
+      actions: [
+        if (s.pathSummary != null) PathChip(text: s.pathSummary!),
+        IconButton(
+          tooltip: '新建目录',
+          onPressed: s.busy || !s.connected ? null : _newDir,
+          icon: const Icon(Icons.create_new_folder_outlined),
+        ),
+        IconButton(
+          tooltip: '刷新',
+          onPressed: s.busy || !s.connected ? null : () => s.refresh(),
+          icon: const Icon(Icons.refresh),
+        ),
+      ],
+    );
+  }
+
+  AppBar _selectionAppBar(List<_Entry> entries) {
+    final selectable = entries.where((e) => !e.isDir).length;
+    return AppBar(
+      leading: IconButton(
+        tooltip: '退出多选',
+        icon: const Icon(Icons.close),
+        onPressed: _exitSelection,
+      ),
+      title: Text('已选 ${_selected.length} 项'),
+      actions: [
+        IconButton(
+          tooltip: '全选',
+          icon: const Icon(Icons.select_all),
+          onPressed: selectable == 0 ? null : () => _selectAll(entries),
+        ),
+      ],
+    );
+  }
+
+  Widget _selectionBar(BuildContext context, List<_Entry> entries) {
+    final files = _selectedFiles(entries);
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        child: GlassCard(
+          blur: 16,
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          child: Row(
+            children: [
+              _SelectionAction(
+                icon: Icons.download,
+                label: '下载',
+                enabled: files.isNotEmpty,
+                onTap: () => _batchDownload(files),
+              ),
+              _SelectionAction(
+                icon: Icons.copy_outlined,
+                label: '复制',
+                enabled: files.isNotEmpty,
+                onTap: () => _batchCopy(files),
+              ),
+              _SelectionAction(
+                icon: Icons.drive_file_move_outline,
+                label: '移动',
+                enabled: files.isNotEmpty,
+                onTap: () => _batchMove(files),
+              ),
+              _SelectionAction(
+                icon: Icons.delete_outline,
+                label: '删除',
+                enabled: files.isNotEmpty,
+                onTap: () => _batchDelete(files),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  List<_Entry> _selectedFiles(List<_Entry> entries) => entries
+      .where((e) => !e.isDir && _selected.contains(e.path))
+      .toList(growable: false);
+
+  // ---------------------------------------------------------------------------
+  // 批量操作
+  // ---------------------------------------------------------------------------
+
+  Future<void> _batchDownload(List<_Entry> files) async {
+    final items = [for (final f in files) (path: f.path, size: f.size)];
+    _exitSelection();
+    await _state.enqueueDownloads(items);
+  }
+
+  Future<void> _batchDelete(List<_Entry> files) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('删除 ${files.length} 个文件'),
+        content: const Text('会移入服务端回收站，不会立即物理删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final paths = [for (final f in files) f.path];
+    _exitSelection();
+    await _state.deleteMany(paths);
+  }
+
+  Future<void> _batchCopy(List<_Entry> files) async {
+    final dir = await _askTargetDir('批量复制', '复制到哪个目录？');
+    if (dir == null) return;
+    final paths = [for (final f in files) f.path];
+    _exitSelection();
+    await _state.copyMany(paths, dir);
+  }
+
+  Future<void> _batchMove(List<_Entry> files) async {
+    final dir = await _askTargetDir('批量移动', '移动到哪个目录？');
+    if (dir == null) return;
+    final paths = [for (final f in files) f.path];
+    _exitSelection();
+    await _state.moveMany(paths, dir);
+  }
+
+  /// 目标目录输入框。留空表示根目录；刻意不预填当前目录，
+  /// 否则同一目录内复制/移动会立刻撞上「目标已存在」。
+  Future<String?> _askTargetDir(String title, String hint) async {
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: InputDecoration(
+            labelText: '目标目录',
+            helperText: '$hint（留空 = 根目录）',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 单个操作
+  // ---------------------------------------------------------------------------
+
+  Future<void> _pickAndUpload() async {
+    final state = _state;
 
     List<PlatformFile> picked;
     try {
@@ -72,7 +320,6 @@ class FilesPage extends StatelessWidget {
     for (final f in picked) {
       final path = f.path;
       if (path == null) continue;
-      // v13 的 PlatformFile 没有 size 字段。
       final size = f.lengthSync() ?? await f.length() ?? 0;
       files.add((name: f.name, path: path, size: size));
     }
@@ -83,8 +330,8 @@ class FilesPage extends StatelessWidget {
     await state.enqueueUploads(files);
   }
 
-  Future<void> _newDir(BuildContext context) async {
-    final state = context.read<AppState>();
+  Future<void> _newDir() async {
+    final state = _state;
     final controller = TextEditingController();
     final name = await showDialog<String>(
       context: context,
@@ -115,12 +362,163 @@ class FilesPage extends StatelessWidget {
     if (trimmed.isEmpty) return;
     await state.createDir(trimmed);
   }
+
+  Future<void> _copyDialog(String source) async {
+    final dot = source.lastIndexOf('.');
+    final slash = source.lastIndexOf('/');
+    final suggested = dot > slash
+        ? '${source.substring(0, dot)}_copy${source.substring(dot)}'
+        : '${source}_copy';
+
+    final controller = TextEditingController(text: suggested);
+    final target = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('复制到'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '目标路径',
+            helperText: '服务端本地复制，不消耗流量',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('复制'),
+          ),
+        ],
+      ),
+    );
+    final trimmed = target?.trim() ?? '';
+    controller.dispose();
+    if (trimmed.isEmpty || trimmed == source) return;
+    await _state.copyFile(source, trimmed);
+  }
+
+  Future<void> _deleteConfirm(String path) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除文件'),
+        content: Text('$path\n\n会移入服务端回收站，不会立即物理删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await _state.deleteFile(path);
+  }
+
+  Future<void> _renameDialog(String path) async {
+    final controller = TextEditingController(text: path);
+    final next = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('重命名 / 移动'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '新路径',
+            helperText: '改目录即移动；目标已存在时不会覆盖',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+    final target = next?.trim() ?? '';
+    controller.dispose();
+    if (target.isEmpty || target == path) return;
+    await _state.renameFile(path, target);
+  }
+}
+
+class _SelectionAction extends StatelessWidget {
+  const _SelectionAction({
+    required this.icon,
+    required this.label,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = enabled ? scheme.onSurface : scheme.outline;
+
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: enabled ? onTap : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 20, color: color),
+              const SizedBox(height: 2),
+              Text(label, style: TextStyle(fontSize: 11, color: color)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _FileList extends StatelessWidget {
-  const _FileList({required this.state});
+  const _FileList({
+    required this.state,
+    required this.selectionMode,
+    required this.selected,
+    required this.onToggle,
+    required this.onLongPress,
+    required this.onEnterDir,
+    required this.onPreview,
+    required this.onCopy,
+    required this.onRename,
+    required this.onDelete,
+    required this.onDownload,
+  });
 
   final AppState state;
+  final bool selectionMode;
+  final Set<String> selected;
+  final void Function(String path) onToggle;
+  final void Function(String path) onLongPress;
+  final void Function(String name) onEnterDir;
+  final void Function(String path) onPreview;
+  final void Function(String path) onCopy;
+  final void Function(String path) onRename;
+  final void Function(String path) onDelete;
+  final void Function(_Entry entry) onDownload;
 
   @override
   Widget build(BuildContext context) {
@@ -199,136 +597,33 @@ class _FileList extends StatelessWidget {
       separatorBuilder: (_, _) => const SizedBox(height: 8),
       itemBuilder: (context, i) {
         final e = entries[i];
+
         if (e.isDir) {
           return _DirTile(
             name: e.name,
-            onTap: state.busy ? null : () => state.enterDir(e.name),
-            onRename: () => _renameDialog(context, state, e.path),
+            onTap: state.busy ? null : () => onEnterDir(e.name),
+            onRename: () => onRename(e.path),
           );
         }
+
         return _FileTile(
           name: e.name,
           size: e.size,
           busy: state.busy,
-          onPreview: () => _openPreview(context, e.path),
-          onDownload: () => state.enqueueDownload(e.path, e.size),
-          onCopy: () => _copyDialog(context, state, e.path),
-          onRename: () => _renameDialog(context, state, e.path),
-          onDelete: () => _deleteConfirm(context, state, e.path),
+          selectionMode: selectionMode,
+          selected: selected.contains(e.path),
+          // 点击 = 预览；多选态下点击 = 勾选
+          onTap: selectionMode
+              ? () => onToggle(e.path)
+              : () => onPreview(e.path),
+          onLongPress: () => onLongPress(e.path),
+          onDownload: () => onDownload(e),
+          onCopy: () => onCopy(e.path),
+          onRename: () => onRename(e.path),
+          onDelete: () => onDelete(e.path),
         );
       },
     );
-  }
-
-  void _openPreview(BuildContext context, String path) {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: (_) => PreviewPage(remote: path)));
-  }
-
-  Future<void> _copyDialog(
-    BuildContext context,
-    AppState state,
-    String source,
-  ) async {
-    // 预填「同目录 + _copy 后缀」，比让用户从零输入省事。
-    final dot = source.lastIndexOf('.');
-    final slash = source.lastIndexOf('/');
-    final suggested = dot > slash
-        ? '${source.substring(0, dot)}_copy${source.substring(dot)}'
-        : '${source}_copy';
-
-    final controller = TextEditingController(text: suggested);
-    final target = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('复制到'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '目标路径',
-            helperText: '服务端本地复制，不消耗流量',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('复制'),
-          ),
-        ],
-      ),
-    );
-    final trimmed = target?.trim() ?? '';
-    controller.dispose();
-    if (trimmed.isEmpty || trimmed == source) return;
-    await state.copyFile(source, trimmed);
-  }
-
-  Future<void> _deleteConfirm(
-    BuildContext context,
-    AppState state,
-    String path,
-  ) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('删除文件'),
-        content: Text('$path\n\n会移入服务端回收站，不会立即物理删除。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('删除'),
-          ),
-        ],
-      ),
-    );
-    if (ok == true) await state.deleteFile(path);
-  }
-
-  /// 重命名与移动共用：改整条相对路径，换目录即移动。
-  Future<void> _renameDialog(
-    BuildContext context,
-    AppState state,
-    String path,
-  ) async {
-    final controller = TextEditingController(text: path);
-    final next = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('重命名 / 移动'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '新路径',
-            helperText: '改目录即移动；目标已存在时不会覆盖',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('确定'),
-          ),
-        ],
-      ),
-    );
-    final target = next?.trim() ?? '';
-    controller.dispose();
-    if (target.isEmpty || target == path) return;
-    await state.renameFile(path, target);
   }
 }
 
@@ -379,7 +674,10 @@ class _FileTile extends StatelessWidget {
     required this.name,
     required this.size,
     required this.busy,
-    required this.onPreview,
+    required this.selectionMode,
+    required this.selected,
+    required this.onTap,
+    required this.onLongPress,
     required this.onDownload,
     required this.onCopy,
     required this.onRename,
@@ -389,7 +687,10 @@ class _FileTile extends StatelessWidget {
   final String name;
   final int size;
   final bool busy;
-  final VoidCallback onPreview;
+  final bool selectionMode;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
   final VoidCallback onDownload;
   final VoidCallback onCopy;
   final VoidCallback onRename;
@@ -399,90 +700,95 @@ class _FileTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
 
-    return GlassCard(
-      padding: const EdgeInsets.fromLTRB(14, 10, 4, 10),
-      child: Row(
-        children: [
-          Icon(_iconFor(name), color: scheme.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(name, overflow: TextOverflow.ellipsis),
-                const SizedBox(height: 2),
-                Text(
-                  humanSize(size),
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: scheme.onSurfaceVariant,
+    return GestureDetector(
+      onTap: onTap,
+      onLongPress: busy ? null : onLongPress,
+      child: GlassCard(
+        blur: 0,
+        padding: EdgeInsets.fromLTRB(selectionMode ? 4 : 14, 10, 4, 10),
+        child: Row(
+          children: [
+            if (selectionMode)
+              Checkbox(
+                value: selected,
+                onChanged: (_) => onTap(),
+                visualDensity: VisualDensity.compact,
+              )
+            else
+              Padding(
+                padding: const EdgeInsets.only(right: 12),
+                child: Icon(_iconFor(name), color: scheme.onSurfaceVariant),
+              ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(name, overflow: TextOverflow.ellipsis),
+                  const SizedBox(height: 2),
+                  Text(
+                    humanSize(size),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          PopupMenuButton<String>(
-            enabled: !busy,
-            tooltip: '更多操作',
-            icon: const Icon(Icons.more_vert, size: 20),
-            onSelected: (v) {
-              switch (v) {
-                case 'preview':
-                  onPreview();
-                case 'download':
-                  onDownload();
-                case 'copy':
-                  onCopy();
-                case 'rename':
-                  onRename();
-                case 'delete':
-                  onDelete();
-              }
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(
-                value: 'preview',
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(Icons.visibility_outlined),
-                  title: Text('预览'),
-                ),
+            if (!selectionMode)
+              PopupMenuButton<String>(
+                enabled: !busy,
+                tooltip: '更多操作',
+                icon: const Icon(Icons.more_vert, size: 20),
+                onSelected: (v) {
+                  switch (v) {
+                    case 'download':
+                      onDownload();
+                    case 'copy':
+                      onCopy();
+                    case 'rename':
+                      onRename();
+                    case 'delete':
+                      onDelete();
+                  }
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(
+                    value: 'download',
+                    child: ListTile(
+                      dense: true,
+                      leading: Icon(Icons.download),
+                      title: Text('下载'),
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'copy',
+                    child: ListTile(
+                      dense: true,
+                      leading: Icon(Icons.copy_outlined),
+                      title: Text('复制'),
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'rename',
+                    child: ListTile(
+                      dense: true,
+                      leading: Icon(Icons.drive_file_rename_outline),
+                      title: Text('重命名 / 移动'),
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: ListTile(
+                      dense: true,
+                      leading: Icon(Icons.delete_outline),
+                      title: Text('删除'),
+                    ),
+                  ),
+                ],
               ),
-              PopupMenuItem(
-                value: 'download',
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(Icons.download),
-                  title: Text('下载'),
-                ),
-              ),
-              PopupMenuItem(
-                value: 'copy',
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(Icons.copy_outlined),
-                  title: Text('复制'),
-                ),
-              ),
-              PopupMenuItem(
-                value: 'rename',
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(Icons.drive_file_rename_outline),
-                  title: Text('重命名 / 移动'),
-                ),
-              ),
-              PopupMenuItem(
-                value: 'delete',
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(Icons.delete_outline),
-                  title: Text('删除'),
-                ),
-              ),
-            ],
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

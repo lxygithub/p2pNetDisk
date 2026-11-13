@@ -54,9 +54,16 @@ class _PreviewPageState extends State<PreviewPage> {
     return name.contains('.') ? name.split('.').last.toLowerCase() : '';
   }
 
+  /// 只有图片和文本走预览；其他类型不该为了「看一眼」把整个文件下下来。
+  bool get _supported => _imageExts.contains(_ext) || _textExts.contains(_ext);
+
   @override
   void initState() {
     super.initState();
+    if (!_supported) {
+      _loading = false;
+      return;
+    }
     _load();
   }
 
@@ -90,6 +97,35 @@ class _PreviewPageState extends State<PreviewPage> {
   }
 
   Widget _body() {
+    // 不支持的类型直接给提示，不做任何下载。
+    if (!_supported) {
+      return Center(
+        child: GlassCard(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.insert_drive_file_outlined,
+                size: 44,
+                color: Theme.of(context).colorScheme.outline,
+              ),
+              const SizedBox(height: 10),
+              Text(_ext.isEmpty ? '该文件没有扩展名，无法判断类型' : '暂不支持预览 .$_ext 类型'),
+              const SizedBox(height: 4),
+              Text(
+                '可以下载后用其他应用打开',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (_loading) {
       return const Center(
         child: Column(
