@@ -51,6 +51,26 @@ class _HomePageState extends State<HomePage> {
   bool _busy = false;
   bool _connected = false;
 
+  /// 传输进度（0..1）与「已传 / 总量」文案；非传输时为 null。
+  double? _progress;
+  String? _progressText;
+
+  void _resetProgress() {
+    if (!mounted) return;
+    setState(() {
+      _progress = null;
+      _progressText = null;
+    });
+  }
+
+  void _updateProgress(int sent, int total) {
+    if (!mounted) return;
+    setState(() {
+      _progress = total > 0 ? (sent / total).clamp(0.0, 1.0) : null;
+      _progressText = '${_humanSize(sent)} / ${_humanSize(total)}';
+    });
+  }
+
   @override
   void dispose() {
     _worker.dispose();
@@ -168,7 +188,14 @@ class _HomePageState extends State<HomePage> {
       final name = file.name;
       _setStatus('上传 ${i + 1}/${files.length}：$name');
       try {
-        final res = await _worker.put(name, file.path!);
+        // v13 的 PlatformFile 没有 size 字段，长度要显式取。
+        final total = file.lengthSync() ?? await file.length() ?? 0;
+        final res = await _worker.put(
+          name,
+          file.path!,
+          totalBytes: total,
+          onProgress: _updateProgress,
+        );
         final err = res['Error'];
         if (err != null) {
           throw Exception(err);
@@ -176,6 +203,8 @@ class _HomePageState extends State<HomePage> {
         ok++;
       } catch (e) {
         failures.add('$name（$e）');
+      } finally {
+        _resetProgress();
       }
     }
 
@@ -189,14 +218,19 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Future<void> _download(String remote) async {
+  Future<void> _download(String remote, {int totalBytes = 0}) async {
     setState(() => _busy = true);
     _setStatus('下载 $remote …');
     try {
       final dir = await getApplicationDocumentsDirectory();
       final target = p.join(dir.path, 'downloads', p.basename(remote));
       await Directory(p.dirname(target)).create(recursive: true);
-      final res = await _worker.get(remote, target);
+      final res = await _worker.get(
+        remote,
+        target,
+        totalBytes: totalBytes,
+        onProgress: _updateProgress,
+      );
       final err = res['Error'];
       if (err != null) {
         throw Exception(err);
@@ -206,6 +240,7 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       _setStatus('下载失败: $e');
     } finally {
+      _resetProgress();
       if (mounted) setState(() => _busy = false);
     }
     await _updatePath();
@@ -380,6 +415,22 @@ class _HomePageState extends State<HomePage> {
             ),
             const SizedBox(height: 8),
             Text(_status),
+            // 传输中：有具体进度就画确定进度条，否则画不确定进度条。
+            if (_progress != null) ...[
+              const SizedBox(height: 8),
+              LinearProgressIndicator(value: _progress),
+              if (_progressText != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    _progressText!,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+            ] else if (_busy) ...[
+              const SizedBox(height: 8),
+              const LinearProgressIndicator(),
+            ],
             const Divider(height: 24),
             if (_files.isEmpty)
               const Text('（列表为空，点「刷新列表」）')
@@ -396,7 +447,7 @@ class _HomePageState extends State<HomePage> {
                     onSelected: (v) {
                       switch (v) {
                         case 'download':
-                          _download(f.path);
+                          _download(f.path, totalBytes: f.size);
                         case 'rename':
                           _renameDialog(f.path);
                         case 'delete':

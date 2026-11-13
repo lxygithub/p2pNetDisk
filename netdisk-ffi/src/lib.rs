@@ -18,8 +18,8 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use iroh::{endpoint::Connection, Endpoint, EndpointAddr};
 use netdisk_core::{
-    build_endpoint, copy_exact_with_hash, describe_paths, has_direct_path, parse_addr, read_frame,
-    write_frame, Request, Response, ALPN, MAX_FILE_SIZE,
+    build_endpoint, copy_exact_with_hash_progress, describe_paths, has_direct_path, parse_addr,
+    read_frame, write_frame, Request, Response, ALPN, MAX_FILE_SIZE,
 };
 use tokio::runtime::Runtime;
 
@@ -179,7 +179,12 @@ fn rename_inner(h: *mut Handle, from: *const c_char, to: *const c_char) -> Resul
     })
 }
 
-fn put_inner(h: *mut Handle, remote: *const c_char, local: *const c_char) -> Result<String> {
+fn put_inner(
+    h: *mut Handle,
+    remote: *const c_char,
+    local: *const c_char,
+    progress: *mut u64,
+) -> Result<String> {
     let h = handle_ref(h)?;
     let remote = unsafe { take_str(remote, "remote")? };
     let local = unsafe { take_str(local, "local")? };
@@ -200,7 +205,8 @@ fn put_inner(h: *mut Handle, remote: *const c_char, local: *const c_char) -> Res
             _ => return Err(anyhow!("unexpected response before upload")),
         }
         let mut file = tokio::fs::File::open(&local).await?;
-        let hash = copy_exact_with_hash(&mut file, &mut send, size).await?;
+        let hash =
+            copy_exact_with_hash_progress(&mut file, &mut send, size, progress_ref(progress)).await?;
         let r: Response = read_frame(&mut recv).await?;
         match &r {
             Response::Stored { hash: server_hash, .. } if *server_hash != hash => {
@@ -212,7 +218,12 @@ fn put_inner(h: *mut Handle, remote: *const c_char, local: *const c_char) -> Res
     })
 }
 
-fn get_inner(h: *mut Handle, remote: *const c_char, local: *const c_char) -> Result<String> {
+fn get_inner(
+    h: *mut Handle,
+    remote: *const c_char,
+    local: *const c_char,
+    progress: *mut u64,
+) -> Result<String> {
     let h = handle_ref(h)?;
     let remote = unsafe { take_str(remote, "remote")? };
     let local = unsafe { take_str(local, "local")? };
@@ -230,11 +241,24 @@ fn get_inner(h: *mut Handle, remote: *const c_char, local: *const c_char) -> Res
             _ => return Err(anyhow!("unexpected response to Get")),
         };
         let mut file = tokio::fs::File::create(&local).await?;
-        let hash = copy_exact_with_hash(&mut recv, &mut file, size).await?;
+        let hash =
+            copy_exact_with_hash_progress(&mut recv, &mut file, size, progress_ref(progress)).await?;
         Ok(format!(
             "{{\"Downloaded\":{{\"size\":{size},\"hash\":\"{hash}\"}}}}"
         ))
     })
+}
+
+/// 把 C 传入的 `u64*` 当作原子计数器，用于跨语言读取传输进度。
+///
+/// `AtomicU64` 与 `u64` 的内存布局一致（8 字节、8 字节对齐）：调用方用
+/// `malloc(sizeof(uint64_t))` 分配，Rust 写入已传输字节数，Dart 侧轮询读取。
+fn progress_ref<'a>(p: *mut u64) -> Option<&'a std::sync::atomic::AtomicU64> {
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(p as *const std::sync::atomic::AtomicU64) })
+    }
 }
 
 /// 统一的收尾：失败时清掉缓存的连接，让下一次调用重新握手。
@@ -255,6 +279,29 @@ pub extern "C" fn netdisk_ping(h: *mut Handle) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn netdisk_list(h: *mut Handle) -> *mut c_char {
     finish(h, list_inner(h))
+}
+
+/// 带进度的上传。`progress` 指向一个由调用方分配的 `u64`，
+/// Rust 在传输过程中持续写入「已发送字节数」，结束时等于文件大小。
+#[no_mangle]
+pub extern "C" fn netdisk_put_progress(
+    h: *mut Handle,
+    remote: *const c_char,
+    local: *const c_char,
+    progress: *mut u64,
+) -> *mut c_char {
+    finish(h, put_inner(h, remote, local, progress))
+}
+
+/// 带进度的下载。语义同 [`netdisk_put_progress`]。
+#[no_mangle]
+pub extern "C" fn netdisk_get_progress(
+    h: *mut Handle,
+    remote: *const c_char,
+    local: *const c_char,
+    progress: *mut u64,
+) -> *mut c_char {
+    finish(h, get_inner(h, remote, local, progress))
 }
 
 /// 删除文件（移入服务端回收站，不是硬删）。
@@ -279,7 +326,7 @@ pub extern "C" fn netdisk_put(
     remote: *const c_char,
     local: *const c_char,
 ) -> *mut c_char {
-    finish(h, put_inner(h, remote, local))
+    finish(h, put_inner(h, remote, local, std::ptr::null_mut()))
 }
 
 #[no_mangle]
@@ -288,7 +335,7 @@ pub extern "C" fn netdisk_get(
     remote: *const c_char,
     local: *const c_char,
 ) -> *mut c_char {
-    finish(h, get_inner(h, remote, local))
+    finish(h, get_inner(h, remote, local, std::ptr::null_mut()))
 }
 
 #[no_mangle]

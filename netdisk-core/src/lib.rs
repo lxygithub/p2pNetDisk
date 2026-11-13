@@ -108,6 +108,26 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    copy_exact_with_hash_progress(r, w, size, None).await
+}
+
+/// 与 [`copy_exact_with_hash`] 相同，但把「已传输字节数」实时写进 `progress`。
+///
+/// 这里用共享的原子计数器而不是回调函数，原因是调用方的实际约束：
+/// Rust 的传输跑在 Flutter 的 **worker isolate 里同步阻塞**，这期间该 isolate
+/// 无法处理事件循环，`NativeCallable` 投递过来的回调只能等传输结束后才被处理——
+/// 等于没有进度。改成「Rust 写内存 + Dart 侧另一个 isolate 轮询」，
+/// 两条路径互不阻塞，才能真正看到实时进度。
+pub async fn copy_exact_with_hash_progress<R, W>(
+    r: &mut R,
+    w: &mut W,
+    size: u64,
+    progress: Option<&std::sync::atomic::AtomicU64>,
+) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     if size > MAX_FILE_SIZE {
         bail!("file too large: {size} bytes (limit {MAX_FILE_SIZE})");
     }
@@ -123,8 +143,14 @@ where
         hasher.update(&buf[..n]);
         w.write_all(&buf[..n]).await?;
         remaining -= n as u64;
+        if let Some(p) = progress {
+            p.store(size - remaining, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     w.flush().await?;
+    if let Some(p) = progress {
+        p.store(size, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(hasher.finalize().to_hex().to_string())
 }
 

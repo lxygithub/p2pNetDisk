@@ -14,7 +14,10 @@
 // 主 isolate 侧用 Completer 把回复对应回具体请求。
 
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:isolate';
+
+import 'package:ffi/ffi.dart';
 
 import 'netdisk_ffi.dart';
 
@@ -167,32 +170,51 @@ class NetdiskWorker {
   }
 
   /// 上传本地文件到 [remote]。返回原始响应（Stored 或 Error）。
+  ///
+  /// [onProgress] 会被周期调用（约 250ms 一次，传已发送字节数与总字节数）。
+  /// 回调在主 isolate 上执行，读取的是 Rust 写入的共享内存计数器，不受 worker 阻塞影响。
   Future<Map<String, dynamic>> put(
     String remote,
     String local, {
+    void Function(int sent, int total)? onProgress,
+    int totalBytes = 0,
     void Function(int attempt)? onAttempt,
-  }) =>
-      _retry(
+  }) async {
+    final tracker = _ProgressTracker(onProgress, totalBytes);
+    try {
+      return await _retry(
         'put',
-        <Object?>[remote, local],
+        <Object?>[remote, local, tracker.addr],
         timeLimit: transferTimeout,
         maxAttempts: 2,
         onAttempt: onAttempt,
       );
+    } finally {
+      tracker.dispose();
+    }
+  }
 
   /// 下载 [remote] 到本地 [local]。返回原始响应（Downloaded 或 Error）。
   Future<Map<String, dynamic>> get(
     String remote,
     String local, {
+    void Function(int sent, int total)? onProgress,
+    int totalBytes = 0,
     void Function(int attempt)? onAttempt,
-  }) =>
-      _retry(
+  }) async {
+    final tracker = _ProgressTracker(onProgress, totalBytes);
+    try {
+      return await _retry(
         'get',
-        <Object?>[remote, local],
+        <Object?>[remote, local, tracker.addr],
         timeLimit: transferTimeout,
         maxAttempts: 2,
         onAttempt: onAttempt,
       );
+    } finally {
+      tracker.dispose();
+    }
+  }
 
   /// 删除文件（服务端移入回收站）。返回 `{"Deleted":{path,trash}}`。
   ///
@@ -371,9 +393,17 @@ void _workerMain(List<Object?> boot) {
         case 'list':
           payload = _require(client).listFiles();
         case 'put':
-          payload = _require(client).put(msg[2] as String, msg[3] as String);
+          payload = _require(client).putWithProgress(
+            msg[2] as String,
+            msg[3] as String,
+            _ptrOrNull(msg[4] as int?),
+          );
         case 'get':
-          payload = _require(client).get(msg[2] as String, msg[3] as String);
+          payload = _require(client).getWithProgress(
+            msg[2] as String,
+            msg[3] as String,
+            _ptrOrNull(msg[4] as int?),
+          );
         case 'delete':
           payload = _require(client).delete(msg[2] as String);
         case 'rename':
@@ -388,9 +418,53 @@ void _workerMain(List<Object?> boot) {
   });
 }
 
+/// 传输进度跟踪器。
+///
+/// 分配一块 `u64` 交给 Rust 写「已传输字节数」，自己用定时器读取并回调。
+/// 关键点：内存由主 isolate 分配/释放，只有地址传入 worker —— 生命周期可控，
+/// 不会出现 worker 已 free、主 isolate 还在读的悬空指针。
+class _ProgressTracker {
+  _ProgressTracker(this._sink, this._total) {
+    final sink = _sink;
+    if (sink == null) return;
+    final buf = malloc<Uint64>(1);
+    buf.value = 0;
+    _buf = buf;
+    final view = buf.asTypedList(1);
+    _timer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      sink(view[0], _total);
+    });
+  }
+
+  final void Function(int sent, int total)? _sink;
+  final int _total;
+  Pointer<Uint64>? _buf;
+  Timer? _timer;
+
+  /// `0` 表示本次调用不需要进度。
+  int get addr => _buf?.address ?? 0;
+
+  void dispose() {
+    _timer?.cancel();
+    _timer = null;
+    final buf = _buf;
+    if (buf != null) {
+      malloc.free(buf);
+      _buf = null;
+    }
+  }
+}
+
 NetdiskClient _require(NetdiskClient? client) {
   if (client == null) {
     throw NetdiskWorkerException('未连接：请先调用 init()');
   }
   return client;
 }
+
+/// 进度计数器地址 → 指针。`0` / null 表示这次调用不需要进度。
+///
+/// 内存由**主 isolate** 分配和释放（`malloc<Uint64>(1)`），只把地址传进 worker。
+/// 这样生命周期由调用方掌握，避免 worker 提前 free 而主 isolate 还在轮询。
+Pointer<Uint64> _ptrOrNull(int? addr) =>
+    (addr == null || addr == 0) ? nullptr : Pointer<Uint64>.fromAddress(addr);

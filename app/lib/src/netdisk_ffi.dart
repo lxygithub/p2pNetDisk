@@ -19,6 +19,8 @@ typedef _Call1Fn = Pointer<Utf8> Function(Pointer<NetdiskHandle>);
 typedef _Call2Fn = Pointer<Utf8> Function(Pointer<NetdiskHandle>, Pointer<Utf8>);
 typedef _Call3Fn = Pointer<Utf8> Function(
     Pointer<NetdiskHandle>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _Call4Fn = Pointer<Utf8> Function(
+    Pointer<NetdiskHandle>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Uint64>);
 typedef _LastErrorFn = Pointer<Utf8> Function();
 typedef _VersionFn = Pointer<Utf8> Function();
 typedef _PathsFn = Pointer<Utf8> Function(Pointer<NetdiskHandle>);
@@ -47,6 +49,8 @@ class NetdiskClient {
   _PathsFn? _paths;
   _Call2Fn? _deleteFn;
   _Call3Fn? _renameFn;
+  _Call4Fn? _putProgressFn;
+  _Call4Fn? _getProgressFn;
 
   Pointer<NetdiskHandle>? _handle;
 
@@ -75,6 +79,18 @@ class NetdiskClient {
       _renameFn = lib.lookupFunction<_Call3Fn, _Call3Fn>('netdisk_rename');
     } catch (_) {
       _renameFn = null;
+    }
+    try {
+      _putProgressFn =
+          lib.lookupFunction<_Call4Fn, _Call4Fn>('netdisk_put_progress');
+    } catch (_) {
+      _putProgressFn = null;
+    }
+    try {
+      _getProgressFn =
+          lib.lookupFunction<_Call4Fn, _Call4Fn>('netdisk_get_progress');
+    } catch (_) {
+      _getProgressFn = null;
     }
   }
 
@@ -141,6 +157,38 @@ class NetdiskClient {
       _call3(_put, remote, local);
   Map<String, dynamic> get(String remote, String local) =>
       _call3(_get, remote, local);
+
+  /// 带进度的上传。旧库没有 `netdisk_put_progress` 时自动回落到普通 `put`。
+  Map<String, dynamic> putWithProgress(
+    String remote,
+    String local,
+    Pointer<Uint64> progress,
+  ) {
+    final fn = _putProgressFn;
+    if (fn == null || progress == nullptr) return put(remote, local);
+    final a = remote.toNativeUtf8();
+    final b = local.toNativeUtf8();
+    final res = fn(_h, a, b, progress);
+    malloc.free(a);
+    malloc.free(b);
+    return _decode(res);
+  }
+
+  /// 带进度的下载。旧库回落行为同上。
+  Map<String, dynamic> getWithProgress(
+    String remote,
+    String local,
+    Pointer<Uint64> progress,
+  ) {
+    final fn = _getProgressFn;
+    if (fn == null || progress == nullptr) return get(remote, local);
+    final a = remote.toNativeUtf8();
+    final b = local.toNativeUtf8();
+    final res = fn(_h, a, b, progress);
+    malloc.free(a);
+    malloc.free(b);
+    return _decode(res);
+  }
 
   /// 删除文件（服务端移入回收站，不是硬删）。
   Map<String, dynamic> delete(String path) {
