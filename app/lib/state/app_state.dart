@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../models/transfer_task.dart';
+import '../services/connection_prefs.dart';
 import '../services/list_cache.dart';
 import '../services/transfer_notifications.dart';
 import '../src/netdisk_worker.dart';
@@ -21,7 +22,7 @@ const kDefaultRelay = 'n0';
 /// ```bash
 /// flutter build apk --debug --dart-define=NETDISK_ENDPOINT_ID=<你的 EndpointId>
 /// ```
-/// 不注入时可在设置页手填完整地址（当前参数不持久化，重启需重填）。
+/// 不注入时可在设置页手填完整地址；改动会持久化到本机，重启后自动套用。
 const kDefaultEndpointId = String.fromEnvironment(
   'NETDISK_ENDPOINT_ID',
   defaultValue: 'YOUR_ENDPOINT_ID',
@@ -37,6 +38,16 @@ const kDefaultAddr = '{"id":"$kDefaultEndpointId","addrs":[]}';
 /// （比如传输页要看队列、文件页要看连接态）。这里统一收进 ChangeNotifier，
 /// 页面通过 provider 订阅。
 class AppState extends ChangeNotifier {
+  /// [savedConfig] 在 runApp 之前由 main() 读入；页面构建时连接参数就已就位，
+  /// 不会出现「设置页先显示占位符、随后又被异步覆盖」的竞态。
+  AppState({ConnectionConfig? savedConfig}) {
+    if (savedConfig != null) {
+      relay = savedConfig.relay;
+      token = savedConfig.token;
+      serverAddr = savedConfig.addr;
+    }
+  }
+
   final NetdiskWorker _worker = NetdiskWorker();
 
   // ---- 连接配置 ----
@@ -60,6 +71,9 @@ class AppState extends ChangeNotifier {
   /// 进行中的刷新。bootstrap 自动刷新与用户下拉同时到达时复用同一个 Future，
   /// 避免 worker 串行排队让第二屏多等一整轮 RPC。
   Future<void>? _refreshFuture;
+
+  /// 设置页输入防抖：避免把「清空再粘贴」的中间态写进配置文件。
+  Timer? _configSaveTimer;
 
   /// 启动时的自动初始化：先渲染缓存列表 → 连接 → 后台拉新列表。
   ///
@@ -127,6 +141,54 @@ class AppState extends ChangeNotifier {
 
   int get failedCount =>
       tasks.where((t) => t.status == TransferStatus.failed).length;
+
+  // ---------------------------------------------------------------------------
+  // 连接参数持久化
+  // ---------------------------------------------------------------------------
+
+  /// 设置页每次输入都走这里：内存立即生效，停顿 500ms 后才落盘。
+  void updateConnectionConfig({String? relay, String? token, String? addr}) {
+    if (relay != null) this.relay = relay;
+    if (token != null) this.token = token;
+    if (addr != null) serverAddr = addr;
+    _configSaveTimer?.cancel();
+    _configSaveTimer = Timer(const Duration(milliseconds: 500), () {
+      unawaited(_persistConnectionConfig());
+    });
+  }
+
+  Future<void> _persistConnectionConfig() async {
+    // 与编译期默认完全一致时删掉文件，让注入值重新生效。
+    if (relay == kDefaultRelay && token.isEmpty && serverAddr == kDefaultAddr) {
+      await ConnectionPrefs.clear();
+      return;
+    }
+    // 半截输入不落盘，下次启动仍用上一次的有效配置。
+    if (!ConnectionPrefs.isValidAddr(serverAddr)) return;
+    await ConnectionPrefs.save(
+      ConnectionConfig(relay: relay, token: token, addr: serverAddr),
+    );
+  }
+
+  /// 「恢复默认」：清掉本机配置，回到编译期注入的地址。
+  Future<void> resetConnectionConfig() async {
+    _configSaveTimer?.cancel();
+    relay = kDefaultRelay;
+    token = '';
+    serverAddr = kDefaultAddr;
+    await ConnectionPrefs.clear();
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _worker.dispose();
+    // 输入后 500ms 内就退出时补写一次；没有待写改动则不产生任何磁盘 IO。
+    final pending = _configSaveTimer?.isActive ?? false;
+    _configSaveTimer?.cancel();
+    if (pending) unawaited(_persistConnectionConfig());
+    super.dispose();
+  }
 
   // ---------------------------------------------------------------------------
   // 连接
@@ -783,9 +845,4 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  @override
-  void dispose() {
-    _worker.dispose();
-    super.dispose();
-  }
 }

@@ -23,6 +23,10 @@ migrate_working_dir/
 # is commented out by default.
 #.vscode/
 
+# 本机私有连接配置：含真实 EndpointId / relay token，绝不入库
+netdisk_config.json
+*.dart-define.json
+
 # Flutter/Dart/Pub related
 **/doc/api/
 **/ios/Flutter/.last_build_id

@@ -747,6 +747,40 @@ cargo test    → 6 passed (core) + 1 passed (netdiskd statvfs)
 
 **已知限制**：`statvfs` 只看接收那一刻的可用空间，多个并发任务同时写仍可能超卖（当前 5 并发）；`#[cfg(not(unix))]` 下查不到空间就不拦。16 GiB 是人为防线，真要传更大的文件需要改常量并重编两端。
 
+### 4.17 连接参数持久化：不用每次都手填 EndpointId
+
+**现象**：真机冷启动后设置页显示 `{"id":"YOUR_ENDPOINT_ID","addrs":[]}`，点连接报
+`invalid EndpointAddr JSON: invalid length at line 1 column 24`。JSON 语法没问题，
+column 24 正好是 id 字符串的结束引号 —— 是 EndpointId 反序列化时长度校验失败。
+`YOUR_ENDPOINT_ID` 是公开仓库刻意留的占位符：没注入 `NETDISK_ENDPOINT_ID` 时
+编译期默认值就是它，**不是协议或服务端故障**。
+
+之前设置页参数只在内存里（注释写着「重启要重填」），而每次编译都带
+`--dart-define` 又很麻烦，所以改成按下面顺序生效：
+
+| 顺序 | 来源 | 作用 |
+| --- | --- | --- |
+| 1 | 编译期注入 `--dart-define=NETDISK_ENDPOINT_ID=<值>` | 初始值与兜底，不进仓库 |
+| 2 | 本机 `connection_config.json` | 启动时覆盖，手填一次后重启保留 |
+| 3 | 设置页当前输入 | 立即生效，停顿 500ms 后写回本机 |
+
+**实现要点**
+
+- `services/connection_prefs.dart`：`path_provider` 写到 App 私有文档目录，
+  读/写失败一律静默回落，绝不阻塞启动或本次连接。
+- 只有用户**在设置页改过**才写盘；编译期注入的值不会被复制一份到磁盘。
+  配置与编译期默认完全一致时直接删文件，让注入值重新生效。
+- `main()` 改为 `async`，在 `runApp` 之前读回配置并传给 `AppState` 构造函数。
+  页面构建时地址已是最终值，也保证 `ListCache` 用 `serverAddr.hashCode`
+  做隔离键时取到的是正确服务端的缓存。
+- 落盘前用 `isValidAddr()` 校验 JSON 结构与非空 `id`，「清空再粘贴」的半截
+  输入不会覆盖上一次的有效配置；EndpointId 格式仍由 Rust 侧（iroh）校验。
+- 设置页新增「恢复默认」（带确认对话框），清掉本机配置回到注入值。
+
+**脱敏边界**：配置文件含真实 EndpointId，但只存在于用户手机的 App 私有目录，
+不进版本控制；`.gitignore` 另外忽略 `netdisk_config.json` / `*.dart-define.json`，
+避免用 `--dart-define-from-file` 时把真实值提交进公开仓库。
+
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：
 
