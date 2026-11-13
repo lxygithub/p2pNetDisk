@@ -23,6 +23,8 @@
 | **删除 / 重命名** | ✅ 列表项右侧 ⋮ 菜单；删除是**移入服务端回收站**（`.trash/`），不是硬删。已用 CLI 端到端验证（§4.5） |
 | **传输进度** | ✅ 上传/下载均显示 `LinearProgressIndicator` + 「已传 / 总量」。实现用共享内存计数器而非回调，原因见 §4.6 |
 | **目录浏览** | ✅ 面包屑导航 + 目录优先排序；上传落到当前目录。纯客户端过滤，无需改协议（§4.7） |
+| **UI 重构** | ✅ 三页底部导航（文件/传输/设置）+ `AppState` 状态层 + Material 3 主题（§4.8） |
+| **传输队列 + 速度** | ✅ 串行任务队列，实时进度 + 2 秒滑窗瞬时速度，失败可重试 |
 | **长连接复用** | ✅ FFI 侧改为复用一条 QUIC 连接（原来每条命令重连，打洞来不及完成、`paths()` 只能看到 relay） |
 | `.so` 版本防错配 | ✅ `netdisk_ffi_version()` + 连接前校验；旧库会提示「动态库过旧（不支持 n0）」 |
 | Windows 桌面实际构建 / 运行 | ⛔ 本机无 Visual Studio 2022 C++ 工具链 |
@@ -46,7 +48,12 @@ FFI_SMOKE_OK
 | `netdisk-ffi/` | Rust `cdylib`，导出 C ABI；内部用全局 tokio runtime 驱动 iroh |
 | `app/lib/src/netdisk_ffi.dart` | `dart:ffi` 绑定、字符串分配/释放、`Entries` 解析 |
 | `app/lib/src/netdisk_worker.dart` | **常驻后台 isolate**：所有 FFI 调用在这里串行执行，UI 线程不被阻塞 |
-| `app/lib/main.dart` | 最小 Material 3 界面（全异步，带重试进度提示） |
+| `app/lib/main.dart` | 入口：Provider 注入 `AppState` + 主题 |
+| `app/lib/state/app_state.dart` | 应用状态：连接、文件浏览、**传输队列**（串行消费） |
+| `app/lib/models/transfer_task.dart` | 传输任务模型 + `SpeedMeter` 滑动窗口测速 + 人读格式化 |
+| `app/lib/pages/` | 页面：`home_shell`（底部导航）、`files_page`、`transfers_page`、`settings_page` |
+| `app/lib/widgets/` | 复用组件：`breadcrumb`（路径导航）、`path_chip`（直连/中继徽标） |
+| `app/lib/theme.dart` | Material 3 主题（种子色派生、统一圆角与输入框） |
 | `app/tool/ffi_smoke.dart` | 不启 UI、在主 isolate 直接调 C ABI 的底层冒烟测试 |
 | `app/tool/worker_smoke.dart` | 走 `NetdiskWorker` 的冒烟测试 —— 与 App 实际执行路径一致 |
 | `app/windows/CMakeLists.txt` | 构建时把 `netdisk_ffi.dll` 复制到 exe 同目录 |
@@ -428,6 +435,25 @@ files = ['photos/a.jpg', 'photos/2026/b.jpg', 'notes.txt']
 - 列表里目录在前、文件在后，各按名称排序；点目录进入，点文件右侧 `⋮` 出菜单。
 - 上传落到**当前目录**（`put` 的 remote 为 `$_cwd$fileName`，父目录由服务端自动创建）。
 - 刷新时若 `_cwd` 已被删除或重命名，自动退回根目录，不会停在空视图上。
+
+### 4.8 界面重构：从单页 State 到三页 + 状态层
+
+原来的 `main.dart` 是一个 600 行的 `StatefulWidget`，文件列表、传输、配置全混在一个 `State` 里。加「传输队列」和「通知」时已经无处安放，所以先做了结构拆分：
+
+| 层级 | 职责 |
+| --- | --- |
+| `state/app_state.dart` | `ChangeNotifier`：连接态、文件列表、当前目录、传输队列、状态文案 |
+| `models/transfer_task.dart` | 任务模型 + `SpeedMeter`（2 秒滑动窗口测速） |
+| `pages/` | 三页：文件 / 传输 / 设置，`IndexedStack` 保留各自状态 |
+| `widgets/` | `Breadcrumb`、`PathChip` 等复用组件 |
+
+**为什么用 `provider`**：三页都要读同一份状态（传输页看队列、文件页看连接态、设置页改配置），逐层传参或 `InheritedWidget` 手写都太啰嗦。
+
+**传输队列为什么是串行的**：FFI 句柄内部只有一条 QUIC 连接 + 一个 `Mutex`，并发发多个 `put/get` 只会在锁上排队，还会把共享内存里的进度计数器搅乱（同一块内存只能表示一个传输）。串行让「进度」和「任务」一一对应，也让速度统计准确。
+
+**速度怎么算**：`SpeedMeter` 保留最近 2 秒内的采样点，用 `(最新 sent − 最早 sent) / 时间差` 得瞬时速度。用平均值会把瞬时波动抹平（大文件前 90% 和最后 10% 的速度差异就看不出来了）。
+
+**任务状态机**：`queued → running → done / failed`，失败可「重试」（重新入队并清零进度）。队列清空后自动静默刷新文件列表，保证上传完立刻能看到新文件。
 
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：
