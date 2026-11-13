@@ -26,7 +26,7 @@ class NetdiskApp extends StatelessWidget {
         return state;
       },
       child: MaterialApp(
-        title: '个人网盘',
+        title: 'p2pNetDisk',
         debugShowCheckedModeBanner: false,
         builder: (context, child) =>
             GlassBackground(child: child ?? const SizedBox.shrink()),

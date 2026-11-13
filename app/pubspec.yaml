@@ -1,5 +1,5 @@
 name: netdisk_app
-description: "A new Flutter project."
+description: "p2pNetDisk - 基于 iroh 的 P2P 个人网盘客户端。"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -72,10 +72,9 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  # 设置页「关于」卡片里展示的品牌 Logo（由 tools/generate_app_icon.py 生成）。
+  assets:
+    - assets/images/logo.png
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

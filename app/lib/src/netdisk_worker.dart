@@ -181,8 +181,16 @@ class NetdiskWorker {
   /// 因此这里默认重试，和 `netdisk-cli` 的行为保持一致。
   Future<List<({String path, int size, bool isDir})>> list({
     void Function(int attempt)? onAttempt,
+    Duration? timeLimit,
+    int maxAttempts = 3,
   }) async {
-    final res = await _retry('list', const <Object?>[], onAttempt: onAttempt);
+    final res = await _retry(
+      'list',
+      const <Object?>[],
+      onAttempt: onAttempt,
+      timeLimit: timeLimit,
+      maxAttempts: maxAttempts,
+    );
     return parseEntries(res);
   }
 
@@ -277,6 +285,9 @@ class NetdiskWorker {
     final text = error.toString().toLowerCase();
     return text.contains('timed out') ||
         text.contains('timeout') ||
+        // _call 把 TimeoutException 转成了中文消息，别漏判（否则短超时后不重试）。
+        text.contains('超时') ||
+        text.contains('丢包') ||
         text.contains('connection') ||
         text.contains('reset') ||
         text.contains('unreachable');
@@ -354,7 +365,7 @@ class NetdiskWorker {
       _pending.remove(id);
       final pendingOp = _ops.remove(id);
       throw NetdiskWorkerException(
-        '$pendingOp 超时（${limit.inSeconds}s）：服务端无响应，'
+        '$pendingOp timeout / 超时（${limit.inSeconds}s）：服务端无响应，'
         '可能是链路丢包，请重试',
       );
     }

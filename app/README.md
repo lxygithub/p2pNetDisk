@@ -1,4 +1,4 @@
-# netdisk_app
+# p2pNetDisk
 
 A new Flutter project.
 

@@ -9,7 +9,7 @@
     <!-- 传输期间保持 CPU 唤醒，避免锁屏后网络栈被挂起。 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <application
-        android:label="netdisk_app"
+        android:label="p2pNetDisk"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

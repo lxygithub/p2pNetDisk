@@ -1,4 +1,4 @@
-# netdisk
+# p2pNetDisk
 
 基于 [iroh](https://github.com/n0-computer/iroh) 的个人网盘：服务端跑在家用 Linux（**无公网 IP**），客户端用 Flutter，数据面靠 NAT 打洞 / IPv6 直连，relay 只承担引荐。
 

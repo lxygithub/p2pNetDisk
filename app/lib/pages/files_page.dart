@@ -77,6 +77,21 @@ class _FilesPageState extends State<FilesPage> {
     ).push(MaterialPageRoute<void>(builder: (_) => PreviewPage(remote: path)));
   }
 
+  /// 缓存列表在离线时也可见，但预览/下载/复制/删除都需要连上服务端。
+  /// 统一在这里拦一道，别让「点了没反应」变成看不懂的底层报错。
+  void _runOnline(VoidCallback action) {
+    if (_state.connected) {
+      action();
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('离线中，显示的是缓存列表；连上后再操作'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final s = context.watch<AppState>();
@@ -102,6 +117,8 @@ class _FilesPageState extends State<FilesPage> {
       body: Column(
         children: [
           if (!_selectionMode) const Breadcrumb(),
+          if (!_selectionMode && s.showingCache)
+            _CacheBanner(savedAt: s.cacheTime, refreshing: s.busy),
           Expanded(
             child: _FileList(
               state: s,
@@ -109,19 +126,21 @@ class _FilesPageState extends State<FilesPage> {
               selected: _selected,
               onToggle: _toggle,
               onLongPress: _enterSelection,
+              // 目录导航是纯本地过滤，离线也可用；其余操作要走网络。
               onEnterDir: _enterDir,
-              onPreview: _openPreview,
-              onCopy: (path) => _copyDialog(path),
-              onRename: (path) => _renameDialog(path),
-              onDelete: (path) => _deleteConfirm(path),
-              onDownload: (entry) => s.enqueueDownload(entry.path, entry.size),
+              onPreview: (path) => _runOnline(() => _openPreview(path)),
+              onCopy: (path) => _runOnline(() => _copyDialog(path)),
+              onRename: (path) => _runOnline(() => _renameDialog(path)),
+              onDelete: (path) => _runOnline(() => _deleteConfirm(path)),
+              onDownload: (entry) =>
+                  _runOnline(() => s.enqueueDownload(entry.path, entry.size)),
             ),
           ),
           if (!_selectionMode) _StatusBar(text: s.status),
         ],
       ),
       bottomNavigationBar: _selectionMode
-          ? _selectionBar(context, entries)
+          ? _selectionBar(context, entries, s.connected)
           : null,
       floatingActionButton: (!_selectionMode && s.connected)
           ? FloatingActionButton.extended(
@@ -135,7 +154,7 @@ class _FilesPageState extends State<FilesPage> {
 
   AppBar _normalAppBar(AppState s) {
     return AppBar(
-      title: const Text('文件'),
+      title: const Text('p2pNetDisk'),
       actions: [
         if (s.pathSummary != null) PathChip(text: s.pathSummary!),
         IconButton(
@@ -171,7 +190,11 @@ class _FilesPageState extends State<FilesPage> {
     );
   }
 
-  Widget _selectionBar(BuildContext context, List<_Entry> entries) {
+  Widget _selectionBar(
+    BuildContext context,
+    List<_Entry> entries,
+    bool online,
+  ) {
     final files = _selectedFiles(entries);
 
     return SafeArea(
@@ -185,25 +208,25 @@ class _FilesPageState extends State<FilesPage> {
               _SelectionAction(
                 icon: Icons.download,
                 label: '下载',
-                enabled: files.isNotEmpty,
+                enabled: files.isNotEmpty && online,
                 onTap: () => _batchDownload(files),
               ),
               _SelectionAction(
                 icon: Icons.copy_outlined,
                 label: '复制',
-                enabled: files.isNotEmpty,
+                enabled: files.isNotEmpty && online,
                 onTap: () => _batchCopy(files),
               ),
               _SelectionAction(
                 icon: Icons.drive_file_move_outline,
                 label: '移动',
-                enabled: files.isNotEmpty,
+                enabled: files.isNotEmpty && online,
                 onTap: () => _batchMove(files),
               ),
               _SelectionAction(
                 icon: Icons.delete_outline,
                 label: '删除',
-                enabled: files.isNotEmpty,
+                enabled: files.isNotEmpty && online,
                 onTap: () => _batchDelete(files),
               ),
             ],
@@ -535,7 +558,8 @@ class _FileList extends StatelessWidget {
 
   /// 未连接与空状态也用可滚动容器包住，否则下拉刷新在空白页上失效。
   Widget _content(BuildContext context) {
-    if (!state.connected) {
+    // 有缓存快照时即使还没连上，也把列表渲染出来（配合顶部缓存提示条）。
+    if (!state.connected && !state.showingCache) {
       return ListView(
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
@@ -562,6 +586,8 @@ class _FileList extends StatelessWidget {
     }
 
     if (state.files.isEmpty) {
+      // 正在拉列表时的占位骨架，别先闪一句「还没有文件」再跳成真实列表。
+      if (state.busy && state.connected) return const _SkeletonList();
       return ListView(
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
@@ -878,6 +904,80 @@ class _StatusBar extends StatelessWidget {
         style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
+      ),
+    );
+  }
+}
+
+/// 首屏显示本地缓存时的提示条：说明数据可能过期，同时给出「正在刷新」反馈。
+class _CacheBanner extends StatelessWidget {
+  const _CacheBanner({required this.savedAt, required this.refreshing});
+
+  final DateTime? savedAt;
+  final bool refreshing;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final t = savedAt;
+    final stamp = t == null
+        ? ''
+        : ' · ${t.hour.toString().padLeft(2, '0')}:'
+            '${t.minute.toString().padLeft(2, '0')}';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: scheme.secondaryContainer.withValues(alpha: 0.45),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.history, size: 16, color: scheme.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                refreshing
+                    ? '上次列表$stamp，正在刷新…'
+                    : '上次列表$stamp · 离线，下拉可重试',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+            if (refreshing)
+              const SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 首屏还没拿到列表时的占位骨架，避免空白页跳变与「还没有文件」的误判。
+class _SkeletonList extends StatelessWidget {
+  const _SkeletonList();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ListView.separated(
+      physics: const NeverScrollableScrollPhysics(),
+      padding: kPagePadding,
+      itemCount: 6,
+      separatorBuilder: (_, _) => const SizedBox(height: 8),
+      itemBuilder: (context, i) => Container(
+        height: 68,
+        decoration: BoxDecoration(
+          color: scheme.onSurface.withValues(alpha: 0.07),
+          borderRadius: BorderRadius.circular(16),
+        ),
       ),
     );
   }

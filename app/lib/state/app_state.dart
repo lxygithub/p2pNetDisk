@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../models/transfer_task.dart';
+import '../services/list_cache.dart';
 import '../services/transfer_notifications.dart';
 import '../src/netdisk_worker.dart';
 
@@ -49,7 +50,18 @@ class AppState extends ChangeNotifier {
   String status = '未连接';
   bool _booting = false;
 
-  /// 启动时的自动初始化：连接 → 拉列表。
+  /// 当前显示的列表是否来自本地缓存（还没被真实列表替换）。
+  bool showingCache = false;
+  DateTime? cacheTime;
+
+  /// 上一次列表 RPC 的耗时，状态栏里可见，便于观察首屏耗时。
+  int? lastListMs;
+
+  /// 进行中的刷新。bootstrap 自动刷新与用户下拉同时到达时复用同一个 Future，
+  /// 避免 worker 串行排队让第二屏多等一整轮 RPC。
+  Future<void>? _refreshFuture;
+
+  /// 启动时的自动初始化：先渲染缓存列表 → 连接 → 后台拉新列表。
   ///
   /// 冷启动时网络、DNS、relay 都可能还没就绪，直接把「连接失败」甩给用户很糟。
   /// 所以失败后按 2s / 4s 退避重试，三次都失败才停在错误态，此时仍可手动重试。
@@ -57,12 +69,14 @@ class AppState extends ChangeNotifier {
     if (_booting) return;
     _booting = true;
     try {
-      // Android 13+ 需要运行时授权才能发通知；拒绝也不影响传输本身。
-      await TransferNotifications.ensurePermission();
+      // 通知权限请求与首屏无关，别把平台通道往返压在关键路径上。
+      unawaited(TransferNotifications.ensurePermission());
+      // 本地读快照通常 < 20ms，先让列表可见，再去等网络握手。
+      await _restoreCache();
       for (var attempt = 1; attempt <= 3; attempt++) {
         await connect();
         if (connected) {
-          await refresh();
+          await refresh(firstLoad: true);
           return;
         }
         if (attempt < 3) {
@@ -75,6 +89,18 @@ class AppState extends ChangeNotifier {
     } finally {
       _booting = false;
     }
+  }
+
+  /// 用上一次成功拉取的快照填第一屏。按服务端地址的 hash 隔离，
+  /// 换了一台服务端时不会错误地显示别人的文件列表。
+  Future<void> _restoreCache() async {
+    final snapshot = await ListCache.read(serverAddr.hashCode.toString());
+    if (snapshot == null) return;
+    files = snapshot.entries;
+    showingCache = true;
+    cacheTime = snapshot.savedAt;
+    status = '显示上次列表，正在连接…';
+    notifyListeners();
   }
 
   /// 「直连 · 8 ms」/「中继 · 1.2 s」，未连接或旧库不支持时为 null。
@@ -191,19 +217,41 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> refresh({bool silent = false}) async {
+  /// 防抖：bootstrap 自动刷新与用户下拉/手动刷新同时到达时复用同一次 RPC，
+  /// 否则 worker 串行排队会让第二屏白等一整轮列表请求。
+  Future<void> refresh({bool silent = false, bool firstLoad = false}) {
+    final pending = _refreshFuture;
+    if (pending != null) return pending;
+    final future = _refreshImpl(silent: silent, firstLoad: firstLoad);
+    _refreshFuture = future;
+    unawaited(future.whenComplete(() => _refreshFuture = null));
+    return future;
+  }
+
+  Future<void> _refreshImpl({
+    required bool silent,
+    required bool firstLoad,
+  }) async {
     if (!connected) {
-      status = '请先连接';
-      notifyListeners();
+      // 已经用缓存渲染出列表时，不要用「请先连接」盖掉可见内容。
+      if (!showingCache) {
+        status = '请先连接';
+        notifyListeners();
+      }
       return;
     }
     if (!silent) {
       busy = true;
-      status = '正在拉取列表…';
+      status = showingCache ? '正在刷新列表…' : '正在拉取列表…';
       notifyListeners();
     }
+    final sw = Stopwatch()..start();
     try {
       final list = await _worker.list(
+        // 首屏链路差时，默认 90s 空闲超时会让用户干等一分半。首屏先用
+        // 短超时快速失败并重试一次；手动刷新仍保留宽松超时和 3 次重试。
+        timeLimit: firstLoad ? const Duration(seconds: 15) : null,
+        maxAttempts: firstLoad ? 2 : 3,
         onAttempt: (n) {
           if (n > 1) {
             status = '链路超时，第 $n 次重试…';
@@ -212,27 +260,36 @@ class AppState extends ChangeNotifier {
         },
       );
       files = list;
+      showingCache = false;
+      cacheTime = null;
+      lastListMs = sw.elapsedMilliseconds;
       // 当前目录可能已被删除/重命名，退回根目录避免停在空视图。
       if (cwd.isNotEmpty && !files.any((f) => f.path.startsWith(cwd))) {
         cwd = '';
       }
-      if (!silent) status = '共 ${files.length} 个文件';
+      if (!silent) {
+        status = '共 ${files.length} 个文件 · 列表 ${lastListMs}ms';
+      }
+      unawaited(ListCache.write(serverAddr.hashCode.toString(), files));
     } catch (e) {
       // 链路类错误视为掉线：置为未连接，UI 会给出「重试」，下拉也能重连。
-      // 否则 connected 一直是 true，用户看到的是「已连接但什么都刷不出来」。
+      // 有缓存时保留列表可见，只把状态改成离线提示。
       if (_looksOffline(e)) {
         connected = false;
-        status = '连接已断开，下拉或点「重试」重新连接';
+        status = showingCache
+            ? '连接已断开，显示上次列表 · 下拉重试'
+            : '连接已断开，下拉或点「重试」重新连接';
       } else if (!silent) {
-        status = '刷新失败: $e';
+        status = showingCache ? '刷新失败，显示上次列表: $e' : '刷新失败: $e';
       }
     } finally {
       if (!silent) busy = false;
       notifyListeners();
     }
-    await _updatePath();
+    // 路径摘要只是锦上添花，别让刷新/bootstrap 在它上面多等一次 RPC。
+    unawaited(_updatePath());
     // 打洞要几秒才完成，稍后再读一次路径让「中继」能变成「直连」。
-    Future<void>.delayed(const Duration(seconds: 4), _updatePath);
+    unawaited(Future<void>.delayed(const Duration(seconds: 4), _updatePath));
   }
 
   /// 粗判是否为链路类错误。与 worker 内部的重试判断保持一致的取向：
@@ -241,6 +298,9 @@ class AppState extends ChangeNotifier {
     final t = e.toString().toLowerCase();
     return t.contains('timed out') ||
         t.contains('timeout') ||
+        // worker 的超时消息是中文，漏判会让「已连接」状态卡住不提示掉线。
+        t.contains('超时') ||
+        t.contains('丢包') ||
         t.contains('connection') ||
         t.contains('unreachable') ||
         t.contains('reset') ||

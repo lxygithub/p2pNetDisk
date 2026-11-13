@@ -186,7 +186,42 @@ class _SettingsPageState extends State<SettingsPage> {
           _SectionCard(
             title: '关于',
             children: [
-              _InfoRow(label: '应用', value: '个人网盘 0.1.0'),
+              Row(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Image.asset(
+                      'assets/images/logo.png',
+                      width: 52,
+                      height: 52,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'p2pNetDisk',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: scheme.onSurface,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'P2P 个人网盘客户端',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              _InfoRow(label: '版本', value: '0.1.0'),
               _InfoRow(label: '传输协议', value: 'iroh / QUIC + ALPN netdisk/0'),
               _InfoRow(label: '完整性校验', value: 'BLAKE3 端到端'),
               const SizedBox(height: 8),
