@@ -51,6 +51,12 @@ class _HomePageState extends State<HomePage> {
   bool _busy = false;
   bool _connected = false;
 
+  /// 当前浏览目录，空串表示根目录，否则以 `/` 结尾（如 `photos/2026/`）。
+  ///
+  /// 服务端的 `List` 返回全量递归列表，这里在客户端按前缀过滤出「当前层」，
+  /// 好处是不用改协议；文件量到几万条时再考虑让服务端支持按目录列举。
+  String _cwd = '';
+
   /// 传输进度（0..1）与「已传 / 总量」文案；非传输时为 null。
   double? _progress;
   String? _progressText;
@@ -135,6 +141,10 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() {
         _files = files;
+        // 当前目录可能已被删除/重命名，此时退回根目录，避免停在一个空视图上。
+        if (_cwd.isNotEmpty && !files.any((f) => f.path.startsWith(_cwd))) {
+          _cwd = '';
+        }
         if (!silent) _status = '共 ${files.length} 个文件';
       });
     } catch (e) {
@@ -191,7 +201,7 @@ class _HomePageState extends State<HomePage> {
         // v13 的 PlatformFile 没有 size 字段，长度要显式取。
         final total = file.lengthSync() ?? await file.length() ?? 0;
         final res = await _worker.put(
-          name,
+          '$_cwd$name',
           file.path!,
           totalBytes: total,
           onProgress: _updateProgress,
@@ -256,6 +266,44 @@ class _HomePageState extends State<HomePage> {
       i++;
     }
     return i == 0 ? '$bytes B' : '${v.toStringAsFixed(1)} ${units[i]}';
+  }
+
+  /// 当前目录下的直接子项：目录在前、文件在后，各自按名称排序。
+  List<({String name, bool isDir, int size, String path})> _visibleEntries() {
+    final fileItems = <({String name, bool isDir, int size, String path})>[];
+    final dirNames = <String>{};
+
+    for (final f in _files) {
+      if (!f.path.startsWith(_cwd)) continue;
+      final rest = f.path.substring(_cwd.length);
+      if (rest.isEmpty) continue;
+      final slash = rest.indexOf('/');
+      if (slash < 0) {
+        fileItems.add((name: rest, isDir: false, size: f.size, path: f.path));
+      } else {
+        // 只取第一层目录名，更深的层级留给进入后再展示。
+        dirNames.add(rest.substring(0, slash));
+      }
+    }
+
+    final dirs = dirNames.toList()..sort();
+    fileItems.sort((a, b) => a.name.compareTo(b.name));
+    return [
+      for (final d in dirs)
+        (name: d, isDir: true, size: 0, path: '$_cwd$d/'),
+      ...fileItems,
+    ];
+  }
+
+  void _enterDir(String name) {
+    setState(() => _cwd = '$_cwd$name/');
+  }
+
+  void _goUp() {
+    if (_cwd.isEmpty) return;
+    final trimmed = _cwd.substring(0, _cwd.length - 1);
+    final idx = trimmed.lastIndexOf('/');
+    setState(() => _cwd = idx < 0 ? '' : trimmed.substring(0, idx + 1));
   }
 
   Future<void> _deleteConfirm(String path) async {
@@ -432,59 +480,132 @@ class _HomePageState extends State<HomePage> {
               const LinearProgressIndicator(),
             ],
             const Divider(height: 24),
+            _breadcrumb(),
             if (_files.isEmpty)
               const Text('（列表为空，点「刷新列表」）')
             else
-              for (final f in _files)
-                ListTile(
-                  dense: true,
-                  leading: const Icon(Icons.insert_drive_file),
-                  title: Text(f.path),
-                  subtitle: Text(_humanSize(f.size)),
-                  trailing: PopupMenuButton<String>(
-                    enabled: !_busy,
-                    tooltip: '更多操作',
-                    onSelected: (v) {
-                      switch (v) {
-                        case 'download':
-                          _download(f.path, totalBytes: f.size);
-                        case 'rename':
-                          _renameDialog(f.path);
-                        case 'delete':
-                          _deleteConfirm(f.path);
-                      }
-                    },
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(
-                        value: 'download',
-                        child: ListTile(
-                          dense: true,
-                          leading: Icon(Icons.download),
-                          title: Text('下载'),
-                        ),
-                      ),
-                      PopupMenuItem(
-                        value: 'rename',
-                        child: ListTile(
-                          dense: true,
-                          leading: Icon(Icons.drive_file_rename_outline),
-                          title: Text('重命名'),
-                        ),
-                      ),
-                      PopupMenuItem(
-                        value: 'delete',
-                        child: ListTile(
-                          dense: true,
-                          leading: Icon(Icons.delete_outline),
-                          title: Text('删除'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+              ..._entryTiles(),
           ],
         ),
       ),
     );
+  }
+
+  /// 路径导航：`/` 可点回根目录，每段都可点回对应层级；非根目录时左侧有「上一级」。
+  Widget _breadcrumb() {
+    final parts = _cwd.split('/').where((e) => e.isNotEmpty).toList();
+    return Row(
+      children: [
+        if (_cwd.isNotEmpty)
+          IconButton(
+            tooltip: '上一级',
+            icon: const Icon(Icons.arrow_upward, size: 18),
+            onPressed: _busy ? null : _goUp,
+          ),
+        Expanded(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed:
+                      _busy ? null : () => setState(() => _cwd = ''),
+                  child: const Text('/'),
+                ),
+                for (var i = 0; i < parts.length; i++) ...[
+                  const Icon(Icons.chevron_right, size: 16),
+                  TextButton(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: _busy
+                        ? null
+                        : () => setState(
+                              () => _cwd = '${parts.take(i + 1).join('/')}/',
+                            ),
+                    child: Text(parts[i]),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 当前目录的列表项：目录在前（点击进入），文件在后（右侧 ⋮ 菜单）。
+  List<Widget> _entryTiles() {
+    final entries = _visibleEntries();
+    if (entries.isEmpty) {
+      return const [
+        Padding(
+          padding: EdgeInsets.symmetric(vertical: 16),
+          child: Text('（此目录为空，可用「上传」放到这里）'),
+        ),
+      ];
+    }
+
+    return [
+      for (final e in entries)
+        if (e.isDir)
+          ListTile(
+            dense: true,
+            leading: const Icon(Icons.folder),
+            title: Text(e.name),
+            trailing: const Icon(Icons.chevron_right, size: 18),
+            onTap: _busy ? null : () => _enterDir(e.name),
+          )
+        else
+          ListTile(
+            dense: true,
+            leading: const Icon(Icons.insert_drive_file),
+            title: Text(e.name),
+            subtitle: Text(_humanSize(e.size)),
+            trailing: PopupMenuButton<String>(
+              enabled: !_busy,
+              tooltip: '更多操作',
+              onSelected: (v) {
+                switch (v) {
+                  case 'download':
+                    _download(e.path, totalBytes: e.size);
+                  case 'rename':
+                    _renameDialog(e.path);
+                  case 'delete':
+                    _deleteConfirm(e.path);
+                }
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(
+                  value: 'download',
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(Icons.download),
+                    title: Text('下载'),
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'rename',
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(Icons.drive_file_rename_outline),
+                    title: Text('重命名'),
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'delete',
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(Icons.delete_outline),
+                    title: Text('删除'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+    ];
   }
 }
