@@ -412,7 +412,10 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 把整个队列的状态汇总成**一条**通知。
+  /// 前台服务是否在运行（决定通知走 startService 还是普通 show）。
+  bool _serviceRunning = false;
+
+  /// 把整个队列的状态汇总成**一条**通知，同时驱动前台服务保活。
   ///
   /// 不按任务发多条：5 个并发会瞬间刷出 5 条通知，用户还得挨个清。
   /// 汇总成「进行中 2 · 排队 1（已完成 3/6）」反而一眼能看懂。
@@ -424,8 +427,16 @@ class AppState extends ChangeNotifier {
     final done = tasks.where((t) => t.status == TransferStatus.done).length;
     final failed = tasks.where((t) => t.status == TransferStatus.failed).length;
 
-    if (running + queued == 0) {
-      if (done + failed == 0) {
+    final active = running + queued;
+    final finished = done + failed;
+
+    if (active == 0) {
+      if (_serviceRunning) {
+        _serviceRunning = false;
+        unawaited(_finishNotification(done, failed));
+        return;
+      }
+      if (finished == 0) {
         unawaited(TransferNotifications.cancel());
         return;
       }
@@ -433,7 +444,6 @@ class AppState extends ChangeNotifier {
         TransferNotifications.show(
           title: failed == 0 ? '传输完成' : '部分传输失败',
           text: failed == 0 ? '$done 个文件已完成' : '$done 个完成，$failed 个失败',
-          // 结束后不再显示进度条
           ongoing: false,
           force: true,
         ),
@@ -441,21 +451,56 @@ class AppState extends ChangeNotifier {
       return;
     }
 
-    final total = running + queued + done + failed;
-    final finished = done + failed;
+    final total = active + finished;
     final parts = <String>[
       if (running > 0) '进行中 $running',
       if (queued > 0) '排队 $queued',
     ];
+    final title = '正在传输';
+    final text = '${parts.join(' · ')}（已完成 $finished/$total）';
+    final progress = total > 0 ? finished * 100 ~/ total : null;
+
+    // 第一次有任务时拉起前台服务：锁屏/切后台后进程才不会被回收。
+    if (!_serviceRunning) {
+      _serviceRunning = true;
+      unawaited(
+        TransferNotifications.startService(
+          title: title,
+          text: text,
+          progress: progress,
+        ),
+      );
+      return;
+    }
 
     unawaited(
-      TransferNotifications.show(
-        title: '正在传输',
-        text: '${parts.join(' · ')}（已完成 $finished/$total）',
-        progress: total > 0 ? finished * 100 ~/ total : null,
-        ongoing: true,
+      TransferNotifications.updateService(
+        title: title,
+        text: text,
+        progress: progress,
         force: force,
       ),
+    );
+  }
+
+  /// 收尾：先撤前台服务，再补一条结果通知。
+  ///
+  /// 顺序不能反 —— `stopForeground(REMOVE)` 会把当前通知一起抹掉，
+  /// 若先发结果通知再停服务，用户什么都看不到。
+  Future<void> _finishNotification(int done, int failed) async {
+    await TransferNotifications.stopService();
+    // stopForeground 由系统异步处理，稍等再发，避免刚发就被移除。
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    if (done + failed == 0) {
+      await TransferNotifications.cancel();
+      return;
+    }
+    await TransferNotifications.show(
+      title: failed == 0 ? '传输完成' : '部分传输失败',
+      text: failed == 0 ? '$done 个文件已完成' : '$done 个完成，$failed 个失败',
+      ongoing: false,
+      force: true,
     );
   }
 

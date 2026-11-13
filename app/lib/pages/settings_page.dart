@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../services/transfer_notifications.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/glass.dart';
@@ -22,6 +23,10 @@ class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _token;
   late final TextEditingController _addr;
 
+  /// 电池优化豁免状态；null 表示查询中或平台不支持。
+  bool? _ignoringBattery;
+  Map<String, Object?>? _device;
+
   @override
   void initState() {
     super.initState();
@@ -29,6 +34,43 @@ class _SettingsPageState extends State<SettingsPage> {
     _relay = TextEditingController(text: s.relay);
     _token = TextEditingController(text: s.token);
     _addr = TextEditingController(text: s.serverAddr);
+    _loadDevice();
+  }
+
+  Future<void> _loadDevice() async {
+    final ignoring =
+        await TransferNotifications.isIgnoringBatteryOptimizations();
+    final info = await TransferNotifications.deviceInfo();
+    if (!mounted) return;
+    setState(() {
+      _ignoringBattery = ignoring;
+      _device = info;
+    });
+  }
+
+  Future<void> _requestIgnoreBattery() async {
+    final opened =
+        await TransferNotifications.requestIgnoreBatteryOptimizations();
+    if (!mounted) return;
+    if (!opened) {
+      _snack('无法打开电池优化设置，请在系统设置中手动操作');
+      return;
+    }
+    // 用户可能停留一会儿才回来，延迟刷新状态。
+    await Future<void>.delayed(const Duration(seconds: 2));
+    await _loadDevice();
+  }
+
+  Future<void> _openAutoStart() async {
+    final hit = await TransferNotifications.openAutoStartSettings();
+    if (!mounted) return;
+    if (!hit) _snack('未找到厂商专属页面，已打开应用详情');
+  }
+
+  void _snack(String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -139,6 +181,8 @@ class _SettingsPageState extends State<SettingsPage> {
             ],
           ),
           const SizedBox(height: 16),
+          _backgroundCard(),
+          const SizedBox(height: 16),
           _SectionCard(
             title: '关于',
             children: [
@@ -159,6 +203,59 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _backgroundCard() {
+    final scheme = Theme.of(context).colorScheme;
+    final device = _device;
+    final deviceLabel = device == null
+        ? '未知'
+        : '${device['manufacturer']} ${device['model']}'
+              '${device['harmony'] == true ? ' · HarmonyOS' : ''}';
+
+    final ignoring = _ignoringBattery;
+
+    return _SectionCard(
+      title: '后台运行',
+      children: [
+        _InfoRow(label: '设备', value: deviceLabel),
+        _InfoRow(
+          label: '电池优化',
+          value: ignoring == null ? '未知' : (ignoring ? '已豁免' : '未豁免'),
+        ),
+        const SizedBox(height: 12),
+        if (ignoring == false) ...[
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _requestIgnoreBattery,
+              icon: const Icon(Icons.battery_saver_outlined),
+              label: const Text('关闭电池优化'),
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _openAutoStart,
+            icon: const Icon(Icons.tune),
+            label: const Text('自启动 / 后台管理设置'),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          '锁屏或切到后台时系统可能冻结进程，导致传输中断。'
+          '华为/荣耀需在「应用启动管理」允许后台活动，小米需开「自启动」，'
+          'OPPO/vivo 需允许后台运行。',
+          style: TextStyle(
+            fontSize: 12,
+            color: scheme.onSurfaceVariant,
+            height: 1.5,
+          ),
+        ),
+      ],
     );
   }
 }

@@ -1,6 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Android 13+ 发送通知需要运行时授权（在 MainActivity 里请求）。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 传输期间用前台服务保活；Android 14+ 需要声明前台服务类型。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 引导用户关闭电池优化（选项页），否则后台容易被冻结。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 传输期间保持 CPU 唤醒，避免锁屏后网络栈被挂起。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <application
         android:label="netdisk_app"
         android:name="${applicationName}"
@@ -27,6 +34,10 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <service
+            android:name=".TransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

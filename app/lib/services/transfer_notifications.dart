@@ -66,4 +66,115 @@ class TransferNotifications {
       _available = false;
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // 前台服务（后台保活）
+  // ---------------------------------------------------------------------------
+
+  /// 启动前台服务。必须带一条通知，否则系统会拒绝。
+  static Future<void> startService({
+    required String title,
+    required String text,
+    int? progress,
+  }) async {
+    if (!_available) return;
+    try {
+      await _channel.invokeMethod<void>('startService', <String, Object?>{
+        'title': title,
+        'text': text,
+        'progress': progress ?? -1,
+      });
+    } catch (_) {
+      _available = false;
+    }
+  }
+
+  static Future<void> updateService({
+    required String title,
+    required String text,
+    int? progress,
+    bool force = false,
+  }) async {
+    if (!_available) return;
+
+    final now = DateTime.now();
+    if (!force && now.difference(_lastShown) < _minInterval) return;
+    _lastShown = now;
+
+    try {
+      await _channel.invokeMethod<void>('updateService', <String, Object?>{
+        'title': title,
+        'text': text,
+        'progress': progress ?? -1,
+      });
+    } catch (_) {
+      _available = false;
+    }
+  }
+
+  static Future<void> stopService() async {
+    if (!_available) return;
+    try {
+      await _channel.invokeMethod<void>('stopService');
+    } catch (_) {
+      _available = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 厂商后台策略
+  // ---------------------------------------------------------------------------
+
+  /// 是否已豁免电池优化；平台不支持时返回 null。
+  static Future<bool?> isIgnoringBatteryOptimizations() async {
+    if (!_available) return null;
+    try {
+      return await _channel.invokeMethod<bool>(
+        'isIgnoringBatteryOptimizations',
+      );
+    } catch (_) {
+      _available = false;
+      return null;
+    }
+  }
+
+  /// 弹出系统的「忽略电池优化」确认框。
+  static Future<bool> requestIgnoreBatteryOptimizations() async {
+    if (!_available) return false;
+    try {
+      return await _channel.invokeMethod<bool>(
+            'requestIgnoreBatteryOptimizations',
+          ) ??
+          false;
+    } catch (_) {
+      _available = false;
+      return false;
+    }
+  }
+
+  /// 跳转厂商的「自启动 / 后台管理」页；返回是否命中了厂商专属页面。
+  static Future<bool> openAutoStartSettings() async {
+    if (!_available) return false;
+    try {
+      return await _channel.invokeMethod<bool>('openAutoStartSettings') ??
+          false;
+    } catch (_) {
+      _available = false;
+      return false;
+    }
+  }
+
+  /// 设备信息：manufacturer / brand / model / sdk / harmony。
+  static Future<Map<String, Object?>?> deviceInfo() async {
+    if (!_available) return null;
+    try {
+      final res = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'deviceInfo',
+      );
+      return res?.map((k, v) => MapEntry(k.toString(), v));
+    } catch (_) {
+      _available = false;
+      return null;
+    }
+  }
 }
