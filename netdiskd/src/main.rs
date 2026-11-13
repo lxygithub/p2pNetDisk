@@ -63,6 +63,28 @@ impl ProtocolHandler for Handler {
     }
 }
 
+/// 返回 path 所在文件系统的可用字节数（普通用户实际能写的量）。
+///
+/// 固定 512MB 上限并不能真正防止打满磁盘 —— 盘剩 2G 时传 10 个 500MB
+/// 一样会写满。改成按 `statvfs` 的 `f_bavail * f_frsize` 判断才对。
+/// 查不到（非 Unix / 系统调用失败）时返回 None，表示「不拦」，不阻断正常上传。
+#[cfg(unix)]
+fn available_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn available_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
 /// 用泛型承接 iroh 的 SendStream / RecvStream，避免绑定具体类型名。
 async fn handle_stream<S, R>(mut send: S, mut recv: R, root: Arc<PathBuf>) -> Result<()>
 where
@@ -99,7 +121,9 @@ where
             if size > MAX_FILE_SIZE {
                 write_frame(
                     &mut send,
-                    &Response::Error(format!("file too large: {size} bytes")),
+                    &Response::Error(format!(
+                        "file too large: {size} bytes (limit {MAX_FILE_SIZE})"
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -154,6 +178,24 @@ where
                 0
             };
 
+            let remaining = size - start;
+
+            // 固定上限只挡异常值，真正防止打满磁盘看可用空间。
+            // 留 1GiB 给系统日志、回收站，别把盘写满导致服务自己挂掉。
+            // 检查要在回 Ready 之前做：客户端会直接收到 Error，而不是传一半才断。
+            const DISK_RESERVE: u64 = 1024 * 1024 * 1024;
+            if let Some(free) = available_bytes(root.as_path()) {
+                let usable = free.saturating_sub(DISK_RESERVE);
+                if remaining > usable {
+                    let msg = format!(
+                        "not enough disk space: need {remaining} bytes, available {usable}"
+                    );
+                    println!("[netdiskd] reject {path}: {msg}");
+                    write_frame(&mut send, &Response::Error(msg)).await?;
+                    return Ok(());
+                }
+            }
+
             let mut file = if start > 0 {
                 tokio::fs::OpenOptions::new()
                     .append(true)
@@ -172,18 +214,21 @@ where
                 write_frame(&mut send, &Response::Ready { offset: start }).await?;
             }
 
-            let remaining = size - start;
             if start > 0 {
                 println!("[netdiskd] resume {path} at {start} bytes ({remaining} left)");
             }
-            copy_exact_with_hash(&mut recv, &mut file, remaining).await?;
+            let stream_hash = copy_exact_with_hash(&mut recv, &mut file, remaining).await?;
             file.sync_all().await?;
             drop(file);
 
-            // 续传只收到片段，`copy_exact_with_hash` 返回的是片段 hash，不能用。
-            // 落盘前把整个文件重算一遍，才谈得上完整性校验。
-            let tmp_for_hash = tmp.clone();
-            let hash = tokio::task::spawn_blocking(move || hash_file(&tmp_for_hash)).await??;
+            // start=0 时边收边算的就是完整文件 hash，直接用，省一次全文件读盘。
+            // 只有续传（只收到片段）才需要事后重读整文件重算。
+            let hash = if start == 0 {
+                stream_hash
+            } else {
+                let tmp_for_hash = tmp.clone();
+                tokio::task::spawn_blocking(move || hash_file(&tmp_for_hash)).await??
+            };
             std::fs::rename(&tmp, &target)?;
 
             write_frame(
@@ -337,4 +382,20 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     let _ = router.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn available_bytes_reports_real_free_space() {
+        let free = available_bytes(std::path::Path::new("/tmp"))
+            .expect("statvfs should work on the server");
+        assert!(free > 0, "free space must be positive");
+        // 只是 sanity check：/tmp 所在盘不应少于 1MB，避免单位换算写错
+        // （f_bavail 是块数，必须乘 f_frsize）。
+        assert!(free > 1024 * 1024, "unexpectedly small free space: {free}");
+    }
 }

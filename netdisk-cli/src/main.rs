@@ -74,9 +74,6 @@ async fn run_command(conn: Connection, cmd: &[String]) -> Result<()> {
                 .with_context(|| format!("cannot stat {}", local.display()))?
                 .len();
 
-            // 完整 hash 先算好：续传时只发片段，片段 hash 无法与服务端比对。
-            let local_hash = hash_file(&local)?;
-
             // NETDISK_LEGACY_PUT=1 用来模拟还没升级的旧客户端，
             // 验证服务端确实兼容（回归测试用，不是产品功能）。
             let legacy = env::var_os("NETDISK_LEGACY_PUT").is_some();
@@ -118,13 +115,19 @@ async fn run_command(conn: Connection, cmd: &[String]) -> Result<()> {
                 use tokio::io::AsyncSeekExt;
                 file.seek(std::io::SeekFrom::Start(start)).await?;
             }
-            copy_exact_with_hash(&mut file, &mut send, size - start).await?;
+            // start=0 时流式 hash 就是完整文件 hash；续传才需重读整文件。
+            let stream_hash = copy_exact_with_hash(&mut file, &mut send, size - start).await?;
 
             let r: Response = read_frame(&mut recv).await?;
             match r {
                 Response::Stored { hash, size: n, path } => {
-                    if hash != local_hash {
-                        bail!("hash mismatch: local={local_hash} server={hash}");
+                    let expected = if start == 0 {
+                        stream_hash
+                    } else {
+                        hash_file(&local)?
+                    };
+                    if hash != expected {
+                        bail!("hash mismatch: local={expected} server={hash}");
                     }
                     println!("uploaded {path} ({n} bytes) blake3={hash}");
                 }

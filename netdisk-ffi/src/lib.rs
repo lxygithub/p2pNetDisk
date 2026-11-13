@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use iroh::{endpoint::Connection, Endpoint, EndpointAddr};
 use netdisk_core::{
     build_endpoint, copy_exact_with_hash_progress, describe_paths, has_direct_path, hash_file,
-    parse_addr, read_frame, read_put_ready, write_frame, Request, Response, ALPN, MAX_FILE_SIZE,
+    parse_addr, read_frame, read_put_ready, write_frame, Request, Response, ALPN,
 };
 use tokio::runtime::Runtime;
 
@@ -232,9 +232,9 @@ fn put_inner(
         let size = std::fs::metadata(&local)
             .with_context(|| format!("cannot stat {local}"))?
             .len();
-        if size > MAX_FILE_SIZE {
-            return Err(anyhow!("file too large: {size} bytes"));
-        }
+        // 不在这里做大小预检：决策点只放服务端一份，否则客户端常量和服务端
+        // 一旦不同步又会变成「莫名其妙传不了」。服务端会在一个小的 Put 帧后
+        // 立刻回 Error，代价只是一次往返。
         let conn = h.connection().await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         // offset 只是「建议值」，真正的起点由服务端在 Ready 里给出。
@@ -254,21 +254,15 @@ fn put_inner(
             return Err(anyhow!("server offset {start} exceeds file size {size}"));
         }
 
-        // 完整文件的 hash 必须在传输前算好：续传时只发片段，
-        // 片段 hash 无法与服务的完整文件 hash 比对。
-        let local_for_hash = local.clone();
-        let expected = tokio::task::spawn_blocking(move || {
-            hash_file(std::path::Path::new(&local_for_hash))
-        })
-        .await??;
-
         let mut file = tokio::fs::File::open(&local).await?;
         if start > 0 {
             use tokio::io::AsyncSeekExt;
             file.seek(std::io::SeekFrom::Start(start)).await?;
         }
         let remaining = size - start;
-        let _ = copy_exact_with_hash_progress(
+        // 边传边算的 hash：start=0 时就是完整文件 hash，省掉一次全文件读盘。
+        // 只有续传（只发了片段）才需要事后把整个文件重读一遍重算。
+        let stream_hash = copy_exact_with_hash_progress(
             &mut file,
             &mut send,
             remaining,
@@ -279,10 +273,21 @@ fn put_inner(
 
         let r: Response = read_frame(&mut recv).await?;
         match &r {
-            Response::Stored { hash: server_hash, .. } if *server_hash != expected => {
-                return Err(anyhow!(
-                    "hash mismatch: local={expected} server={server_hash}"
-                ));
+            Response::Stored { hash: server_hash, .. } => {
+                let expected = if start == 0 {
+                    stream_hash
+                } else {
+                    let local_for_hash = local.clone();
+                    tokio::task::spawn_blocking(move || {
+                        hash_file(std::path::Path::new(&local_for_hash))
+                    })
+                    .await??
+                };
+                if *server_hash != expected {
+                    return Err(anyhow!(
+                        "hash mismatch: local={expected} server={server_hash}"
+                    ));
+                }
             }
             _ => {}
         }

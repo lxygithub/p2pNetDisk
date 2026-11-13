@@ -94,11 +94,11 @@ NETDISK_RELAY_URL=n0 \
 
 - ~~密钥临时~~ **已解决**：`netdisk-core::load_or_create_secret` 落盘 32 字节 Ed25519 种子（0600），`netdiskd` 用 `build_endpoint_with_secret` 注入；重启后 `EndpointId` 不变。
 - **没有元数据层**：`list` 靠递归扫目录，无 SQLite / oplog / revision，因此也没有 D4 的同名自动重命名与 LWW 仲裁。
-- **没有断点续传**：单文件上限 512 MB，中断需重传；计划改用 `iroh-blobs`。
+- ~~没有断点续传~~ **已解决**：`Put` 一次往返协商 `offset` + `.part` 续传（`FLUTTER_CLIENT.md` §4.12）。单文件上限从 512 MB 提到 16 GiB 异常值防线，实际由服务端按磁盘可用空间判断（§4.16）。
 - **没有静态加密**（D3 已确认不做），服务端目录明文落盘。
 - **并发写不安全**：同路径并发 `put` 会争用同一个 `.netdisk-tmp` 临时文件，MVP 单用户串行使用。
 - **路径防护**已拒绝绝对路径与 `..`，但尚未防符号链接逃逸；存储目录不要放软链。
-- **Flutter 前端尚未接入**：这一版先用 `netdisk-cli` 代表客户端，避免 FFI/NDK 风险和产品逻辑同时卡住。
+- ~~Flutter 前端尚未接入~~ **已解决**：Android 客户端已通过 `dart:ffi` 接入并真机验证上传/下载/预览；`netdisk-cli` 现在主要用作端到端回归与旧协议模拟。
 
 ## 下一步路线
 

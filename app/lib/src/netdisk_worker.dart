@@ -53,6 +53,21 @@ class NetdiskWorker {
   int _seq = 0;
   bool _disposed = false;
 
+  /// 大文件按体积放宽传输超时。
+  ///
+  /// 固定的 30 分钟是按小文件定的：手机走中继时约 1MB/s，600MB 就要
+  /// 10 分钟以上，2GB 必然被超时打断。按最差 **256 KB/s** 估算并加 5 分钟
+  /// 建连/校验余量，上限 6 小时；小任务仍保持 30 分钟，避免卡死时干等。
+  Duration _transferTimeoutFor(int totalBytes) {
+    if (totalBytes <= 0) return transferTimeout;
+    const maxLimit = Duration(hours: 6);
+    final estimate =
+        Duration(seconds: totalBytes ~/ (256 * 1024)) +
+        const Duration(minutes: 5);
+    if (estimate <= transferTimeout) return transferTimeout;
+    return estimate > maxLimit ? maxLimit : estimate;
+  }
+
   /// worker 是否已就绪。
   bool get isRunning => _tx != null;
 
@@ -187,7 +202,7 @@ class NetdiskWorker {
       return await _retry(
         'put',
         <Object?>[remote, local, tracker.addr],
-        timeLimit: transferTimeout,
+        timeLimit: _transferTimeoutFor(totalBytes),
         maxAttempts: 2,
         onAttempt: onAttempt,
       );
@@ -209,7 +224,7 @@ class NetdiskWorker {
       return await _retry(
         'get',
         <Object?>[remote, local, tracker.addr],
-        timeLimit: transferTimeout,
+        timeLimit: _transferTimeoutFor(totalBytes),
         maxAttempts: 2,
         onAttempt: onAttempt,
       );
