@@ -154,6 +154,31 @@ fn list_inner(h: *mut Handle) -> Result<String> {
     })
 }
 
+fn delete_inner(h: *mut Handle, path: *const c_char) -> Result<String> {
+    let h = handle_ref(h)?;
+    let path = unsafe { take_str(path, "path")? };
+    RT.block_on(async {
+        let conn = h.connection().await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &Request::Delete { path }).await?;
+        let r: Response = read_frame(&mut recv).await?;
+        Ok(serde_json::to_string(&r)?)
+    })
+}
+
+fn rename_inner(h: *mut Handle, from: *const c_char, to: *const c_char) -> Result<String> {
+    let h = handle_ref(h)?;
+    let from = unsafe { take_str(from, "from")? };
+    let to = unsafe { take_str(to, "to")? };
+    RT.block_on(async {
+        let conn = h.connection().await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &Request::Rename { from, to }).await?;
+        let r: Response = read_frame(&mut recv).await?;
+        Ok(serde_json::to_string(&r)?)
+    })
+}
+
 fn put_inner(h: *mut Handle, remote: *const c_char, local: *const c_char) -> Result<String> {
     let h = handle_ref(h)?;
     let remote = unsafe { take_str(remote, "remote")? };
@@ -230,6 +255,22 @@ pub extern "C" fn netdisk_ping(h: *mut Handle) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn netdisk_list(h: *mut Handle) -> *mut c_char {
     finish(h, list_inner(h))
+}
+
+/// 删除文件（移入服务端回收站，不是硬删）。
+#[no_mangle]
+pub extern "C" fn netdisk_delete(h: *mut Handle, path: *const c_char) -> *mut c_char {
+    finish(h, delete_inner(h, path))
+}
+
+/// 重命名 / 移动文件；目标已存在时服务端会报错。
+#[no_mangle]
+pub extern "C" fn netdisk_rename(
+    h: *mut Handle,
+    from: *const c_char,
+    to: *const c_char,
+) -> *mut c_char {
+    finish(h, rename_inner(h, from, to))
 }
 
 #[no_mangle]

@@ -17,8 +17,10 @@
 | Android 真机 / 模拟器 | ✅ UI 启动、`netdisk_init` 成功（界面显示「已连接」） |
 | FFI 执行位置 | ✅ 已改为常驻后台 isolate（`netdisk_worker.dart`）；此前在 UI isolate 同步调用导致 **ANR**，见 §4.1 |
 | **Android `list`（真机）** | ✅ **已拿到文件列表**：n0 官方 relay（自动选中 `aps1-1`）+ 后台 isolate，一次成功 |
-| **上传 / 下载（UI）** | ✅ 已实现：`file_picker` 多选上传、列表项下载到 App 文档目录；待真机验证（§4.3） |
+| **上传 / 下载（UI）** | ✅ 已实现：`file_picker` 多选上传、列表项下载到 App 文档目录；**上传已真机验证**（1.1MB 落到数据盘，BLAKE3 一致） |
+| 手机直连稳定性 | ⚠️ 时好时坏：11:41 走 IPv6 直连 RTT 32ms，13:01 上传时 `direct=NO`（全程 relay，RTT 0.9–1.8s）。见 §4.4 |
 | **传输路径显示** | ✅ 标题栏 Chip 显示「直连 · 5 ms」/「中继 · 1.2 s」，数据来自 `netdisk_paths()` |
+| **删除 / 重命名** | ✅ 列表项右侧 ⋮ 菜单；删除是**移入服务端回收站**（`.trash/`），不是硬删。已用 CLI 端到端验证（§4.5） |
 | **长连接复用** | ✅ FFI 侧改为复用一条 QUIC 连接（原来每条命令重连，打洞来不及完成、`paths()` 只能看到 relay） |
 | `.so` 版本防错配 | ✅ `netdisk_ffi_version()` + 连接前校验；旧库会提示「动态库过旧（不支持 n0）」 |
 | Windows 桌面实际构建 / 运行 | ⛔ 本机无 Visual Studio 2022 C++ 工具链 |
@@ -168,6 +170,34 @@ cd D:\workdbuddy\workspace\iroh\app\android
 
 然后重跑。为减少对代理的依赖，项目已加阿里云镜像（`settings.gradle.kts` 的 `pluginManagement` 与根 `build.gradle.kts` 的 `allprojects`），并在 `gradle.properties` 里把 `*.aliyun.com` 加入 `nonProxyHosts` 走直连；官方源保留兜底，镜像缺包时 Gradle 会自动回落。
 
+### 3.5 根本原因：Gradle 默认没有 HTTP 超时
+
+只加镜像是治不好的。真正的坑在 `gradle.properties`：
+
+```properties
+systemProp.org.gradle.internal.http.connectionTimeout=15000
+systemProp.org.gradle.internal.http.socketTimeout=30000
+systemProp.org.gradle.internal.repository.max.retries=3
+systemProp.org.gradle.internal.repository.initial.backoff=500
+```
+
+**Gradle 的 HTTP 客户端默认没有 socket 读超时。** 一条连接如果 TCP 握手成功、但对端后续不返回数据（跨境链路被干扰的典型表现），Gradle 会一直阻塞读，既不失败也不继续 —— build 就永久停在 `assembleDebug`。
+
+判断方法（很可靠）：**间隔 40 秒采样两次 `~/.gradle/caches` 的大小，delta 为 0 就说明是挂起而不是慢**。
+
+```powershell
+$p="$env:USERPROFILE\.gradle\caches"
+(Get-ChildItem $p -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum
+Start-Sleep 40
+(Get-ChildItem $p -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum
+```
+
+配合 `jstack` 看线程，会看到主线程停在 `DefaultBuildOperationQueue.waitForWorkToComplete`，worker 停在 `SocketInputStream.read` —— 就是标准的「等一个永远不会来的响应」。
+
+**改完 `systemProp.*` 必须停 daemon**（`gradlew --stop`），因为这些属性只在 daemon 启动时读取一次。
+
+顺带开启的构建效率项：`org.gradle.parallel=true`、`org.gradle.caching=true`、`android.enableJetifier=false`（新项目全是 AndroidX，不需要 Jetifier 全量扫描）。
+
 ## 4. 冒烟测试（已可复现）
 
 默认走 **n0 官方公共 relay**，不需要 token，地址只给 EndpointId（由 `dns.iroh.link` 解析）：
@@ -289,6 +319,63 @@ cd app; flutter build apk --debug; flutter install
 | 打洞 | 来不及完成，一直走 relay | 几秒后切直连，`paths()` 能读到 |
 | 连接失效 | 每条都是新连接，天然规避 | 靠 `close_reason()` + 失败清缓存重连 |
 
+### 4.4 手机直连不稳定：同一台设备两次结果不同
+
+| 时间 | 服务端观察到的路径 | RTT |
+| --- | --- | --- |
+| 11:41（点刷新列表） | `direct* [2001:db8:1:...]` —— **公网 IPv6 直连** | 32 ms |
+| 13:01（上传 1.1MB） | `relay* aps1-1`，`direct=NO` —— **全程中继** | 0.9–1.8 s |
+
+同一台手机、同一台服务器、几小时内两种结果。可能原因：
+
+- 手机在 WiFi 与 5G 之间切换过，两个网络的 IPv6 可达性不同；
+- 手机侧 IPv6 前缀/地址变化（隐私地址轮换），服务端拿到的旧候选已失效；
+- 运营商的 IPv6 防火墙策略在这个时段收紧。
+
+**结论**：IPv6 直连是「有则几乎必成」，但**不保证一直有**。不能假设手机永远直连。
+
+**应对顺序**（按性价比）：
+
+1. App 里已经显示路径 Chip（「直连 · 32ms」/「中继 · 1.2s」），用户能自己判断当前状态——这是最先该做的，已完成；
+2. 小文件走中继可以接受（n0 免费、无 SLA，但 1MB 级别没问题）；
+3. 要稳定直连，最省事的是给手机也装 Tailscale，iroh 会自动识别 `100.64/10` 网段做直连（桌面端实测 5–8ms）；
+4. 长期方案仍是自建 relay（回到 R14 的线路问题）。
+
+**排查方法**：服务端 `netdiskd` 日志里看 `paths +4s` 那一行的 `direct=YES/NO`，比在客户端猜更准 —— 因为服务端看到的是它自己这一侧的完整路径集合。
+
+### 4.5 删除 / 重命名：语义与验证
+
+**删除不是硬删**。服务端把文件 `rename` 到 `<data>/.trash/<unix秒>-<文件名>`，架构 §5.3 约定的「用户主动删除走回收站」由此落地。`.trash` 以 `.` 开头，`safe_path`（拒绝任何 `.` 开头的组件）和 `list_entries`（跳过 `.` 开头的项）都会把它排除，所以：
+
+- 客户端看不到回收站；
+- 也无法通过 `get` 读到 `../.trash/xxx`；
+- 同名文件在同一秒内被删时，会追加序号避免互相覆盖。
+
+**重命名不覆盖**。目标已存在时服务端直接返回错误：
+
+```
+$ netdisk-cli rename rn-test-renamed.txt e2e/final.bin
+Error: server: target already exists: e2e/final.bin
+```
+
+这是刻意的：覆盖属于 `Put` 的语义（架构 D4 的 LWW），重命名不该成为「静默盖掉别人文件」的途径。重命名同时充当移动，`to` 可以带子目录（父目录会自动创建）。
+
+**CLI 端到端验证记录**：
+
+```
+put     : uploaded rn-test.txt (14 bytes) blake3=2839f650...
+rename  : renamed rn-test.txt -> rn-test-renamed.txt
+list    : 14  rn-test-renamed.txt
+rename→已存在: Error: server: target already exists: e2e/final.bin
+delete  : deleted rn-test-renamed.txt -> .trash/1794547119-rn-test-renamed.txt
+list    : （已消失）
+.trash/ : 1794547119-rn-test-renamed.txt  14 bytes   ← 仍在数据盘
+```
+
+服务端日志同步确认：`[netdiskd] deleted rn-test-renamed.txt -> .trash/1794547119-rn-test-renamed.txt`。
+
+**UI 入口**：文件列表每项右侧 `⋮` → 下载 / 重命名 / 删除。删除有确认对话框，并说明「会移入回收站，不会立即物理删除」。
+
 ## 5. 平台落地（待工具链）
 
 **Windows 桌面**（本机缺 VS 2022）：
@@ -324,6 +411,8 @@ flutter build apk --debug
 | `netdisk_put(handle, remote, local)` | 返回 `{"Stored":{path,size,hash}}`；本地与服务端 hash 不一致会报错 |
 | `netdisk_get(handle, remote, local)` | 返回 `{"Downloaded":{size,hash}}` |
 | `netdisk_last_error()` | 最近一次错误文本 |
+| `netdisk_delete(handle, path)` | 删除文件（移入回收站）：`{"Deleted":{"path":..,"trash":..}}` |
+| `netdisk_rename(handle, from, to)` | 重命名 / 移动：`{"Renamed":{"from":..,"to":..}}`；目标已存在时返回 `Error` |
 | `netdisk_paths(handle)` | 当前连接路径：`{"Paths":{"desc":"relay ... | direct* ...","direct":true}}` |
 | `netdisk_ffi_version()` | 能力标记，如 `netdisk-ffi 0.1.0 (relay-modes: n0,custom; proto: netdisk/0)` |
 | `netdisk_string_free(ptr)` | 释放 Rust 返回的字符串（Dart 侧已封装） |
@@ -337,8 +426,10 @@ flutter build apk --debug
 
 - **下载文件在 App 私有目录**：`.../AppDocuments/downloads/`，用户需通过文件管理器或后续接「分享 / 另存」（`share_plus`）才能拿到。
 - **无上传进度**：Rust 侧是一次性阻塞调用，只有开始/结束两个状态；要做真实进度条需要在 `copy_exact_with_hash` 里加回调/事件。
+- **回收站不会自动清理**：删除只是移到 `<data>/.trash/`，目前没有保留期策略与恢复 UI。`.trash` 以 `.` 开头，`list_entries` 与 `safe_path` 都会排除它，用户既看不到也访问不到。
+- **目录不能整棵删除**：`Delete` 只接受文件，删目录需要逐个删除文件（服务端会明确报错，不会误删）。
 - **token 与地址未持久化**：退出应用后要重填（n0 模式只需点「连接」，痛点已减轻）。
-- **无删除 / 重命名命令**：冒烟测试留下的 `e2e/*.bin` 只能到服务器上手工删。
+- **无断点续传**：中断后要重传整个文件。
 - **Windows 桌面仍未验证**（缺 VS 2022 C++ 工具链）；Android 已跑通到「连接」，`list / put / get` 待实测。
 - **「已连接」≠ 可用**：`netdisk_init` 只建 endpoint，不校验 token、不发 RPC。真正的验证是点「刷新列表」。
 

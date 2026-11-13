@@ -211,6 +211,95 @@ class _HomePageState extends State<HomePage> {
     await _updatePath();
   }
 
+  /// 字节数转成易读单位。
+  static String _humanSize(int bytes) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var v = bytes.toDouble();
+    var i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return i == 0 ? '$bytes B' : '${v.toStringAsFixed(1)} ${units[i]}';
+  }
+
+  Future<void> _deleteConfirm(String path) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除文件'),
+        content: Text('$path\n\n会移入服务端回收站（.trash/），不会立即物理删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    setState(() => _busy = true);
+    _setStatus('正在删除 $path …');
+    try {
+      await _worker.delete(path);
+      _setStatus('已删除：$path（在服务端回收站）');
+      await _refresh(silent: true);
+    } catch (e) {
+      _setStatus('删除失败: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _renameDialog(String current) async {
+    final controller = TextEditingController(text: current);
+    final next = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('重命名 / 移动'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '新路径（可含子目录）',
+            helperText: '目标已存在时不会覆盖，会直接报错',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+
+    final target = next?.trim() ?? '';
+    controller.dispose();
+    if (!mounted || target.isEmpty || target == current) return;
+
+    setState(() => _busy = true);
+    _setStatus('正在重命名为 $target …');
+    try {
+      await _worker.rename(current, target);
+      _setStatus('已重命名：$current → $target');
+      await _refresh(silent: true);
+    } catch (e) {
+      _setStatus('重命名失败: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -300,11 +389,46 @@ class _HomePageState extends State<HomePage> {
                   dense: true,
                   leading: const Icon(Icons.insert_drive_file),
                   title: Text(f.path),
-                  subtitle: Text('${f.size} bytes'),
-                  trailing: IconButton(
-                    tooltip: '下载到 App 文档目录',
-                    icon: const Icon(Icons.download),
-                    onPressed: _busy ? null : () => _download(f.path),
+                  subtitle: Text(_humanSize(f.size)),
+                  trailing: PopupMenuButton<String>(
+                    enabled: !_busy,
+                    tooltip: '更多操作',
+                    onSelected: (v) {
+                      switch (v) {
+                        case 'download':
+                          _download(f.path);
+                        case 'rename':
+                          _renameDialog(f.path);
+                        case 'delete':
+                          _deleteConfirm(f.path);
+                      }
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(
+                        value: 'download',
+                        child: ListTile(
+                          dense: true,
+                          leading: Icon(Icons.download),
+                          title: Text('下载'),
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'rename',
+                        child: ListTile(
+                          dense: true,
+                          leading: Icon(Icons.drive_file_rename_outline),
+                          title: Text('重命名'),
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'delete',
+                        child: ListTile(
+                          dense: true,
+                          leading: Icon(Icons.delete_outline),
+                          title: Text('删除'),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
           ],

@@ -12,8 +12,8 @@ use iroh::{
 };
 use netdisk_core::{
     addr_to_json, build_endpoint_with_secret, copy_exact_with_hash, describe_paths, list_entries,
-    load_or_create_secret, public_addr, read_frame, safe_path, write_frame, FileEntry, Request,
-    Response, ALPN, DEFAULT_RELAY_URL, MAX_FILE_SIZE,
+    load_or_create_secret, move_to_trash, public_addr, read_frame, rename_entry, safe_path,
+    write_frame, FileEntry, Request, Response, ALPN, DEFAULT_RELAY_URL, MAX_FILE_SIZE,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -163,6 +163,22 @@ where
             println!("[netdiskd] sent {size} bytes, blake3={hash}");
             Ok(())
         }
+
+        Request::Delete { path } => match move_to_trash(&root, &path) {
+            Ok(trash) => {
+                println!("[netdiskd] deleted {path} -> {trash}");
+                write_frame(&mut send, &Response::Deleted { path, trash }).await
+            }
+            Err(e) => write_frame(&mut send, &Response::Error(e.to_string())).await,
+        },
+
+        Request::Rename { from, to } => match rename_entry(&root, &from, &to) {
+            Ok(()) => {
+                println!("[netdiskd] renamed {from} -> {to}");
+                write_frame(&mut send, &Response::Renamed { from, to }).await
+            }
+            Err(e) => write_frame(&mut send, &Response::Error(e.to_string())).await,
+        },
     };
 
     if let Err(e) = result {

@@ -43,6 +43,10 @@ pub enum Request {
     List,
     Put { path: String, size: u64 },
     Get { path: String },
+    /// 删除：移入回收站，**不是硬删**（架构 §5.3 约定，30 天后才真正清理）。
+    Delete { path: String },
+    /// 重命名 / 移动。`to` 是目标相对路径，可与 `from` 不同目录。
+    Rename { from: String, to: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +58,9 @@ pub enum Response {
     /// `Get` 的响应头，随后紧跟 `size` 字节裸数据。
     File { size: u64 },
     Stored { path: String, size: u64, hash: String },
+    /// 删除成功。`trash` 是回收站内的相对路径，保留以便将来实现恢复。
+    Deleted { path: String, trash: String },
+    Renamed { from: String, to: String },
     Error(String),
 }
 
@@ -324,6 +331,66 @@ pub fn safe_path(root: &Path, raw: &str) -> Result<PathBuf> {
 }
 
 /// 递归列出文件（同步实现；MVP 文件量小，后续换成 SQLite 索引）。
+/// 回收站目录名。以 `.` 开头，因此 `safe_path` 与 `list_entries` 都会把它排除，
+/// 用户既看不到、也无法通过协议直接访问。
+pub const TRASH_DIR: &str = ".trash";
+
+/// 把 `root/<rel>` 移入回收站，返回回收站内的相对路径。
+///
+/// **不是硬删**：文件仍在数据盘上，只是移出用户可见的树，符合架构 §5.3
+/// 「用户主动删除走回收站」的约定。超过保留期后的真正清理留给后续阶段。
+///
+/// 同一秒内删除同名文件时会追加序号，避免覆盖之前删的同类文件。
+pub fn move_to_trash(root: &Path, rel: &str) -> Result<String> {
+    let src = safe_path(root, rel)?;
+    let meta = std::fs::symlink_metadata(&src).with_context(|| format!("not found: {rel}"))?;
+    if meta.is_dir() {
+        bail!("refusing to delete a directory (delete its files one by one): {rel}");
+    }
+
+    let trash_dir = root.join(TRASH_DIR);
+    std::fs::create_dir_all(&trash_dir)?;
+
+    let base = src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut candidate = format!("{stamp}-{base}");
+    let mut n = 1;
+    while trash_dir.join(&candidate).exists() {
+        candidate = format!("{stamp}-{n}-{base}");
+        n += 1;
+    }
+
+    std::fs::rename(&src, trash_dir.join(&candidate))?;
+    Ok(format!("{TRASH_DIR}/{candidate}"))
+}
+
+/// 重命名 / 移动文件。
+///
+/// 目标已存在时报错而不是覆盖 —— 覆盖属于 `Put` 的语义（架构 D4 的 LWW），
+/// 重命名不该成为「静默覆盖别人文件」的途径。
+pub fn rename_entry(root: &Path, from: &str, to: &str) -> Result<()> {
+    let src = safe_path(root, from)?;
+    let dst = safe_path(root, to)?;
+    if !src.exists() {
+        bail!("not found: {from}");
+    }
+    if dst.exists() {
+        bail!("target already exists: {to}");
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&src, &dst)?;
+    Ok(())
+}
+
 pub fn list_entries(root: &Path) -> Result<Vec<FileEntry>> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> Result<()> {
         if !dir.exists() {

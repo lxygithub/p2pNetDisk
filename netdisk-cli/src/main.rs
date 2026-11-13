@@ -14,7 +14,8 @@ use netdisk_core::{
 };
 
 fn usage() -> String {
-    "usage: netdisk-cli <ping|list|put <local> <remote>|get <remote> <local>>".to_string()
+    "usage: netdisk-cli <ping|list|put <local> <remote>|get <remote> <local>|delete <remote>|rename <from> <to>>"
+        .to_string()
 }
 
 async fn run_command(conn: Connection, cmd: &[String]) -> Result<()> {
@@ -118,6 +119,43 @@ async fn run_command(conn: Connection, cmd: &[String]) -> Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
+
+        "delete" => {
+            if cmd.len() != 2 {
+                bail!("{}", usage());
+            }
+            let remote = cmd[1].clone();
+            write_frame(&mut send, &Request::Delete { path: remote.clone() }).await?;
+            let r: Response = read_frame(&mut recv).await?;
+            match r {
+                Response::Deleted { trash, .. } => println!("deleted {remote} -> {trash}"),
+                Response::Error(e) => bail!("server: {e}"),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+
+        "rename" => {
+            if cmd.len() != 3 {
+                bail!("{}", usage());
+            }
+            let from = cmd[1].clone();
+            let to = cmd[2].clone();
+            write_frame(
+                &mut send,
+                &Request::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+            )
+            .await?;
+            let r: Response = read_frame(&mut recv).await?;
+            match r {
+                Response::Renamed { .. } => println!("renamed {from} -> {to}"),
+                Response::Error(e) => bail!("server: {e}"),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+
 
         other => bail!("unknown command '{other}'. {}", usage()),
     }

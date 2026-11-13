@@ -194,10 +194,33 @@ class NetdiskWorker {
         onAttempt: onAttempt,
       );
 
+  /// 删除文件（服务端移入回收站）。返回 `{"Deleted":{path,trash}}`。
+  ///
+  /// 只重试 2 次：第一次可能已经删成功但响应在丢包中丢了，第二次会报
+  /// `not found` —— 那其实是成功，UI 刷新后文件消失即可，不必当失败处理。
+  Future<Map<String, dynamic>> delete(
+    String path, {
+    void Function(int attempt)? onAttempt,
+  }) =>
+      _retry('delete', <Object?>[path], maxAttempts: 2, onAttempt: onAttempt);
+
+  /// 重命名 / 移动。目标已存在时服务端返回错误（不覆盖）。
+  Future<Map<String, dynamic>> rename(
+    String from,
+    String to, {
+    void Function(int attempt)? onAttempt,
+  }) =>
+      _retry(
+        'rename',
+        <Object?>[from, to],
+        maxAttempts: 2,
+        onAttempt: onAttempt,
+      );
+
   /// 只对「链路类」错误重试（超时 / 连接失败）。
   ///
-  /// token 被拒、路径不存在、hash 不一致这些是确定性错误，重试只会浪费时间，
-  /// 所以直接抛出。
+  /// token 被拒、路径不存在、hash 不一致这类确定性错误重试只会浪费时间，
+  /// 直接抛出。
   static bool _isTransient(Object error) {
     if (error is TimeoutException) return true;
     final text = error.toString().toLowerCase();
@@ -351,6 +374,10 @@ void _workerMain(List<Object?> boot) {
           payload = _require(client).put(msg[2] as String, msg[3] as String);
         case 'get':
           payload = _require(client).get(msg[2] as String, msg[3] as String);
+        case 'delete':
+          payload = _require(client).delete(msg[2] as String);
+        case 'rename':
+          payload = _require(client).rename(msg[2] as String, msg[3] as String);
         default:
           throw NetdiskWorkerException('unknown op: $op');
       }

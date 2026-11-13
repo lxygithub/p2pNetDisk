@@ -16,6 +16,7 @@ final class NetdiskHandle extends Opaque {}
 typedef _InitFn = Pointer<NetdiskHandle> Function(
     Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 typedef _Call1Fn = Pointer<Utf8> Function(Pointer<NetdiskHandle>);
+typedef _Call2Fn = Pointer<Utf8> Function(Pointer<NetdiskHandle>, Pointer<Utf8>);
 typedef _Call3Fn = Pointer<Utf8> Function(
     Pointer<NetdiskHandle>, Pointer<Utf8>, Pointer<Utf8>);
 typedef _LastErrorFn = Pointer<Utf8> Function();
@@ -44,6 +45,8 @@ class NetdiskClient {
   late final _CloseDart _closeHandle;
   /// 旧库可能没有这个符号（可选能力）。
   _PathsFn? _paths;
+  _Call2Fn? _deleteFn;
+  _Call3Fn? _renameFn;
 
   Pointer<NetdiskHandle>? _handle;
 
@@ -62,6 +65,16 @@ class NetdiskClient {
       _paths = lib.lookupFunction<_PathsFn, _PathsFn>('netdisk_paths');
     } catch (_) {
       _paths = null;
+    }
+    try {
+      _deleteFn = lib.lookupFunction<_Call2Fn, _Call2Fn>('netdisk_delete');
+    } catch (_) {
+      _deleteFn = null;
+    }
+    try {
+      _renameFn = lib.lookupFunction<_Call3Fn, _Call3Fn>('netdisk_rename');
+    } catch (_) {
+      _renameFn = null;
     }
   }
 
@@ -128,6 +141,27 @@ class NetdiskClient {
       _call3(_put, remote, local);
   Map<String, dynamic> get(String remote, String local) =>
       _call3(_get, remote, local);
+
+  /// 删除文件（服务端移入回收站，不是硬删）。
+  Map<String, dynamic> delete(String path) {
+    final fn = _deleteFn;
+    if (fn == null) {
+      throw StateError('动态库缺少 netdisk_delete：请重新交叉编译 .so');
+    }
+    final a = path.toNativeUtf8();
+    final res = fn(_h, a);
+    malloc.free(a);
+    return _decode(res);
+  }
+
+  /// 重命名 / 移动；目标已存在时服务端返回 Error。
+  Map<String, dynamic> rename(String from, String to) {
+    final fn = _renameFn;
+    if (fn == null) {
+      throw StateError('动态库缺少 netdisk_rename：请重新交叉编译 .so');
+    }
+    return _call3(fn, from, to);
+  }
 
   String lastError() {
     final p = _lastError();
