@@ -12,9 +12,9 @@ use iroh::{
 };
 use netdisk_core::{
     addr_to_json, build_endpoint_with_secret, copy_exact_with_hash, describe_paths, list_entries,
-    copy_entry, load_or_create_secret, make_dir, move_to_trash, public_addr, read_frame,
-    rename_entry, safe_path, write_frame, FileEntry, Request, Response, ALPN, DEFAULT_RELAY_URL,
-    MAX_FILE_SIZE,
+    copy_entry, hash_file, load_or_create_secret, make_dir, move_to_trash, public_addr,
+    read_frame, rename_entry, safe_path, write_frame, FileEntry, Request, Response, ALPN,
+    DEFAULT_RELAY_URL, MAX_FILE_SIZE,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -88,7 +88,7 @@ where
             write_frame(&mut send, &Response::Entries { entries }).await
         }
 
-        Request::Put { path, size } => {
+        Request::Put { path, size, offset: _ } => {
             if size > MAX_FILE_SIZE {
                 write_frame(
                     &mut send,
@@ -109,14 +109,68 @@ where
                     .parent()
                     .ok_or_else(|| anyhow::anyhow!("no parent dir"))?,
             )?;
+
             // 先写临时文件，完整接收并校验后才改名，避免半截文件被当成正式文件。
-            let tmp = target.with_extension("netdisk-tmp");
-            let mut file = tokio::fs::File::create(&tmp).await?;
-            write_frame(&mut send, &Response::Ready).await?;
-            let hash = copy_exact_with_hash(&mut recv, &mut file, size).await?;
+            // 这个临时文件同时充当断点续传的载体：连接断了它还在，下次接着写。
+            // 注意用「追加后缀」而不是 with_extension：后者会替换原有扩展名，
+            // 让 a.bin 与 a.txt 共用同一个临时文件（互相踩踏）。
+            let tmp = {
+                let mut os = target.clone().into_os_string();
+                os.push(".netdisk-tmp");
+                std::path::PathBuf::from(os)
+            };
+            let existing = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+            // 超过 24 小时的半截文件视为陈旧：可能是上次中断遗留，
+            // 而客户端早已换成同名但内容不同的文件，接着写会拼出错文件。
+            let stale = std::fs::metadata(&tmp)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs() > 24 * 3600)
+                .unwrap_or(false);
+
+            if stale {
+                let _ = std::fs::remove_file(&tmp);
+                println!("[netdiskd] drop stale part {path} (older than 24h)");
+            }
+
+            let start = if !stale && existing > 0 && existing <= size {
+                existing
+            } else {
+                if existing > size {
+                    // 残留的是另一个更大的文件，留着也没用。
+                    let _ = std::fs::remove_file(&tmp);
+                    println!("[netdiskd] discard stale part {path} ({existing} > {size})");
+                }
+                0
+            };
+
+            let mut file = if start > 0 {
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&tmp)
+                    .await?
+            } else {
+                tokio::fs::File::create(&tmp).await?
+            };
+
+            // 告诉客户端实际从哪开始，它据此跳过已传部分。
+            write_frame(&mut send, &Response::Ready { offset: start }).await?;
+
+            let remaining = size - start;
+            if start > 0 {
+                println!("[netdiskd] resume {path} at {start} bytes ({remaining} left)");
+            }
+            copy_exact_with_hash(&mut recv, &mut file, remaining).await?;
             file.sync_all().await?;
             drop(file);
+
+            // 续传只收到片段，`copy_exact_with_hash` 返回的是片段 hash，不能用。
+            // 落盘前把整个文件重算一遍，才谈得上完整性校验。
+            let tmp_for_hash = tmp.clone();
+            let hash = tokio::task::spawn_blocking(move || hash_file(&tmp_for_hash)).await??;
             std::fs::rename(&tmp, &target)?;
+
             write_frame(
                 &mut send,
                 &Response::Stored {

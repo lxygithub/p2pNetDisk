@@ -41,7 +41,9 @@ pub const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 pub enum Request {
     Ping,
     List,
-    Put { path: String, size: u64 },
+    /// `offset` 是客户端**建议**的起点（通常为 0，它并不知道服务端状态）；
+    /// 服务端会以 `Ready { offset }` 告知实际能从哪开始。
+    Put { path: String, size: u64, offset: u64 },
     Get { path: String },
     /// 删除：移入回收站，**不是硬删**（架构 §5.3 约定，30 天后才真正清理）。
     Delete { path: String },
@@ -57,8 +59,11 @@ pub enum Request {
 pub enum Response {
     Pong,
     Entries { entries: Vec<FileEntry> },
-    /// 服务端已准备好接收 `Put` 的裸数据流。
-    Ready,
+    /// 服务端已准备好接收 `Put` 的裸数据流，并从 `offset` 开始。
+    ///
+    /// 断点续传的关键：服务端发现 `.part` 已有 N 字节时返回 `offset = N`，
+    /// 客户端只需补发剩余部分，不必重传。
+    Ready { offset: u64 },
     /// `Get` 的响应头，随后紧跟 `size` 字节裸数据。
     File { size: u64 },
     Stored { path: String, size: u64, hash: String },
@@ -120,7 +125,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    copy_exact_with_hash_progress(r, w, size, None).await
+    copy_exact_with_hash_progress(r, w, size, 0, None).await
 }
 
 /// 与 [`copy_exact_with_hash`] 相同，但把「已传输字节数」实时写进 `progress`。
@@ -134,6 +139,7 @@ pub async fn copy_exact_with_hash_progress<R, W>(
     r: &mut R,
     w: &mut W,
     size: u64,
+    base: u64,
     progress: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<String>
 where
@@ -156,12 +162,13 @@ where
         w.write_all(&buf[..n]).await?;
         remaining -= n as u64;
         if let Some(p) = progress {
-            p.store(size - remaining, std::sync::atomic::Ordering::Relaxed);
+            // 续传时进度要从已有字节数起算，否则进度条会从 0 重新跳到一半。
+            p.store(base + (size - remaining), std::sync::atomic::Ordering::Relaxed);
         }
     }
     w.flush().await?;
     if let Some(p) = progress {
-        p.store(size, std::sync::atomic::Ordering::Relaxed);
+        p.store(base + size, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -454,6 +461,27 @@ pub fn make_dir(root: &Path, rel: &str) -> Result<()> {
     let dir = safe_path(root, rel)?;
     std::fs::create_dir_all(&dir)?;
     Ok(())
+}
+
+/// 计算整个文件的 BLAKE3。
+///
+/// 续传场景专用：服务端只收到剩余部分，`copy_exact_with_hash` 返回的只是片段 hash，
+/// 无法用于完整性校验，所以落盘前要把整个文件读一遍重算。
+/// 代价是一次顺序读盘，换取「拼接错误能被发现」。
+pub fn hash_file(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn list_entries(root: &Path) -> Result<Vec<FileEntry>> {

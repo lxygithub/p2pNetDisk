@@ -18,8 +18,8 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use iroh::{endpoint::Connection, Endpoint, EndpointAddr};
 use netdisk_core::{
-    build_endpoint, copy_exact_with_hash_progress, describe_paths, has_direct_path, parse_addr,
-    read_frame, write_frame, Request, Response, ALPN, MAX_FILE_SIZE,
+    build_endpoint, copy_exact_with_hash_progress, describe_paths, has_direct_path, hash_file,
+    parse_addr, read_frame, write_frame, Request, Response, ALPN, MAX_FILE_SIZE,
 };
 use tokio::runtime::Runtime;
 
@@ -237,20 +237,55 @@ fn put_inner(
         }
         let conn = h.connection().await?;
         let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::Put { path: remote.clone(), size }).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        match r {
-            Response::Ready => {}
+        // offset 只是「建议值」，真正的起点由服务端在 Ready 里给出。
+        write_frame(
+            &mut send,
+            &Request::Put {
+                path: remote.clone(),
+                size,
+                offset: 0,
+            },
+        )
+        .await?;
+
+        let start = match read_frame(&mut recv).await? {
+            Response::Ready { offset } => offset,
             Response::Error(e) => return Err(anyhow!("server refused upload: {e}")),
             _ => return Err(anyhow!("unexpected response before upload")),
+        };
+        if start > size {
+            return Err(anyhow!("server offset {start} exceeds file size {size}"));
         }
+
+        // 完整文件的 hash 必须在传输前算好：续传时只发片段，
+        // 片段 hash 无法与服务的完整文件 hash 比对。
+        let local_for_hash = local.clone();
+        let expected = tokio::task::spawn_blocking(move || {
+            hash_file(std::path::Path::new(&local_for_hash))
+        })
+        .await??;
+
         let mut file = tokio::fs::File::open(&local).await?;
-        let hash =
-            copy_exact_with_hash_progress(&mut file, &mut send, size, progress_ref(progress)).await?;
+        if start > 0 {
+            use tokio::io::AsyncSeekExt;
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+        }
+        let remaining = size - start;
+        let _ = copy_exact_with_hash_progress(
+            &mut file,
+            &mut send,
+            remaining,
+            start,
+            progress_ref(progress),
+        )
+        .await?;
+
         let r: Response = read_frame(&mut recv).await?;
         match &r {
-            Response::Stored { hash: server_hash, .. } if *server_hash != hash => {
-                return Err(anyhow!("hash mismatch: local={hash} server={server_hash}"));
+            Response::Stored { hash: server_hash, .. } if *server_hash != expected => {
+                return Err(anyhow!(
+                    "hash mismatch: local={expected} server={server_hash}"
+                ));
             }
             _ => {}
         }
@@ -282,7 +317,8 @@ fn get_inner(
         };
         let mut file = tokio::fs::File::create(&local).await?;
         let hash =
-            copy_exact_with_hash_progress(&mut recv, &mut file, size, progress_ref(progress)).await?;
+            copy_exact_with_hash_progress(&mut recv, &mut file, size, 0, progress_ref(progress))
+                .await?;
         Ok(format!(
             "{{\"Downloaded\":{{\"size\":{size},\"hash\":\"{hash}\"}}}}"
         ))
