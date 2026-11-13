@@ -5,14 +5,15 @@ import 'package:provider/provider.dart';
 
 import '../services/transfer_notifications.dart';
 import '../state/app_state.dart';
+import 'connection_page.dart';
 import '../theme.dart';
 import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
 
-/// 设置页：连接参数、连接状态、链路信息。
+/// 设置页：连接状态、链路信息、后台运行与关于。
 ///
-/// 参数改动经 [AppState.updateConnectionConfig] 持久化到 App 私有目录，冷启动时
-/// 由 main() 读回；「恢复默认」清掉本机配置，回到编译期注入的默认值。
+/// 敏感的连接参数统一放在独立的 [ConnectionPage]，这里只显示打码摘要，
+/// 避免真实 EndpointId 出现在常驻页面或截图里。
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
 
@@ -21,10 +22,6 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
-  late final TextEditingController _relay;
-  late final TextEditingController _token;
-  late final TextEditingController _addr;
-
   /// 电池优化豁免状态；null 表示查询中或平台不支持。
   bool? _ignoringBattery;
   Map<String, Object?>? _device;
@@ -32,11 +29,15 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
-    final s = context.read<AppState>();
-    _relay = TextEditingController(text: s.relay);
-    _token = TextEditingController(text: s.token);
-    _addr = TextEditingController(text: s.serverAddr);
     _loadDevice();
+  }
+
+  void _openConnectionPage() {
+    unawaited(
+      Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(builder: (_) => const ConnectionPage()),
+      ),
+    );
   }
 
   Future<void> _loadDevice() async {
@@ -75,49 +76,6 @@ class _SettingsPageState extends State<SettingsPage> {
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
-  /// 清掉本机保存的连接参数，回到编译期注入的默认值。
-  ///
-  /// 手填的 EndpointId 有 52 个字符，误触清掉很麻烦，所以先确认一次。
-  Future<void> _resetToDefault(AppState s) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('恢复默认连接参数？'),
-        content: const Text(
-          '将清除本机保存的服务端地址与 Relay 设置，回到编译期注入的默认值。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('清除'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    await s.resetConnectionConfig();
-    if (!mounted) return;
-    // controller 只在 initState 里初始化过一次，值变了要手动同步回输入框。
-    setState(() {
-      _relay.text = s.relay;
-      _token.text = s.token;
-      _addr.text = s.serverAddr;
-    });
-    _snack('已恢复默认连接参数（清除本机保存的地址）');
-  }
-
-  @override
-  void dispose() {
-    _relay.dispose();
-    _token.dispose();
-    _addr.dispose();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
     final s = context.watch<AppState>();
@@ -150,36 +108,20 @@ class _SettingsPageState extends State<SettingsPage> {
                   )
                 : null,
             children: [
-              TextField(
-                controller: _relay,
-                decoration: const InputDecoration(
-                  labelText: 'Relay',
-                  helperText: 'n0 = 官方公共中继；也可填自建 https://host:8443',
-                ),
-                onChanged: (v) => s.updateConnectionConfig(relay: v.trim()),
+              _InfoRow(
+                label: 'EndpointId',
+                value: s.endpointConfigured ? s.maskedEndpointId : '未配置',
               ),
               const SizedBox(height: 12),
-              TextField(
-                controller: _token,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Relay Token',
-                  helperText: '仅自建 relay 需要；n0 模式留空',
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _openConnectionPage,
+                  icon: const Icon(Icons.tune, size: 18),
+                  label: const Text('编辑连接参数'),
                 ),
-                onChanged: (v) => s.updateConnectionConfig(token: v.trim()),
               ),
               const SizedBox(height: 12),
-              TextField(
-                controller: _addr,
-                maxLines: 3,
-                minLines: 2,
-                decoration: const InputDecoration(
-                  labelText: '服务端 EndpointAddr',
-                  helperText: 'n0 模式只需 {"id":"…","addrs":[]}，改动自动保存到本机',
-                ),
-                onChanged: (v) => s.updateConnectionConfig(addr: v.trim()),
-              ),
-              const SizedBox(height: 16),
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
@@ -192,14 +134,6 @@ class _SettingsPageState extends State<SettingsPage> {
                         )
                       : const Icon(Icons.link),
                   label: Text(s.connected ? '重新连接' : '连接'),
-                ),
-              ),
-              Align(
-                alignment: Alignment.centerRight,
-                child: TextButton.icon(
-                  onPressed: () => unawaited(_resetToDefault(s)),
-                  icon: const Icon(Icons.restore, size: 16),
-                  label: const Text('恢复默认'),
                 ),
               ),
               if (s.pathSummary != null) ...[
@@ -221,6 +155,11 @@ class _SettingsPageState extends State<SettingsPage> {
               const SizedBox(height: 10),
               Text(
                 s.status,
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '连接参数在独立页面管理，EndpointId 默认隐藏；此处只显示打码摘要。',
                 style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
               ),
             ],

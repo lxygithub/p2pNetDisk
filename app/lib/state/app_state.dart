@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../models/transfer_task.dart';
 import '../services/connection_prefs.dart';
+import '../services/endpoint_addr.dart';
 import '../services/list_cache.dart';
 import '../services/transfer_notifications.dart';
 import '../src/netdisk_worker.dart';
@@ -58,8 +59,27 @@ class AppState extends ChangeNotifier {
   // ---- 连接状态 ----
   bool connected = false;
   bool busy = false;
-  String status = '未连接';
   bool _booting = false;
+
+  String _status = '未连接';
+
+  /// 状态文本统一在这里脱敏：底层异常可能把 EndpointAddr / token 带上来，
+  /// 直接显示等于把网盘地址印在界面上（还会进截图）。
+  String get status => _status;
+
+  set status(String value) {
+    _status = scrubConnectionText(value, addr: serverAddr, token: token);
+  }
+
+  /// 界面上只展示打码后的 EndpointId。
+  String get maskedEndpointId =>
+      maskEndpointId(splitEndpointAddr(serverAddr).id);
+
+  /// 是否至少填过非占位符的 EndpointId。
+  bool get endpointConfigured {
+    final id = splitEndpointAddr(serverAddr).id.trim();
+    return id.isNotEmpty && id != 'YOUR_ENDPOINT_ID';
+  }
 
   /// 当前显示的列表是否来自本地缓存（还没被真实列表替换）。
   bool showingCache = false;
@@ -71,9 +91,6 @@ class AppState extends ChangeNotifier {
   /// 进行中的刷新。bootstrap 自动刷新与用户下拉同时到达时复用同一个 Future，
   /// 避免 worker 串行排队让第二屏多等一整轮 RPC。
   Future<void>? _refreshFuture;
-
-  /// 设置页输入防抖：避免把「清空再粘贴」的中间态写进配置文件。
-  Timer? _configSaveTimer;
 
   /// 启动时的自动初始化：先渲染缓存列表 → 连接 → 后台拉新列表。
   ///
@@ -146,15 +163,20 @@ class AppState extends ChangeNotifier {
   // 连接参数持久化
   // ---------------------------------------------------------------------------
 
-  /// 设置页每次输入都走这里：内存立即生效，停顿 500ms 后才落盘。
-  void updateConnectionConfig({String? relay, String? token, String? addr}) {
-    if (relay != null) this.relay = relay;
-    if (token != null) this.token = token;
-    if (addr != null) serverAddr = addr;
-    _configSaveTimer?.cancel();
-    _configSaveTimer = Timer(const Duration(milliseconds: 500), () {
-      unawaited(_persistConnectionConfig());
-    });
+  /// 连接参数页点「保存」时调用：内存立即生效、同步落盘、通知界面刷新。
+  ///
+  /// 页面内的输入是草稿，只有点保存才写进来，不会出现「半截 JSON 被存进
+  /// 配置、下次启动连不上」的情况。
+  Future<void> saveConnectionConfig({
+    required String relay,
+    required String token,
+    required String addr,
+  }) async {
+    this.relay = relay;
+    this.token = token;
+    serverAddr = addr;
+    await _persistConnectionConfig();
+    notifyListeners();
   }
 
   Future<void> _persistConnectionConfig() async {
@@ -172,7 +194,6 @@ class AppState extends ChangeNotifier {
 
   /// 「恢复默认」：清掉本机配置，回到编译期注入的地址。
   Future<void> resetConnectionConfig() async {
-    _configSaveTimer?.cancel();
     relay = kDefaultRelay;
     token = '';
     serverAddr = kDefaultAddr;
@@ -183,10 +204,6 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _worker.dispose();
-    // 输入后 500ms 内就退出时补写一次；没有待写改动则不产生任何磁盘 IO。
-    final pending = _configSaveTimer?.isActive ?? false;
-    _configSaveTimer?.cancel();
-    if (pending) unawaited(_persistConnectionConfig());
     super.dispose();
   }
 

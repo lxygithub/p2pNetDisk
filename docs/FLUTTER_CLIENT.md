@@ -762,24 +762,54 @@ column 24 正好是 id 字符串的结束引号 —— 是 EndpointId 反序列�
 | --- | --- | --- |
 | 1 | 编译期注入 `--dart-define=NETDISK_ENDPOINT_ID=<值>` | 初始值与兜底，不进仓库 |
 | 2 | 本机 `connection_config.json` | 启动时覆盖，手填一次后重启保留 |
-| 3 | 设置页当前输入 | 立即生效，停顿 500ms 后写回本机 |
+| 3 | 连接参数页点「保存」 | 一次性写入状态并同步落盘，草稿不落盘 |
 
 **实现要点**
 
 - `services/connection_prefs.dart`：`path_provider` 写到 App 私有文档目录，
   读/写失败一律静默回落，绝不阻塞启动或本次连接。
-- 只有用户**在设置页改过**才写盘；编译期注入的值不会被复制一份到磁盘。
-  配置与编译期默认完全一致时直接删文件，让注入值重新生效。
+- 只有在**连接参数页点「保存」/「保存并连接」**时才写盘；页面内输入是草稿，
+  半截 JSON 不会进配置。编译期注入的值不会被复制一份到磁盘；配置与默认值
+  完全一致时直接删文件，让注入值重新生效。
 - `main()` 改为 `async`，在 `runApp` 之前读回配置并传给 `AppState` 构造函数。
   页面构建时地址已是最终值，也保证 `ListCache` 用 `serverAddr.hashCode`
   做隔离键时取到的是正确服务端的缓存。
-- 落盘前用 `isValidAddr()` 校验 JSON 结构与非空 `id`，「清空再粘贴」的半截
-  输入不会覆盖上一次的有效配置；EndpointId 格式仍由 Rust 侧（iroh）校验。
-- 设置页新增「恢复默认」（带确认对话框），清掉本机配置回到注入值。
+- 落盘前用 `isValidAddr()` 校验 JSON 结构与非空 `id`；`buildEndpointAddr()`
+  在保存前先校验 `addrs` 必须是 JSON 数组。EndpointId 格式仍由 Rust 侧校验。
+- 「恢复默认」（带确认对话框）在连接参数页，清掉本机配置回到注入值。
 
 **脱敏边界**：配置文件含真实 EndpointId，但只存在于用户手机的 App 私有目录，
 不进版本控制；`.gitignore` 另外忽略 `netdisk_config.json` / `*.dart-define.json`，
 避免用 `--dart-define-from-file` 时把真实值提交进公开仓库。
+
+### 4.18 独立连接参数页与脱敏
+
+设置页原先一个多行框收整个 `EndpointAddr` JSON，真实 EndpointId 会明文出现在
+常驻页面和截图里。现在把连接参数挪到独立的 `ConnectionPage`：
+
+- **两个输入框**：`EndpointId` 只填纯 ID（不带引号 / 花括号），`addrs` 只填 JSON
+  数组（`[]` 或 `[{"Relay":"https://host:8443/"}]`）。
+  `services/endpoint_addr.dart` 负责拆分 / 组合，用户不用手拼 JSON；只校验结构，
+  EndpointId 格式合法性仍由 Rust 侧（iroh）判断。
+- **默认隐藏**：已有真实 EndpointId 时 id 框默认 `obscureText`，点眼睛才显示；
+  占位符阶段默认展开方便第一次粘贴。Token 默认隐藏；`addrs` 为 `[]` 时展开，
+  含自建 relay 地址时默认隐藏。三个字段都能一键切换。
+- **设置页只显示打码摘要**：`maskEndpointId()` 只留首尾各 4 位（`aaaa••••4444`），
+  占位符显示「未配置」，完整地址不再出现在常驻页面。
+- **状态文本统一脱敏**：`AppState.status` 改成 getter / setter，所有赋值都过
+  `scrubConnectionText()`，把可能出现的完整 EndpointAddr、EndpointId、relay token
+  替换成 `[地址已隐藏]` / `••••`，防止底层异常把地址回显到 UI。
+- **保存语义**：页面内是草稿，点「保存」或「保存并连接」才写入状态并同步落盘；
+  直接返回不保存，避免半截输入被记住。
+- **兼容性**：旧的 `connection_config.json` 存的仍是完整 `EndpointAddr` JSON，
+  `splitEndpointAddr()` 能解析并拆成两个框，无需数据迁移。
+
+**仍未做**：没有启用 Android `FLAG_SECURE`，系统截图 / 最近任务预览仍可能录到
+用户手动点开显示后的内容；真值本身只落在 App 私有目录。n0 模式下无应用层鉴权，
+EndpointId 仍等同于网盘地址，不要外传。
+
+**验证**：`endpoint_addr_test.dart` 覆盖拆分 / 组合 / 往返 / 打码 / 状态脱敏共
+17 例，`flutter analyze` 无问题，`flutter test` 18 passed；APK 未构建。
 
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：
