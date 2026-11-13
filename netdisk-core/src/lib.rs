@@ -41,9 +41,18 @@ pub const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 pub enum Request {
     Ping,
     List,
-    /// `offset` 是客户端**建议**的起点（通常为 0，它并不知道服务端状态）；
+    /// `offset` 是客户端**建议**的起点（通常为 `Some(0)`，它并不知道服务端状态）；
     /// 服务端会以 `Ready { offset }` 告知实际能从哪开始。
-    Put { path: String, size: u64, offset: u64 },
+    ///
+    /// `None` = 旧版客户端（请求里没有这个字段）。旧客户端不支持续传，
+    /// 服务端会按旧协议回 `Ready` 并从头接收完整文件 —— 这样升级服务端
+    /// 不会把还没更新的手机一次性打死。以后加字段一律要 `#[serde(default)]`。
+    Put {
+        path: String,
+        size: u64,
+        #[serde(default)]
+        offset: Option<u64>,
+    },
     Get { path: String },
     /// 删除：移入回收站，**不是硬删**（架构 §5.3 约定，30 天后才真正清理）。
     Delete { path: String },
@@ -114,6 +123,42 @@ where
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
+}
+
+/// 解析「上传就绪」帧，兼容新旧两种服务端形态。
+///
+/// - 旧：`"Ready"`（unit variant，不支持续传 → offset 0）
+/// - 新：`{"Ready":{"offset":N}}`
+/// - 拒绝：`{"Error":"..."}`
+///
+/// 抽成纯函数是为了能直接单测，不必搭 QUIC 流。
+pub fn parse_ready_value(v: &serde_json::Value) -> Result<u64> {
+    if let Some(msg) = v.get("Error").and_then(|x| x.as_str()) {
+        bail!("server refused upload: {msg}");
+    }
+    if v.as_str() == Some("Ready") {
+        return Ok(0);
+    }
+    if let Some(off) = v
+        .get("Ready")
+        .and_then(|x| x.get("offset"))
+        .and_then(|x| x.as_u64())
+    {
+        return Ok(off);
+    }
+    bail!("unexpected response before upload: {v}")
+}
+
+/// 读一次 `Put` 的就绪响应。用 `serde_json::Value` 而非 [`Response`] 反序列化，
+/// 这样新客户端连到旧服务端时也能工作（旧服务端回的是裸字符串 `"Ready"`）。
+pub async fn read_put_ready<R>(r: &mut R) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+{
+    let v: serde_json::Value = read_frame(r).await.context(
+        "服务端未响应 Put（协议版本不匹配？请确认 netdiskd 与客户端已同步升级）",
+    )?;
+    parse_ready_value(&v)
 }
 
 /// 精确搬运 `size` 字节并计算 BLAKE3。
@@ -525,4 +570,67 @@ pub fn list_entries(root: &Path) -> Result<Vec<FileEntry>> {
     walk(root, root, &mut out)?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+#[cfg(test)]
+mod protocol_compat_tests {
+    use super::*;
+
+    #[test]
+    fn old_put_without_offset_is_accepted() {
+        let r: Request =
+            serde_json::from_str(r#"{"Put":{"path":"a.bin","size":10}}"#).unwrap();
+        assert!(matches!(
+            r,
+            Request::Put { offset: None, size: 10, .. }
+        ));
+    }
+
+    #[test]
+    fn new_put_with_offset_is_accepted() {
+        let r: Request =
+            serde_json::from_str(r#"{"Put":{"path":"a.bin","size":10,"offset":5}}"#).unwrap();
+        assert!(matches!(r, Request::Put { offset: Some(5), .. }));
+    }
+
+    #[test]
+    fn ready_parser_accepts_old_and_new_shapes() {
+        let legacy = serde_json::json!("Ready");
+        assert_eq!(parse_ready_value(&legacy).unwrap(), 0);
+
+        let current = serde_json::json!({"Ready": {"offset": 524288}});
+        assert_eq!(parse_ready_value(&current).unwrap(), 524288);
+    }
+
+    #[test]
+    fn legacy_ready_string_is_a_unit_variant() {
+        // 服务端给旧客户端回的就是这个形状：unit variant 序列化成裸字符串。
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum OldResponse {
+            Ready,
+        }
+        let frame = serde_json::to_vec(&"Ready").unwrap();
+        let parsed: OldResponse = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(parsed, OldResponse::Ready);
+    }
+
+    #[test]
+    fn new_put_serializes_offset_field() {
+        // 事故复盘：旧 .so 发的 Put 没有 offset，新服务端直接拒绝。
+        // 这条断言保证客户端确实把字段写进 JSON。
+        let v = serde_json::to_value(Request::Put {
+            path: "a.bin".into(),
+            size: 10,
+            offset: Some(0),
+        })
+        .unwrap();
+        assert_eq!(v["Put"]["offset"], 0, "Put 必须带上 offset 字段");
+    }
+
+    #[test]
+    fn ready_parser_reports_server_refusal() {
+        let v = serde_json::json!({"Error": "file too large"});
+        let e = parse_ready_value(&v).unwrap_err();
+        assert!(e.to_string().contains("file too large"));
+    }
 }

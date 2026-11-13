@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use iroh::{endpoint::Connection, Endpoint, EndpointAddr};
 use netdisk_core::{
     build_endpoint, copy_exact_with_hash_progress, describe_paths, has_direct_path, hash_file,
-    parse_addr, read_frame, write_frame, Request, Response, ALPN, MAX_FILE_SIZE,
+    parse_addr, read_frame, read_put_ready, write_frame, Request, Response, ALPN, MAX_FILE_SIZE,
 };
 use tokio::runtime::Runtime;
 
@@ -243,16 +243,13 @@ fn put_inner(
             &Request::Put {
                 path: remote.clone(),
                 size,
-                offset: 0,
+                offset: Some(0),
             },
         )
         .await?;
 
-        let start = match read_frame(&mut recv).await? {
-            Response::Ready { offset } => offset,
-            Response::Error(e) => return Err(anyhow!("server refused upload: {e}")),
-            _ => return Err(anyhow!("unexpected response before upload")),
-        };
+        // 兼容旧服务端：它回的是裸字符串 "Ready"，read_put_ready 两种都认。
+        let start = read_put_ready(&mut recv).await?;
         if start > size {
             return Err(anyhow!("server offset {start} exceeds file size {size}"));
         }

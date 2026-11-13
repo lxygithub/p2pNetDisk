@@ -33,6 +33,7 @@
 | **传输通知** | ✅ 一条汇总通知（进行中/排队/已完成/失败），原生 MethodChannel 实现（§4.11） |
 | **断点续传** | ✅ `Put` 一次往返协商 offset，只补发剩余字节；已实测「半截 .part → 只传 512KB → 哈希一致」（§4.12） |
 | **后台任务** | ✅ `TransferService` 前台服务保活，复用同一通知渠道；设置页提供电池优化与厂商自启动入口（§4.13） |
+| **协议双向兼容** | ✅ 新旧客户端 / 新旧服务端任意组合都能上传，版本错配时给出明确错误而非 EOF（§4.15） |
 | **长连接复用** | ✅ FFI 侧改为复用一条 QUIC 连接（原来每条命令重连，打洞来不及完成、`paths()` 只能看到 relay） |
 | `.so` 版本防错配 | ✅ `netdisk_ffi_version()` + 连接前校验；旧库会提示「动态库过旧（不支持 n0）」 |
 | Windows 桌面实际构建 / 运行 | ⛔ 本机无 Visual Studio 2022 C++ 工具链 |
@@ -543,11 +544,14 @@ files = ['photos/a.jpg', 'photos/2026/b.jpg', 'notes.txt']
 **协议设计：一次往返完成协商。** 客户端并不知道服务端已经收了多少，所以 `Put` 里的 `offset` 只是「建议值」（通常 0），真正的起点由服务端在 `Ready` 里给出：
 
 ```rust
-Put   { path, size, offset: 0 }   // 客户端：我要传这个文件
+Put   { path, size, offset: Some(0) }   // 客户端：我要传这个文件（offset 仅作建议）
 Ready { offset: 524288 }          // 服务端：已有半截，从这里接着来
 ```
 
 这样不需要额外的「查询进度」请求，省一次往返。
+
+> `offset` 现在是 `Option<u64>` 且带 `#[serde(default)]`：字段缺失表示**旧版客户端**，
+> 服务端按旧协议处理（见 §4.15）。这是 2026-11-13 一次线上事故的直接产物。
 
 **服务端逻辑**（`netdiskd`）：
 
@@ -636,6 +640,72 @@ resuming at 524288 bytes (524288 left)      ← 只补发剩余一半
 **目标目录输入框刻意不预填当前目录** —— 否则「在同目录内复制/移动」会立刻撞上 `target already exists`，用户还得手动删掉重填。
 
 **切换目录时清理失效选中项**：进入别的目录后，之前勾选的路径已不在视图内，会在下一帧把无效项剔除，全空了就自动退出多选，避免「已选 3 项但屏幕上什么都没选中」的诡异状态。
+
+### 4.15 协议版本错配事故与双向兼容
+
+**现象**：上传全部失败，界面报 `unexpected end of file`；列表、下载、删除都正常。
+
+**根因**：断点续传把 `Put` 从 `{path, size}` 改成了 `{path, size, offset}`，服务端部署了新协议，
+但手机上 `libnetdisk_ffi.so` 还是**旧版**（编译于协议改动之前）。服务端日志给出铁证：
+
+```
+[netdiskd] stream error: missing field `offset` at line 1 column 39   ← 重复十几次
+```
+
+服务端反序列化 `Request` 失败 → 直接断流 → 客户端 `read_frame` 读到 EOF →
+`UnexpectedEof` 的 Display 就是 "unexpected end of file"。**报错在客户端，根子在服务端**，
+这类错误信息完全没有指向性。
+
+**只重编 `.so` 不够**，因为这暴露的是协议设计缺陷：任何一次加字段都会把未升级的客户端全打死。所以做了三件事：
+
+**1. 新服务端兼容旧客户端**
+
+```rust
+Put { path, size, #[serde(default)] offset: Option<u64> }
+```
+
+`None` = 旧客户端（不支持续传）。服务端识别后：
+
+- 回**旧格式** `Ready`（裸字符串 `"Ready"`，而不是 `{"Ready":{"offset":N}}`）；
+- 强制 `start = 0`，`File::create` 截断残留 `.part`，让旧客户端重传完整文件，不会和半截内容拼在一起；
+- 后续逻辑不变，服务端重算完整 BLAKE3，与旧客户端边传边算的完整 hash 一致。
+
+**2. 新客户端兼容旧服务端**
+
+`read_put_ready()` 把就绪帧读成 `serde_json::Value`，两种形状都认：
+
+| 来源 | JSON | offset |
+| --- | --- | --- |
+| 旧服务端 | `"Ready"` | 0 |
+| 新服务端 | `{"Ready":{"offset":524288}}` | 524288 |
+| 拒绝 | `{"Error":"..."}` | 直接报错 |
+
+于是四种组合（新/旧客户端 × 新/旧服务端）都能上传，只是旧协议那一侧没有续传能力。
+
+**3. 错误必须可见**
+
+- 服务端解析请求失败时回一帧 `Response::Error("bad request: ...")`，而不是静默断流；
+- 客户端 `read_put_ready` 的 context 直接点名「协议版本不匹配？请确认 netdiskd 与客户端已同步升级」；
+- `netdiskd` 命令执行出错时本来就有兜底 Error 帧，保留。
+
+**验证**（`NETDISK_LEGACY_PUT=1` 让 CLI 模拟旧客户端，作为长期回归开关）：
+
+```
+新协议上传        → uploaded 23 bytes, 内容一致
+旧客户端模拟      → [legacy client] Ready, uploading full file → 哈希一致
+                    服务端日志：legacy client ... (no resume)
+断点续传回归      → resuming at 524288 bytes (524288 left) → 哈希一致，.part 清理
+cargo test        → 6 passed（含 "Put 必须带上 offset 字段" 的序列化断言）
+```
+
+**构建清单**（协议改了就照做，漏一步就会复现这次事故）：
+
+1. `cargo ndk -t arm64-v8a -o app/android/app/src/main/jniLibs build -p netdisk-ffi --release`
+2. 同步 `netdiskd` 源码到服务器，`cargo build -p netdiskd` 并 `systemctl restart netdiskd`
+3. `flutter build apk --debug && flutter install`
+
+判断 `.so` 是否过期最直接的办法：比时间戳（`libnetdisk_ffi.so` 必须晚于 `netdisk-core/src/lib.rs`），
+或看服务端日志有没有 `missing field`。
 
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：

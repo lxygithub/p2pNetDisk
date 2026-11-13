@@ -76,6 +76,10 @@ where
             if e.downcast_ref::<std::io::Error>().is_some() {
                 return Ok(());
             }
+            // 格式/版本错误必须回一帧 Error：否则客户端只是读到 EOF，
+            // 界面上会显示莫名其妙的「unexpected end of file」。
+            let msg = format!("bad request: {e:#}");
+            let _ = write_frame(&mut send, &Response::Error(msg)).await;
             return Err(e);
         }
     };
@@ -88,7 +92,10 @@ where
             write_frame(&mut send, &Response::Entries { entries }).await
         }
 
-        Request::Put { path, size, offset: _ } => {
+        Request::Put { path, size, offset } => {
+            // 旧客户端没有 offset 字段：它不支持续传，会从头发完整文件。
+            // 按旧协议回 Ready，让没升级的手机仍能正常上传。
+            let legacy = offset.is_none();
             if size > MAX_FILE_SIZE {
                 write_frame(
                     &mut send,
@@ -134,7 +141,9 @@ where
                 println!("[netdiskd] drop stale part {path} (older than 24h)");
             }
 
-            let start = if !stale && existing > 0 && existing <= size {
+            // legacy 强制 start=0；下面的 File::create 会截断残留的 .part，
+            // 所以旧客户端重传完整文件不会和半截内容拼在一起。
+            let start = if !legacy && !stale && existing > 0 && existing <= size {
                 existing
             } else {
                 if existing > size {
@@ -155,7 +164,13 @@ where
             };
 
             // 告诉客户端实际从哪开始，它据此跳过已传部分。
-            write_frame(&mut send, &Response::Ready { offset: start }).await?;
+            if legacy {
+                // 旧客户端的 Response::Ready 是 unit variant，JSON 形态是裸字符串。
+                write_frame(&mut send, &"Ready").await?;
+                println!("[netdiskd] legacy client {path} (no resume)");
+            } else {
+                write_frame(&mut send, &Response::Ready { offset: start }).await?;
+            }
 
             let remaining = size - start;
             if start > 0 {

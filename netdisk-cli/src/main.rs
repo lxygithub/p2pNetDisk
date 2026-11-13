@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use iroh::{endpoint::Connection, EndpointAddr};
 use netdisk_core::{
     build_endpoint, copy_exact_with_hash, describe_paths, has_direct_path, hash_file, parse_addr,
-    read_frame, write_frame, Request, Response, ALPN, DEFAULT_RELAY_URL,
+    read_frame, read_put_ready, write_frame, Request, Response, ALPN, DEFAULT_RELAY_URL,
 };
 
 fn usage() -> String {
@@ -77,19 +77,34 @@ async fn run_command(conn: Connection, cmd: &[String]) -> Result<()> {
             // 完整 hash 先算好：续传时只发片段，片段 hash 无法与服务端比对。
             let local_hash = hash_file(&local)?;
 
-            write_frame(
-                &mut send,
-                &Request::Put {
-                    path: remote.clone(),
-                    size,
-                    offset: 0,
-                },
-            )
-            .await?;
-            let start = match read_frame(&mut recv).await? {
-                Response::Ready { offset } => offset,
-                Response::Error(e) => bail!("server refused upload: {e}"),
-                other => bail!("unexpected response: {other:?}"),
+            // NETDISK_LEGACY_PUT=1 用来模拟还没升级的旧客户端，
+            // 验证服务端确实兼容（回归测试用，不是产品功能）。
+            let legacy = env::var_os("NETDISK_LEGACY_PUT").is_some();
+            let start = if legacy {
+                write_frame(
+                    &mut send,
+                    &serde_json::json!({
+                        "Put": { "path": remote.clone(), "size": size }
+                    }),
+                )
+                .await?;
+                let v: serde_json::Value = read_frame(&mut recv).await?;
+                if v.as_str() != Some("Ready") {
+                    bail!("legacy client: unexpected ready response {v:?}");
+                }
+                eprintln!("[legacy client] Ready, uploading full file");
+                0
+            } else {
+                write_frame(
+                    &mut send,
+                    &Request::Put {
+                        path: remote.clone(),
+                        size,
+                        offset: Some(0),
+                    },
+                )
+                .await?;
+                read_put_ready(&mut recv).await?
             };
             if start > size {
                 bail!("server offset {start} exceeds file size {size}");
