@@ -19,8 +19,12 @@ class TransferStore {
   static const int _version = 1;
   static const String _fileName = 'transfer_tasks.json';
 
-  /// 只保留最近这么多条，避免长期使用后 JSON 无限增长。
-  static const int _maxTasks = 200;
+  /// 已完成的历史只留最近这么多条 —— 它们只是参考记录，越老越没用。
+  static const int maxDoneHistory = 200;
+
+  /// 未完成的任务理论上要全部保留；这个上限只防病态情况（比如误选了十万个
+  /// 文件），正常使用不会碰到。
+  static const int maxPending = 1000;
 
   static Future<File> _target() async {
     final dir = await getApplicationDocumentsDirectory();
@@ -49,9 +53,28 @@ class TransferStore {
 
   static Future<void> write(List<TransferTask> tasks) async {
     try {
-      final keep = tasks.length > _maxTasks
-          ? tasks.sublist(tasks.length - _maxTasks)
-          : tasks;
+      // 未完成的任务（排队/暂停/失败/进行中）是用户真正关心的，全部保留；
+      // 已完成的只留最近若干条。之前统一按 200 条截断，批量上传时会把较早的
+      // 排队任务悄悄丢掉，重启后就真的「任务没了」。
+      final pending = <TransferTask>[];
+      final done = <TransferTask>[];
+      for (final t in tasks) {
+        (t.status == TransferStatus.done ? done : pending).add(t);
+      }
+
+      final doneKeep = done.length > maxDoneHistory
+          ? done.sublist(done.length - maxDoneHistory).toSet()
+          : done.toSet();
+      final pendingKeep = pending.length > maxPending
+          ? pending.sublist(pending.length - maxPending).toSet()
+          : pending.toSet();
+
+      // 按原队列顺序过滤，保持用户看到的顺序不变。
+      final keep = [
+        for (final t in tasks)
+          if (doneKeep.contains(t) || pendingKeep.contains(t)) t,
+      ];
+
       final payload = <String, Object?>{
         'version': _version,
         'tasks': [for (final t in keep) _encode(t)],

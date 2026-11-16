@@ -51,18 +51,26 @@ class _SearchPageState extends State<SearchPage> {
     return i < 0 ? '根目录' : clean.substring(0, i);
   }
 
-  List<SearchHit> _results(AppState state) {
+  /// 结果列表的渲染上限。超过时明确提示「只显示前 N 条」，
+  /// 而不是悄悄吞掉 —— 静默截断会让人以为文件不存在。
+  static const int _maxResults = 200;
+
+  ({List<SearchHit> hits, bool truncated}) _search(AppState state) {
     final q = _query.trim().toLowerCase();
-    if (q.isEmpty) return const [];
+    if (q.isEmpty) return (hits: const <SearchHit>[], truncated: false);
 
     final out = <SearchHit>[];
+    var truncated = false;
     for (final f in state.files) {
       if (!_lastSegment(f.path).toLowerCase().contains(q)) continue;
+      if (out.length >= _maxResults) {
+        truncated = true;
+        break;
+      }
       out.add((path: f.path, isDir: f.isDir));
-      if (out.length >= 200) break; // 结果太多反而没法看
     }
     out.sort((a, b) => a.path.compareTo(b.path));
-    return out;
+    return (hits: out, truncated: truncated);
   }
 
   void _run(String keyword, {bool remember = false}) {
@@ -77,7 +85,9 @@ class _SearchPageState extends State<SearchPage> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final results = _results(state);
+    final scheme = Theme.of(context).colorScheme;
+    final search = _search(state);
+    final results = search.hits;
 
     return Scaffold(
       appBar: AppBar(
@@ -108,30 +118,47 @@ class _SearchPageState extends State<SearchPage> {
           ? _historyView()
           : results.isEmpty
           ? const Center(child: Text('没有匹配的文件'))
-          : ListView.separated(
-              padding: kPagePadding,
-              itemCount: results.length,
-              separatorBuilder: (_, _) => const Divider(height: 1),
-              itemBuilder: (context, i) {
-                final hit = results[i];
-                final name = _lastSegment(hit.path);
-                return ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(
-                    hit.isDir
-                        ? Icons.folder_rounded
-                        : Icons.description_outlined,
+          : Column(
+              children: [
+                if (search.truncated)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                    child: Text(
+                      '结果较多，仅显示前 $_maxResults 条，试试更精确的关键字',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
                   ),
-                  title: HighlightedText(text: name, query: _query),
-                  subtitle: Text(
-                    _parentOf(hit.path),
-                    style: const TextStyle(fontSize: 11),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                Expanded(
+                  child: ListView.separated(
+                    padding: kPagePadding,
+                    itemCount: results.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, i) {
+                      final hit = results[i];
+                      final name = _lastSegment(hit.path);
+                      return ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          hit.isDir
+                              ? Icons.folder_rounded
+                              : Icons.description_outlined,
+                        ),
+                        title: HighlightedText(text: name, query: _query),
+                        subtitle: Text(
+                          _parentOf(hit.path),
+                          style: const TextStyle(fontSize: 11),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        onTap: () => Navigator.pop(context, hit),
+                      );
+                    },
                   ),
-                  onTap: () => Navigator.pop(context, hit),
-                );
-              },
+                ),
+              ],
             ),
     );
   }
