@@ -14,6 +14,7 @@ import '../services/list_cache.dart';
 import '../services/path_utils.dart';
 import '../services/storage_access.dart';
 import '../services/transfer_notifications.dart';
+import '../services/transfer_store.dart';
 import '../src/netdisk_worker.dart';
 
 /// 默认走 n0 官方公共 relay（实测 aps1-1/euc1-1 握手 8/8，自建港服仅 2/8）。
@@ -65,6 +66,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       }
     } else if (state == AppLifecycleState.paused) {
       _stopHeartbeat();
+      // 切后台立刻落盘：被系统杀掉时才有东西可恢复。
+      unawaited(TransferStore.write(tasks));
     }
   }
 
@@ -128,6 +131,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       unawaited(TransferNotifications.ensurePermission());
       // 本地读快照通常 < 20ms，先让列表可见，再去等网络握手。
       await _restoreCache();
+      // 传输队列也要恢复：重启后看不到上一次的任务会让人以为白传了。
+      await _restoreTasks();
       for (var attempt = 1; attempt <= 3; attempt++) {
         await connect();
         if (connected) {
@@ -283,6 +288,120 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // ---- 传输队列 ----
   final List<TransferTask> tasks = [];
   int _nextTaskId = 1;
+
+  Timer? _persistTimer;
+
+  /// 恢复上次的传输队列。上次在跑的任务降级为排队，上传任务先检查本地文件。
+  Future<void> _restoreTasks() async {
+    final saved = await TransferStore.read();
+    if (saved.isEmpty) return;
+
+    var maxId = 0;
+    for (final task in saved) {
+      if (task.id > maxId) maxId = task.id;
+      // 上次没跑完的任务恢复成「已暂停」而不是「排队中」：直接续跑会在冷启动
+      // 时突然吃掉流量，用户点「全部开始」再继续更符合预期。
+      if (task.status == TransferStatus.running ||
+          task.status == TransferStatus.queued) {
+        task
+          ..status = TransferStatus.paused
+          ..sent = 0;
+      }
+      if (task.kind == TransferKind.upload &&
+          task.status == TransferStatus.paused &&
+          !await File(task.local).exists()) {
+        task
+          ..status = TransferStatus.failed
+          ..error = '本地文件已不存在';
+      }
+      tasks.add(task);
+    }
+    if (maxId >= _nextTaskId) _nextTaskId = maxId + 1;
+    notifyListeners();
+  }
+
+  /// 把队列落盘（400ms 防抖：进度更新很频繁，没必要每次都写）。
+  void _schedulePersist() {
+    _persistTimer?.cancel();
+    _persistTimer = Timer(const Duration(milliseconds: 400), () {
+      unawaited(TransferStore.write(tasks));
+    });
+  }
+
+  /// 优先传输：把任务插到队列最前面（只对排队中的任务有意义）。
+  void prioritizeTask(TransferTask task) {
+    if (task.status != TransferStatus.queued) return;
+    tasks.remove(task);
+    tasks.insert(0, task);
+    notifyListeners();
+    _schedulePersist();
+  }
+
+  /// 暂停：只在排队阶段有效。已经开始的传输由 native 调用占着，无法中断。
+  bool pauseTask(TransferTask task) {
+    if (task.status != TransferStatus.queued) return false;
+    task.status = TransferStatus.paused;
+    notifyListeners();
+    _schedulePersist();
+    return true;
+  }
+
+  void resumeTask(TransferTask task) {
+    if (task.status != TransferStatus.paused) return;
+    task.status = TransferStatus.queued;
+    notifyListeners();
+    _schedulePersist();
+    unawaited(_pump());
+  }
+
+  /// 暂停全部：运行中的任务没法中断，只把排队的收起来。
+  void pauseAll() {
+    var changed = false;
+    for (final t in tasks) {
+      if (t.status == TransferStatus.queued) {
+        t.status = TransferStatus.paused;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    notifyListeners();
+    _schedulePersist();
+  }
+
+  void resumeAll() {
+    var changed = false;
+    for (final t in tasks) {
+      if (t.status == TransferStatus.paused) {
+        t.status = TransferStatus.queued;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    notifyListeners();
+    _schedulePersist();
+    unawaited(_pump());
+  }
+
+  /// 重试所有失败任务。
+  void retryAllFailed() {
+    var changed = false;
+    for (final t in tasks) {
+      if (t.status == TransferStatus.failed) {
+        t
+          ..status = TransferStatus.queued
+          ..sent = 0
+          ..error = null
+          ..speed = 0;
+        t.meter.reset();
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    notifyListeners();
+    _schedulePersist();
+    unawaited(_pump());
+  }
+
   bool _pumping = false;
 
   int get activeCount => tasks
@@ -343,6 +462,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _stopHeartbeat();
     _statusTimer?.cancel();
+    _persistTimer?.cancel();
+    // 尽力落盘一次，让下次启动能恢复队列。
+    unawaited(TransferStore.write(tasks));
     _disposeTransferPool();
     _worker.dispose();
     super.dispose();
@@ -558,6 +680,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  /// 直接跳到某个目录（搜索结果里点目录时用）。
+  void jumpTo(String path) {
+    var d = path.replaceAll('\\', '/');
+    while (d.startsWith('/')) {
+      d = d.substring(1);
+    }
+    if (!d.endsWith('/')) d = '$d/';
+    cwd = d;
+    notifyListeners();
+  }
+
   void goUp() {
     if (cwd.isEmpty) return;
     final trimmed = cwd.substring(0, cwd.length - 1);
@@ -651,9 +784,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         pathSummary = null;
         pathLatencyMs = null;
         _stopHeartbeat();
-        status = showingCache
-            ? '连接已断开，显示上次列表 · 下拉重试'
-            : '连接已断开，下拉或点「重试」重新连接';
+        status = showingCache ? '连接已断开，显示上次列表 · 下拉重试' : '连接已断开，下拉或点「重试」重新连接';
       } else if (!silent) {
         status = showingCache ? '刷新失败，显示上次列表: $e' : '刷新失败: $e';
       }
@@ -765,6 +896,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       );
     }
     notifyListeners();
+    _schedulePersist();
     await _pump();
   }
 
@@ -822,7 +954,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         } else if (entity is File) {
           final stat = await entity.stat();
           totalBytes += stat.size;
-          picked.add((name: '$rootName/$rel', path: entity.path, size: stat.size));
+          picked.add((
+            name: '$rootName/$rel',
+            path: entity.path,
+            size: stat.size,
+          ));
         }
       }
     } catch (e) {
@@ -849,9 +985,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // 只含空目录的文件夹：没有文件要传，但目录结构已经建好了。
     if (picked.isEmpty) {
       final created = emptyDirs.length - dirFailures;
-      status = created > 0
-          ? '已在远端创建 $created 个空目录'
-          : '空目录创建失败（$dirFailures 个）';
+      status = created > 0 ? '已在远端创建 $created 个空目录' : '空目录创建失败（$dirFailures 个）';
       notifyListeners();
       return;
     }
@@ -874,6 +1008,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         '已加入 ${picked.length} 个文件（${humanSize(totalBytes)}）'
         '$skippedText$failText';
     notifyListeners();
+    _schedulePersist();
     await _pump();
   }
 
@@ -998,6 +1133,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
     status = '已加入 ${items.length} 个下载任务 → $root';
     notifyListeners();
+    _schedulePersist();
     await _pump();
   }
 
@@ -1031,9 +1167,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       while (_pool.length < _transferPoolSize) {
         final w = NetdiskWorker();
         try {
-          await w.start(
-            libraryPath: Platform.environment['NETDISK_FFI_DLL'],
-          );
+          await w.start(libraryPath: Platform.environment['NETDISK_FFI_DLL']);
           await w.init(relay, token, serverAddr);
           _pool.add(w);
         } catch (_) {
@@ -1129,6 +1263,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     task.meter.reset();
     notifyListeners();
     _notifyTransfers(force: true);
+    _schedulePersist();
 
     unawaited(() async {
       final (worker, fromPool) = _acquireTransferWorker();
@@ -1176,6 +1311,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         _running--;
         notifyListeners();
         _notifyTransfers(force: true);
+        _schedulePersist();
       }
     }());
   }
@@ -1187,6 +1323,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           t.status == TransferStatus.done || t.status == TransferStatus.failed,
     );
     notifyListeners();
+    _schedulePersist();
   }
 
   /// 前台服务是否在运行（决定通知走 startService 还是普通 show）。
@@ -1290,6 +1427,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       ..speed = 0;
     task.meter.reset();
     notifyListeners();
+    _schedulePersist();
     unawaited(_pump());
   }
 
@@ -1306,10 +1444,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       setTransientStatus('已删除：$path（在服务端回收站）');
       await refresh(silent: true);
     } catch (e) {
-      setTransientStatus(
-        '删除失败: $e',
-        ttl: const Duration(seconds: 6),
-      );
+      setTransientStatus('删除失败: $e', ttl: const Duration(seconds: 6));
     } finally {
       busy = false;
       notifyListeners();
@@ -1325,10 +1460,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       setTransientStatus('已重命名：$from → $to');
       await refresh(silent: true);
     } catch (e) {
-      setTransientStatus(
-        '重命名失败: $e',
-        ttl: const Duration(seconds: 6),
-      );
+      setTransientStatus('重命名失败: $e', ttl: const Duration(seconds: 6));
     } finally {
       busy = false;
       notifyListeners();
@@ -1345,10 +1477,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       setTransientStatus('已复制：$from → $to');
       await refresh(silent: true);
     } catch (e) {
-      setTransientStatus(
-        '复制失败: $e',
-        ttl: const Duration(seconds: 6),
-      );
+      setTransientStatus('复制失败: $e', ttl: const Duration(seconds: 6));
     } finally {
       busy = false;
       notifyListeners();
@@ -1375,10 +1504,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       setTransientStatus('已创建目录：$base$trimmed');
       return true;
     } catch (e) {
-      setTransientStatus(
-        '创建目录失败: $e',
-        ttl: const Duration(seconds: 6),
-      );
+      setTransientStatus('创建目录失败: $e', ttl: const Duration(seconds: 6));
       return false;
     } finally {
       busy = false;
@@ -1553,7 +1679,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     // 深的目录先删，父目录才会变空。
-    final ordered = dirPaths.toList()..sort((a, b) => b.length.compareTo(a.length));
+    final ordered = dirPaths.toList()
+      ..sort((a, b) => b.length.compareTo(a.length));
     var okDirs = 0;
     for (final dir in ordered) {
       try {
@@ -1677,5 +1804,4 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     return '已连接';
   }
-
 }

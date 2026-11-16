@@ -14,6 +14,7 @@ import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
 import '../widgets/text_input_dialog.dart';
 import 'preview_page.dart';
+import 'search_page.dart';
 
 /// 条目类型（列表里目录与文件共用）。
 typedef _Entry = ({String name, bool isDir, int size, String path});
@@ -24,6 +25,13 @@ typedef _Entry = ({String name, bool isDir, int size, String path});
 /// - **点击文件 = 直接预览**（不再经过 ⋮ 菜单）
 /// - **长按 = 进入多选**，此后点击变成勾选
 /// - 点击目录始终是「进入」
+class FilesPage extends StatefulWidget {
+  const FilesPage({super.key});
+
+  @override
+  State<FilesPage> createState() => _FilesPageState();
+}
+
 /// 把 `a/b/c.txt` 拆成 (`a/b/`, `c.txt`)；目录带尾斜杠也能正确处理。
 (String, String) _splitPath(String path) {
   final clean = path.endsWith('/') ? path.substring(0, path.length - 1) : path;
@@ -32,18 +40,27 @@ typedef _Entry = ({String name, bool isDir, int size, String path});
   return (dir, clean.substring(dir.length));
 }
 
-class FilesPage extends StatefulWidget {
-  const FilesPage({super.key});
-
-  @override
-  State<FilesPage> createState() => _FilesPageState();
-}
-
 class _FilesPageState extends State<FilesPage> {
+  /// 每页条数。列表一次只渲染这么多，触底再追加，目录很大时也不卡。
+  static const int _pageSize = 50;
+
   bool _selectionMode = false;
   final Set<String> _selected = <String>{};
 
+  /// 当前已加载的条数（分页）。
+  int _visible = _pageSize;
+
+  /// 上一次渲染的目录，用于在切换目录时把分页重置回第一页。
+  String? _lastCwd;
+
   AppState get _state => context.read<AppState>();
+
+  /// 触底追加一页。
+  void _growVisible(int total) {
+    if (_visible >= total) return;
+    final next = _visible + _pageSize;
+    setState(() => _visible = next > total ? total : next);
+  }
 
   void _enterSelection(String path) {
     setState(() {
@@ -82,6 +99,23 @@ class _FilesPageState extends State<FilesPage> {
   void _enterDir(String name) {
     _exitSelection();
     _state.enterDir(name);
+  }
+
+  /// 全盘搜索：点目录跳过去，点文件先切到它所在目录再预览
+  /// （这样预览页能拿到同目录的图片列表，可以左右滑动）。
+  Future<void> _openSearch() async {
+    final hit = await Navigator.of(
+      context,
+    ).push<SearchHit>(MaterialPageRoute(builder: (_) => const SearchPage()));
+    if (hit == null || !mounted) return;
+
+    if (hit.isDir) {
+      _state.jumpTo(hit.path);
+      return;
+    }
+    final dir = _splitPath(hit.path).$1;
+    if (dir != _state.cwd) _state.jumpTo(dir);
+    _openPreview(hit.path);
   }
 
   /// 同目录下的图片一起传给预览页，支持左右滑动连续看。
@@ -123,6 +157,12 @@ class _FilesPageState extends State<FilesPage> {
     final s = context.watch<AppState>();
     final entries = s.entries;
 
+    // 切目录后分页回到第一页（直接改字段，不额外 setState —— 这次 build 就会用新值）。
+    if (_lastCwd != s.cwd) {
+      _lastCwd = s.cwd;
+      _visible = _pageSize;
+    }
+
     // 切到别的目录后，之前勾选的路径已经不在视图里，顺手清理。
     if (_selectionMode && _selected.isNotEmpty) {
       final visible = entries.map((e) => e.path).toSet();
@@ -146,21 +186,31 @@ class _FilesPageState extends State<FilesPage> {
           if (!_selectionMode && s.showingCache)
             _CacheBanner(savedAt: s.cacheTime, refreshing: s.busy),
           Expanded(
-            child: _FileList(
-              state: s,
-              selectionMode: _selectionMode,
-              selected: _selected,
-              onToggle: _toggle,
-              onLongPress: _enterSelection,
-              // 目录导航是纯本地过滤，离线也可用；其余操作要走网络。
-              onEnterDir: _enterDir,
-              onPreview: (path) => _runOnline(() => _openPreview(path)),
-              onCopy: (path) => _runOnline(() => _copyDialog(path)),
-              onRename: (path) => _runOnline(() => _renameDialog(path)),
-              onDelete: (path) => _runOnline(() => _deleteConfirm(path)),
-              onDownload: (entry) => _runOnline(() => _startDownload(entry)),
-              onDownloadDir: (entry) =>
-                  _runOnline(() => _startDirDownload(entry)),
+            child: NotificationListener<ScrollNotification>(
+              onNotification: (n) {
+                // 距底部 240px 时追加一页，滚动过程中无感。
+                if (n.metrics.pixels >= n.metrics.maxScrollExtent - 240) {
+                  _growVisible(entries.length);
+                }
+                return false;
+              },
+              child: _FileList(
+                state: s,
+                selectionMode: _selectionMode,
+                selected: _selected,
+                visible: _visible,
+                onToggle: _toggle,
+                onLongPress: _enterSelection,
+                // 目录导航是纯本地过滤，离线也可用；其余操作要走网络。
+                onEnterDir: _enterDir,
+                onPreview: (path) => _runOnline(() => _openPreview(path)),
+                onCopy: (path) => _runOnline(() => _copyDialog(path)),
+                onRename: (path) => _runOnline(() => _renameDialog(path)),
+                onDelete: (path) => _runOnline(() => _deleteConfirm(path)),
+                onDownload: (entry) => _runOnline(() => _startDownload(entry)),
+                onDownloadDir: (entry) =>
+                    _runOnline(() => _startDirDownload(entry)),
+              ),
             ),
           ),
           if (!_selectionMode) _StatusBar(text: s.status),
@@ -183,6 +233,11 @@ class _FilesPageState extends State<FilesPage> {
     return AppBar(
       title: const Text('p2pNetDisk'),
       actions: [
+        IconButton(
+          tooltip: '搜索',
+          icon: const Icon(Icons.search),
+          onPressed: s.busy ? null : _openSearch,
+        ),
         if (s.connected && s.pathSummary != null)
           PathChip(text: s.pathSummary!, latencyMs: s.pathLatencyMs)
         else if (!s.connected)
@@ -297,7 +352,10 @@ class _FilesPageState extends State<FilesPage> {
       for (final e in selected)
         if (!e.isDir) (path: e.path, size: e.size),
     ];
-    final dirs = [for (final e in selected) if (e.isDir) e.path];
+    final dirs = [
+      for (final e in selected)
+        if (e.isDir) e.path,
+    ];
     _exitSelection();
 
     // 文件平铺到下载根目录（保持原有行为），目录保持各自的相对结构。
@@ -346,11 +404,7 @@ class _FilesPageState extends State<FilesPage> {
   }
 
   Future<void> _batchCopy(List<_Entry> files) async {
-    final dir = await showDirectoryPicker(
-      context,
-      state: _state,
-      title: '复制到',
-    );
+    final dir = await showDirectoryPicker(context, state: _state, title: '复制到');
     if (dir == null || !mounted) return;
     final paths = [for (final f in files) f.path];
     _exitSelection();
@@ -365,18 +419,12 @@ class _FilesPageState extends State<FilesPage> {
         .toList(growable: false);
     if (selected.isEmpty) return;
 
-    final dir = await showDirectoryPicker(
-      context,
-      state: _state,
-      title: '移动到',
-    );
+    final dir = await showDirectoryPicker(context, state: _state, title: '移动到');
     if (dir == null || !mounted) return;
     // 目录路径在列表里带尾斜杠，rename 时去掉更干净。
     final paths = [
       for (final e in selected)
-        e.path.endsWith('/')
-            ? e.path.substring(0, e.path.length - 1)
-            : e.path,
+        e.path.endsWith('/') ? e.path.substring(0, e.path.length - 1) : e.path,
     ];
     _exitSelection();
     await _state.moveMany(paths, dir);
@@ -616,11 +664,15 @@ class _FileList extends StatelessWidget {
     required this.onDelete,
     required this.onDownload,
     required this.onDownloadDir,
+    required this.visible,
   });
 
   final AppState state;
   final bool selectionMode;
   final Set<String> selected;
+
+  /// 当前分页已加载的条数（列表只渲染前 [visible] 项）。
+  final int visible;
   final void Function(String path) onToggle;
   final void Function(String path) onLongPress;
   final void Function(String name) onEnterDir;
@@ -707,7 +759,7 @@ class _FileList extends StatelessWidget {
     return ListView.separated(
       physics: const AlwaysScrollableScrollPhysics(),
       padding: kPagePadding,
-      itemCount: entries.length,
+      itemCount: entries.length > visible ? visible : entries.length,
       separatorBuilder: (_, _) => const SizedBox(height: 8),
       itemBuilder: (context, i) {
         final e = entries[i];
@@ -1157,7 +1209,7 @@ class _CacheBanner extends StatelessWidget {
     final stamp = t == null
         ? ''
         : ' · ${t.hour.toString().padLeft(2, '0')}:'
-            '${t.minute.toString().padLeft(2, '0')}';
+              '${t.minute.toString().padLeft(2, '0')}';
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
       child: Container(
@@ -1172,13 +1224,8 @@ class _CacheBanner extends StatelessWidget {
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                refreshing
-                    ? '上次列表$stamp，正在刷新…'
-                    : '上次列表$stamp · 离线，下拉可重试',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: scheme.onSurfaceVariant,
-                ),
+                refreshing ? '上次列表$stamp，正在刷新…' : '上次列表$stamp · 离线，下拉可重试',
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
               ),
             ),
             if (refreshing)

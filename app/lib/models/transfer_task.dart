@@ -6,7 +6,7 @@ library;
 
 enum TransferKind { upload, download }
 
-enum TransferStatus { queued, running, done, failed }
+enum TransferStatus { queued, running, done, failed, paused }
 
 class TransferTask {
   TransferTask({
