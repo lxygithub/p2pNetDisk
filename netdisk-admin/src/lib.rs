@@ -107,7 +107,8 @@ async fn serve(listener: TcpListener, cfg: AdminConfig) -> Result<()> {
     };
     let app = Router::new()
         .route("/", get(index))
-        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/favicon.ico", get(favicon))
+        .route("/favicon.png", get(favicon_png))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/overview", get(overview))
@@ -123,6 +124,32 @@ async fn serve(listener: TcpListener, cfg: AdminConfig) -> Result<()> {
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("admin.html"))
+}
+
+/// 多尺寸 ICO（16/32/48/64），由 `tools/generate_admin_favicon.py` 生成。
+///
+/// 内嵌进二进制而不是走静态目录：管理后台只有一个页面，少一个需要部署的路径。
+async fn favicon() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/x-icon"),
+            (header::CACHE_CONTROL, "public, max-age=604800"),
+        ],
+        include_bytes!("favicon.ico").as_slice(),
+    )
+        .into_response()
+}
+
+/// 128px PNG，供 apple-touch-icon 与高 DPI 标签页使用。
+async fn favicon_png() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=604800"),
+        ],
+        include_bytes!("favicon.png").as_slice(),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +703,26 @@ mod tests {
         dir
     }
 
+    /// 取原始字节，用于校验二进制响应（ICO / PNG）。
+    async fn fetch_raw(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let split = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap_or(buf.len());
+        let head = String::from_utf8_lossy(&buf[..split]).to_string();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, buf[split.saturating_add(4)..].to_vec())
+    }
+
     #[tokio::test]
     async fn api_requires_login_then_accepts_valid_token() {
         let root = temp_root("auth");
@@ -745,6 +792,22 @@ mod tests {
         assert_eq!(status, 200);
         let head: String = body.chars().take(300).collect();
         assert!(body.contains("p2pNetDisk 管理后台"), "{head}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn favicon_is_served() {
+        let root = temp_root("favicon");
+        let (addr, _) = spawn_admin(root.clone()).await;
+
+        let (status, ico) = fetch_raw(addr, "/favicon.ico").await;
+        assert_eq!(status, 200);
+        assert_eq!(&ico[..4], &[0, 0, 1, 0], "ICO signature");
+
+        let (status, png) = fetch_raw(addr, "/favicon.png").await;
+        assert_eq!(status, 200);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+
         std::fs::remove_dir_all(&root).ok();
     }
 
