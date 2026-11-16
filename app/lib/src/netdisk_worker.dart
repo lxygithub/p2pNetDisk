@@ -372,12 +372,17 @@ class NetdiskWorker {
   }
 
   /// 释放 worker 内的 endpoint 句柄，但保留 isolate 以便再次 init。
-  Future<void> closeConnection() async {
+  ///
+  /// 必须在每次 `init` 前调用：同一进程里留下两个同身份的 iroh endpoint，
+  /// 新 endpoint 的 relay 注册/连接会互相干扰，重连会一直失败。
+  Future<void> closeConnection({
+    Duration timeLimit = const Duration(seconds: 8),
+  }) async {
     if (!isRunning) return;
     try {
-      await _call('close');
+      await _call('close', timeLimit: timeLimit);
     } catch (_) {
-      // 关闭失败不影响后续重建。
+      // 关闭失败不影响后续重建；超时会把 worker 标记成卡死，交给上层换 isolate。
     }
   }
 

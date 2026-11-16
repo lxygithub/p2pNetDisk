@@ -160,6 +160,9 @@ class NetdiskClient {
 
   /// 成功返回 null，失败返回错误说明。
   String? connect(String relayUrl, String token, String serverAddr) {
+    // 防御：旧 handle 没释放就再 init，会在同一进程里留下第二个同身份的
+    // endpoint，导致重连失败（杀进程才能恢复）。
+    close();
     final a = relayUrl.toNativeUtf8();
     final b = token.toNativeUtf8();
     final c = serverAddr.toNativeUtf8();

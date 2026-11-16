@@ -352,6 +352,18 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // ---------------------------------------------------------------------------
 
   Future<void> connect() async {
+    // 先释放旧的 endpoint 句柄。
+    //
+    // 掉线时 worker 通常没「卡死」，connect() 会复用它，旧的 iroh endpoint
+    // 就一直活着；再 init 一个同身份（同一 secret）的新 endpoint，两者的
+    // relay 注册/连接互相干扰，重连就永远失败 —— 表现正是「杀进程重开才好」。
+    // 必须显式 netdisk_close 把旧 endpoint drop 掉。
+    if (!_worker.isStuck) {
+      await _worker.closeConnection();
+      // relay/QUIC 侧清理旧连接需要一点时间，太紧地接着 bind 容易被判成重复连接。
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+
     // 上一次 RPC 超时后，旧 isolate 里还挂着一条取消不了的 native 调用。
     // 换一个新的（dispose 会 kill 掉旧的），否则新命令只会继续排队。
     final rebuilt = _worker.isStuck;
@@ -385,8 +397,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _startHeartbeat();
     } catch (e) {
       connected = false;
-      status = '连接失败: $e';
       _stopHeartbeat();
+      status = '连接失败: $e';
+      // 失败后直接丢掉这个 worker：坏掉的是 isolate 里的 native client，
+      // 留着它，下次重连只会在同一个坏状态上再试一遍。重建之后用户再点
+      // 「重新连接」就等价于一次干净启动，不必杀进程。
+      _worker.dispose();
+      _worker = NetdiskWorker();
     } finally {
       busy = false;
       notifyListeners();

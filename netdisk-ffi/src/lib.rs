@@ -633,11 +633,24 @@ pub extern "C" fn netdisk_ffi_version() -> *mut c_char {
 }
 
 /// 释放 handle（会 drop endpoint）。
+///
+/// iroh 的 `Endpoint::close` 是异步的：只 drop 不等待，紧接着 bind 新 endpoint
+/// 时 relay 会短暂看到同 IP 的两条连接，新连接容易被判成重复而失败 ——
+/// 现象就是「掉线后重连一直失败，杀进程重开才恢复」。这里最多等 5s，
+/// 让旧连接真正下线再返回。
 #[no_mangle]
 pub unsafe extern "C" fn netdisk_close(h: *mut Handle) {
-    if !h.is_null() {
-        drop(Box::from_raw(h));
+    if h.is_null() {
+        return;
     }
+    let handle = Box::from_raw(h);
+    let ep = handle.ep.clone();
+    drop(handle);
+    let _ = RT.block_on(with_timeout(
+        Duration::from_secs(5),
+        "close endpoint",
+        ep.close(),
+    ));
 }
 
 #[cfg(test)]
