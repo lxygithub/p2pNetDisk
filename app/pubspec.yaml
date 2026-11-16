@@ -50,6 +50,9 @@ dependencies:
   # 跨页面共享状态（连接态、文件列表、传输队列）
   provider: ^6.1.2
 
+  # 传输队列持久化：SQLite 增量写入，避免每次状态变化都全量重写 JSON
+  sqflite: ^2.4.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

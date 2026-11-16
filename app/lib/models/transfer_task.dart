@@ -15,10 +15,14 @@ class TransferTask {
     required this.remote,
     required this.local,
     required this.total,
-  });
+    DateTime? createdAt,
+  }) : createdAt = createdAt ?? DateTime.now();
 
   final int id;
   final TransferKind kind;
+
+  /// 入队时间。持久化时用它排序，恢复后顺序与退出前一致。
+  final DateTime createdAt;
 
   /// 服务端相对路径（含目录前缀）。
   final String remote;

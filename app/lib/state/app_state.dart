@@ -67,7 +67,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     } else if (state == AppLifecycleState.paused) {
       _stopHeartbeat();
       // 切后台立刻落盘：被系统杀掉时才有东西可恢复。
-      unawaited(TransferStore.write(tasks));
+      unawaited(_flushTasks());
     }
   }
 
@@ -320,12 +320,50 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  /// 把队列落盘（400ms 防抖：进度更新很频繁，没必要每次都写）。
+  /// 待写入数据库的任务 id：只写变化的行，不做全量重写。
+  final Set<int> _dirtyTaskIds = <int>{};
+
+  /// 标记单个任务需要落盘。
+  void _markTask(TransferTask task) {
+    _dirtyTaskIds.add(task.id);
+    _schedulePersist();
+  }
+
+  /// 批量操作（入队 / 全部暂停等）后整队列都要同步。
+  void _markAllDirty() {
+    _dirtyTaskIds.addAll(tasks.map((t) => t.id));
+    _schedulePersist();
+  }
+
+  /// 400ms 防抖：进度更新很频繁，没必要每次都写库。
   void _schedulePersist() {
     _persistTimer?.cancel();
     _persistTimer = Timer(const Duration(milliseconds: 400), () {
-      unawaited(TransferStore.write(tasks));
+      unawaited(_flushTasks());
     });
+  }
+
+  /// 把脏任务写进 SQLite；已从列表里消失的（被清除）顺手删掉。
+  Future<void> _flushTasks() async {
+    _persistTimer?.cancel();
+    final ids = _dirtyTaskIds.toList(growable: false);
+    _dirtyTaskIds.clear();
+    if (ids.isEmpty) return;
+
+    final byId = {for (final t in tasks) t.id: t};
+    final rows = <TransferTask>[];
+    final gone = <int>[];
+    for (final id in ids) {
+      final task = byId[id];
+      if (task == null) {
+        gone.add(id);
+      } else {
+        rows.add(task);
+      }
+    }
+    if (rows.isNotEmpty) await TransferStore.upsertMany(rows);
+    if (gone.isNotEmpty) await TransferStore.remove(gone);
+    await TransferStore.prune();
   }
 
   /// 优先传输：把任务插到队列最前面（只对排队中的任务有意义）。
@@ -334,7 +372,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     tasks.remove(task);
     tasks.insert(0, task);
     notifyListeners();
-    _schedulePersist();
+    _markTask(task);
   }
 
   /// 暂停：只在排队阶段有效。已经开始的传输由 native 调用占着，无法中断。
@@ -342,7 +380,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (task.status != TransferStatus.queued) return false;
     task.status = TransferStatus.paused;
     notifyListeners();
-    _schedulePersist();
+    _markTask(task);
     return true;
   }
 
@@ -350,7 +388,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (task.status != TransferStatus.paused) return;
     task.status = TransferStatus.queued;
     notifyListeners();
-    _schedulePersist();
+    _markTask(task);
     unawaited(_pump());
   }
 
@@ -365,7 +403,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     if (!changed) return;
     notifyListeners();
-    _schedulePersist();
+    _markAllDirty();
   }
 
   void resumeAll() {
@@ -378,7 +416,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     if (!changed) return;
     notifyListeners();
-    _schedulePersist();
+    _markAllDirty();
     unawaited(_pump());
   }
 
@@ -398,7 +436,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     if (!changed) return;
     notifyListeners();
-    _schedulePersist();
+    _markAllDirty();
     unawaited(_pump());
   }
 
@@ -462,9 +500,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _stopHeartbeat();
     _statusTimer?.cancel();
-    _persistTimer?.cancel();
     // 尽力落盘一次，让下次启动能恢复队列。
-    unawaited(TransferStore.write(tasks));
+    unawaited(_flushTasks());
     _disposeTransferPool();
     _worker.dispose();
     super.dispose();
@@ -896,7 +933,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       );
     }
     notifyListeners();
-    _schedulePersist();
+    _markAllDirty();
     await _pump();
   }
 
@@ -1008,7 +1045,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         '已加入 ${picked.length} 个文件（${humanSize(totalBytes)}）'
         '$skippedText$failText';
     notifyListeners();
-    _schedulePersist();
+    _markAllDirty();
     await _pump();
   }
 
@@ -1133,7 +1170,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
     status = '已加入 ${items.length} 个下载任务 → $root';
     notifyListeners();
-    _schedulePersist();
+    _markAllDirty();
     await _pump();
   }
 
@@ -1263,7 +1300,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     task.meter.reset();
     notifyListeners();
     _notifyTransfers(force: true);
-    _schedulePersist();
+    _markTask(task);
 
     unawaited(() async {
       final (worker, fromPool) = _acquireTransferWorker();
@@ -1311,19 +1348,25 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         _running--;
         notifyListeners();
         _notifyTransfers(force: true);
-        _schedulePersist();
+        _markTask(task);
       }
     }());
   }
 
   /// 清掉已完成/失败的任务，保留进行中的。
   void clearFinishedTasks() {
-    tasks.removeWhere(
-      (t) =>
-          t.status == TransferStatus.done || t.status == TransferStatus.failed,
-    );
+    final removed = <int>{};
+    tasks.removeWhere((t) {
+      final finished =
+          t.status == TransferStatus.done || t.status == TransferStatus.failed;
+      if (finished) removed.add(t.id);
+      return finished;
+    });
+    if (removed.isEmpty) return;
+    _dirtyTaskIds.removeAll(removed);
     notifyListeners();
-    _schedulePersist();
+    // 直接按状态批量删，不用逐条 upsert。
+    unawaited(TransferStore.clearFinished());
   }
 
   /// 前台服务是否在运行（决定通知走 startService 还是普通 show）。
@@ -1427,7 +1470,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       ..speed = 0;
     task.meter.reset();
     notifyListeners();
-    _schedulePersist();
+    _markTask(task);
     unawaited(_pump());
   }
 
