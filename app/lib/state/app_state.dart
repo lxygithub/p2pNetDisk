@@ -603,7 +603,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       status = '已连接';
       _startHeartbeat();
       // 后台再起一个传输专用 endpoint，让上传/下载能并行；失败不影响主连接。
-      unawaited(_ensureTransferPool());
+      unawaited(_syncTransferPool());
       return null;
     } catch (e) {
       _stopHeartbeat();
@@ -900,6 +900,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         : '${m.group(1) == 'direct' ? '直连' : '中继'} · ${m.group(3)} ms';
     pathLatencyMs = m == null ? null : int.tryParse(m.group(3) ?? '');
     notifyListeners();
+    // 直连/中继切换会改变目标并发数，顺手把池调一下。
+    unawaited(_syncTransferPool());
   }
 
   void _clearPathSummary() {
@@ -1187,26 +1189,60 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // ---------------------------------------------------------------------------
   //
   // 单个 worker isolate 里的 native 调用是同步的，`put/get` 只能排队执行 ——
-  // 所以「并发 5 个任务」实际是 1 个在传。这里额外起一个独立 endpoint 的
-  // worker 专门跑传输，让上传/下载真正并行（服务端也已按流并发处理）。
+  // 所以「并发 5 个任务」实际是 1 个在传。这里额外起独立 endpoint 的 worker
+  // 专门跑传输，让上传/下载真正并行（服务端也已按流并发处理）。
+  //
+  // 池大小不是常数，按「路径 + 排队任务数」动态计算：
+  // - 直连：单连接容易卡在拥塞控制上，多开几路能填满上行；
+  // - relay：共享中继，开太多既不快也可能影响别人，只加 1 路；
+  // - 排队任务不足 2 个：建了也用不上，白付 endpoint 冷启动与内存。
   // 池只是加速：建不起来就退回单 worker，不影响功能。
 
-  static const int _transferPoolSize = 1;
+  /// 直连时额外开的 worker 数（总并发 = 1 + 3 = 4）。
+  static const int _maxDirectPool = 3;
+
+  /// 走 relay 时额外开的 worker 数（总并发 = 2）。
+  static const int _maxRelayPool = 1;
 
   final List<NetdiskWorker> _pool = [];
   final Set<NetdiskWorker> _busyPool = {};
   bool _warmingPool = false;
 
-  Future<void> _ensureTransferPool() async {
-    if (_warmingPool || _pool.length >= _transferPoolSize) return;
+  /// 路径是否直连。还没探测出来时按中继保守处理。
+  bool get pathIsDirect => pathSummary?.startsWith('直连') ?? false;
+
+  /// 目标池大小（不含主 worker）。
+  int get _targetPoolSize {
+    if (!connected) return 0;
+    final queued = tasks.where((t) => t.status == TransferStatus.queued).length;
+    if (queued < 2) return 0;
+    return pathIsDirect ? _maxDirectPool : _maxRelayPool;
+  }
+
+  /// 把池调整到目标大小：先关空闲的多余 worker，再按需补齐。
+  Future<void> _syncTransferPool() async {
+    final target = _targetPoolSize;
+
+    if (_pool.length > target) {
+      // 只关空闲的；正在传的不打断，等它自己结束。
+      for (final w in _pool.where((w) => !_busyPool.contains(w)).toList()) {
+        if (_pool.length <= target) break;
+        _pool.remove(w);
+        w.dispose();
+      }
+    }
+    if (target == 0 || _pool.length >= target || _warmingPool) return;
+
     _warmingPool = true;
     try {
-      while (_pool.length < _transferPoolSize) {
+      while (_pool.length < target && connected) {
         final w = NetdiskWorker();
         try {
           await w.start(libraryPath: Platform.environment['NETDISK_FFI_DLL']);
           await w.init(relay, token, serverAddr);
           _pool.add(w);
+          // 新通道就绪，让等待中的 _pump 立刻用上。
+          notifyListeners();
         } catch (_) {
           w.dispose();
           return;
@@ -1247,7 +1283,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       // 池 worker 出过错就直接丢掉，下次补一个新的；否则会一直用坏连接。
       _pool.remove(worker);
       worker.dispose();
-      unawaited(_ensureTransferPool());
+      unawaited(_syncTransferPool());
     }
   }
 
@@ -1258,6 +1294,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> _pump() async {
     if (_pumping) return;
     _pumping = true;
+    // 排队任务数变化会改变目标池大小，先把池调好再派活。
+    unawaited(_syncTransferPool());
     try {
       while (true) {
         TransferTask? next;
@@ -1289,6 +1327,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _anyDone = false;
       await refresh(silent: true);
     }
+    // 队列空了就收缩，别让几个空闲 endpoint 一直占着内存。
+    unawaited(_syncTransferPool());
   }
 
   /// 启动单个任务（不等待完成，由调用方通过 `_running` 计数感知）。

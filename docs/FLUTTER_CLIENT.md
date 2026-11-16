@@ -1146,9 +1146,17 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 所以 handler 里不能提前返回 `Ok(())`（返回即连接被 drop，客户端立刻 EOF，
 表现为服务端反复重启）。
 
-**客户端**：额外起一个传输专用 worker（独立 endpoint），
-`_acquireTransferWorker` 优先分配空闲的池 worker，上传/下载变成 2 路并行。
-池 worker 出错就丢弃并补一个新的；建不起来就退回单 worker，功能不受影响。
+**客户端**：额外起独立 endpoint 的传输 worker，数量按「路径 + 排队任务数」动态算：
+
+| 条件 | 池大小 | 总并发 |
+| --- | --- | --- |
+| 直连（`pathSummary` 以「直连」开头） | 3 | 4 |
+| relay / 路径还没探测出来 | 1 | 2 |
+| 排队任务 < 2 | 0 | 1 |
+
+`_syncTransferPool()` 在连接成功、`_updatePath` 完成、每次 `_pump` 前后调用：
+多了就补，少了只关**空闲**的 worker（正在传的不打断）。池 worker 出错就丢弃并
+重建；建不起来就退回单 worker，功能不受影响。
 
 **重连保护**：之前 `connect()` 无条件 `closeConnection` + `dispose`，
 传输途中被心跳/超时触发重连时，会把正在跑的任务全部打断 ——
