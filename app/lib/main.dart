@@ -12,17 +12,24 @@ import 'widgets/glass.dart';
 Future<void> main() async {
   // path_provider 走平台通道，必须在 runApp 之前绑定好引擎。
   WidgetsFlutterBinding.ensureInitialized();
-  // 本机保存的连接参数先读出来，页面构建时就是最终值。
-  final saved = await ConnectionPrefs.read();
+
+  // 读本机保存的连接参数，但**绝不能让这一步挡住首帧**。
+  //
+  // 从后台恢复、进程刚重建时，平台通道偶发迟迟不返回；如果这里无限等待，
+  // `runApp` 就不会执行、Flutter 首帧不渲染，Android 的开屏 logo 会一直挂着
+  // —— 表现就是「偶现切回前台卡在启动页」。正常情况下这一步 < 50ms。
+  ConnectionConfig? saved;
+  try {
+    saved = await ConnectionPrefs.read().timeout(const Duration(seconds: 3));
+  } catch (_) {
+    // 超时/异常都退回编译期默认值，先让界面起来。
+    saved = null;
+  }
   runApp(NetdiskApp(savedConfig: saved));
 }
 
 class NetdiskApp extends StatelessWidget {
-  const NetdiskApp({
-    super.key,
-    this.autoConnect = true,
-    this.savedConfig,
-  });
+  const NetdiskApp({super.key, this.autoConnect = true, this.savedConfig});
 
   /// 是否在启动时自动连接。widget 测试里关掉，避免留下重试定时器。
   final bool autoConnect;

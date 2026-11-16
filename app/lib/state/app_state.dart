@@ -133,7 +133,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       // 本地读快照通常 < 20ms，先让列表可见，再去等网络握手。
       await _restoreCache();
       // 传输队列也要恢复：重启后看不到上一次的任务会让人以为白传了。
-      await _restoreTasks();
+      // 但 DB 打不开不能连累连接流程 —— 界面已经渲染出来了，这里只影响
+      // 「有没有历史队列」。
+      try {
+        await _restoreTasks().timeout(const Duration(seconds: 3));
+      } catch (_) {
+        // 超时就先不恢复，后台继续跑完也不会重复添加（_restoreStarted 保护）。
+      }
       for (var attempt = 1; attempt <= 3; attempt++) {
         await connect();
         if (connected) {
@@ -292,8 +298,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   Timer? _persistTimer;
 
+  bool _restoreStarted = false;
+
   /// 恢复上次的传输队列。上次在跑的任务降级为排队，上传任务先检查本地文件。
   Future<void> _restoreTasks() async {
+    if (_restoreStarted) return;
+    _restoreStarted = true;
+
     final saved = await TransferStore.read();
     if (saved.isEmpty) return;
 
