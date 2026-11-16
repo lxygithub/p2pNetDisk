@@ -24,6 +24,14 @@ typedef _Entry = ({String name, bool isDir, int size, String path});
 /// - **点击文件 = 直接预览**（不再经过 ⋮ 菜单）
 /// - **长按 = 进入多选**，此后点击变成勾选
 /// - 点击目录始终是「进入」
+/// 把 `a/b/c.txt` 拆成 (`a/b/`, `c.txt`)；目录带尾斜杠也能正确处理。
+(String, String) _splitPath(String path) {
+  final clean = path.endsWith('/') ? path.substring(0, path.length - 1) : path;
+  final slash = clean.lastIndexOf('/');
+  final dir = slash >= 0 ? clean.substring(0, slash + 1) : '';
+  return (dir, clean.substring(dir.length));
+}
+
 class FilesPage extends StatefulWidget {
   const FilesPage({super.key});
 
@@ -76,10 +84,23 @@ class _FilesPageState extends State<FilesPage> {
     _state.enterDir(name);
   }
 
+  /// 同目录下的图片一起传给预览页，支持左右滑动连续看。
   void _openPreview(String path) {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: (_) => PreviewPage(remote: path)));
+    final images = [
+      for (final e in _state.entries)
+        if (!e.isDir && _FileTile._iconFor(e.name) == Icons.image_outlined)
+          e.path,
+    ];
+    final index = images.indexOf(path);
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PreviewPage(
+          remote: path,
+          gallery: index >= 0 ? images : const <String>[],
+          initialIndex: index >= 0 ? index : 0,
+        ),
+      ),
+    );
   }
 
   /// 缓存列表在离线时也可见，但预览/下载/复制/删除都需要连上服务端。
@@ -526,17 +547,20 @@ class _FilesPageState extends State<FilesPage> {
     await _state.deleteMany([path]);
   }
 
+  /// 重命名：只改最后一段名字，路径保持不变（要换目录用批量移动）。
   Future<void> _renameDialog(String path) async {
+    final (dir, name) = _splitPath(path);
     final next = await showTextInputDialog(
       context,
-      title: '重命名 / 移动',
-      label: '新路径',
-      helper: '改目录即移动；目标已存在时不会覆盖',
-      initial: path,
+      title: '重命名',
+      label: '新名称',
+      helper: dir.isEmpty ? '位于根目录' : '位于 $dir',
+      initial: name,
     );
-    final target = next?.trim() ?? '';
-    if (target.isEmpty || target == path || !mounted) return;
-    await _state.renameFile(path, target);
+    final trimmed = next?.trim() ?? '';
+    if (trimmed.isEmpty || trimmed == name || !mounted) return;
+    // from 用去掉尾斜杠的干净路径：目录带 `/` 时 rename 更稳妥。
+    await _state.renameFile('$dir$name', '$dir$trimmed');
   }
 }
 
@@ -809,7 +833,7 @@ class _DirTile extends StatelessWidget {
                       children: [
                         Icon(Icons.drive_file_rename_outline, size: 20),
                         SizedBox(width: 12),
-                        Text('重命名 / 移动'),
+                        Text('重命名'),
                       ],
                     ),
                   ),
@@ -946,7 +970,7 @@ class _FileTile extends StatelessWidget {
                     child: ListTile(
                       dense: true,
                       leading: Icon(Icons.drive_file_rename_outline),
-                      title: Text('重命名 / 移动'),
+                      title: Text('重命名'),
                     ),
                   ),
                   PopupMenuItem(

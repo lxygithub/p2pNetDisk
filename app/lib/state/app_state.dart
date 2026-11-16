@@ -1242,13 +1242,24 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// 预览缓存：远端路径 → 本地临时文件。左右滑动连续预览时避免反复下载。
+  final Map<String, String> _previewPaths = {};
+
   /// 把远程文件下载到临时目录，用于预览。返回本地路径。
   ///
   /// 预览是「用完即弃」的，所以落到 `getTemporaryDirectory()` 而不是 App 文档目录，
   /// 避免重复预览时占满用户空间（系统会自行回收）。
   Future<String> downloadForPreview(String remote) async {
+    final cached = _previewPaths[remote];
+    if (cached != null && await File(cached).exists()) return cached;
+
     final dir = await getTemporaryDirectory();
-    final local = p.join(dir.path, 'preview', p.basename(remote));
+    // 不同目录可能有同名文件，用路径 hash 前缀区分。
+    final local = p.join(
+      dir.path,
+      'preview',
+      '${remote.hashCode.toRadixString(16)}-${p.basename(remote)}',
+    );
     await Directory(p.dirname(local)).create(recursive: true);
 
     final res = await _worker.get(
@@ -1260,6 +1271,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     );
     final err = res['Error'];
     if (err != null) throw Exception(err);
+    _previewPaths[remote] = local;
     return local;
   }
 
