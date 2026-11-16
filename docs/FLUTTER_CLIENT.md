@@ -1084,6 +1084,14 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 - 标题栏在 `!connected` 时显示红色「未连接」徽标（`OfflineChip`，点击重连），
   不会再出现「已经断了却还显示直连」。
 - 传输中（`busy`）跳过探活，避免和正在跑的任务抢同一条 RPC 通道。
+- **探活超时不再判定 worker 卡死**：`ping` 用 8s 短超时且 `poisonOnTimeout:
+  false`，`closeConnection` 同样不 poison。之前从后台切回来、链路还没恢复时
+  ping 超时会把 worker 标记成卡死 → 重连只能 dispose isolate 重建，而旧
+  isolate 里的 native 调用还没退出，新 isolate spawn 拿不到资源 ——
+  表现就是「后台线程启动超时（isolate 无响应），请重启 App」。
+- `resumed` 后**延迟 1.5s** 再探活（系统刚恢复时链路/线程未就绪，立刻探容易
+  误判），探活失败**自动重连一次**（传输中不打断）；重建重试前的等待
+  400ms → 1s，给旧 native 调用退出的时间。
 - **isolate 起不来时快速失败**：之前 worker 收到 isolate 异常/退出只标记 pending
   请求失败，`start()` 仍在等 `ready`，于是调用方干等 30s，用户只看到「后台
   isolate 启动超时」，真实异常被吞掉。现在异常/退出会立刻 `completeError` 到

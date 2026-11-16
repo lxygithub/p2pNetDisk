@@ -63,7 +63,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       if (connected) {
         _startHeartbeat();
-        unawaited(_probe());
+        // 系统刚把进程从后台捞回来时，链路和线程都还没就绪，立刻探活很容易
+        // 误判成掉线；等 1.5s 再探。
+        unawaited(
+          Future<void>.delayed(const Duration(milliseconds: 1500), _probe),
+        );
       }
     } else if (state == AppLifecycleState.paused) {
       _stopHeartbeat();
@@ -564,7 +568,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       }
       status = '后台线程启动失败，正在重建并重试…';
       notifyListeners();
-      await Future<void>.delayed(const Duration(milliseconds: 400));
+      // 多等一会儿：旧 isolate 里卡着的 native 调用要时间退出，
+      // 太急着 spawn 新 isolate 反而会拿不到资源（表现就是「启动超时」）。
+      await Future<void>.delayed(const Duration(seconds: 1));
     }
   }
 
@@ -667,10 +673,15 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (_probing || !connected || busy) return;
     _probing = true;
     try {
-      await _worker.ping().timeout(const Duration(seconds: 10));
+      await _worker.ping().timeout(const Duration(seconds: 9));
     } catch (_) {
       if (!connected) return;
-      _markOffline('连接已断开（心跳超时）· 下拉或点「重连」');
+      _markOffline('连接已断开（心跳超时）· 正在自动重连…');
+      // 回来时链路断了就自己连一次，别让用户先看到错误再手动点。
+      // 正在传输时不打断（connect 会把在途任务掐掉）。
+      if (_running == 0) {
+        unawaited(connect());
+      }
     } finally {
       _probing = false;
     }

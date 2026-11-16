@@ -172,9 +172,8 @@ class NetdiskWorker {
       // 没必要干等 30s 让用户以为卡死。
       await ready.future.timeout(
         const Duration(seconds: 15),
-        onTimeout: () => throw NetdiskWorkerException(
-          '后台线程启动超时（isolate 无响应），请重试或重启 App',
-        ),
+        onTimeout: () =>
+            throw NetdiskWorkerException('后台线程启动超时（isolate 无响应），请重试或重启 App'),
       );
     } finally {
       if (identical(_boot, ready)) _boot = null;
@@ -228,6 +227,11 @@ class NetdiskWorker {
   }
 
   /// 探活。默认只试一次：心跳失败就是失败，再重试只会占着 RPC 通道。
+  ///
+  /// **不能用超时把 worker 标记成卡死**：后台切回前台时链路常要几秒才恢复，
+  /// 一旦标脏，重连就得 dispose 掉 isolate 再重建，而旧 isolate 的 native
+  /// 调用还没退出来，新 isolate 反而起不来（表现为「后台线程启动超时」，
+  /// 只能重启 App）。
   Future<Map<String, dynamic>> ping({
     void Function(int attempt)? onAttempt,
     int maxAttempts = 1,
@@ -235,6 +239,8 @@ class NetdiskWorker {
     'ping',
     const <Object?>[],
     maxAttempts: maxAttempts,
+    timeLimit: const Duration(seconds: 8),
+    poisonOnTimeout: false,
     onAttempt: onAttempt,
   );
 
@@ -374,12 +380,18 @@ class NetdiskWorker {
     int maxAttempts = 3,
     Duration? timeLimit,
     void Function(int attempt)? onAttempt,
+    bool poisonOnTimeout = true,
   }) async {
     Object? lastError;
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       onAttempt?.call(attempt);
       try {
-        final res = await _call(op, args: args, timeLimit: timeLimit);
+        final res = await _call(
+          op,
+          args: args,
+          timeLimit: timeLimit,
+          poisonOnTimeout: poisonOnTimeout,
+        );
         final err = res['Error'];
         if (err != null) {
           throw NetdiskWorkerException(err.toString());
@@ -406,7 +418,7 @@ class NetdiskWorker {
   }) async {
     if (!isRunning) return;
     try {
-      await _call('close', timeLimit: timeLimit);
+      await _call('close', timeLimit: timeLimit, poisonOnTimeout: false);
     } catch (_) {
       // 关闭失败不影响后续重建；超时会把 worker 标记成卡死，交给上层换 isolate。
     }
