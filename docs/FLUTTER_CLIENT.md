@@ -811,6 +811,107 @@ EndpointId 仍等同于网盘地址，不要外传。
 **验证**：`endpoint_addr_test.dart` 覆盖拆分 / 组合 / 往返 / 打码 / 状态脱敏共
 17 例，`flutter analyze` 无问题，`flutter test` 18 passed；APK 未构建。
 
+### 4.19 「显示直连，但列表和预览一直转圈」
+
+**现象**：状态栏 / 设置页显示「直连 · xx ms」，`已连接` 也是真，但文件列表停在
+骨架屏、点文件预览一直「正在下载以预览…」，怎么下拉都不动。
+
+**「直连」为什么不能证明服务可用**
+
+- `netdisk_paths()`（`netdisk-ffi/src/lib.rs`）只读 `Handle.conn` 里**缓存的那条
+  QUIC 连接**的路径表（`describe_paths` + `has_direct_path`）。它不发任何请求、
+  不探测对端是否还活着，也不检查 `close_reason()`。连接半死（服务端断电、
+  手机切网络、对端没发 CONNECTION_CLOSE）时，本地仍保留着旧的 direct 路径。
+- `connected = true` 同样只代表 `netdisk_init` 把 endpoint 建起来了（§7 的
+  「已连接 ≠ 可用」），不校验 token、不发 RPC。
+- 旧代码里 `pathSummary` 一旦赋值就**从不清空**，掉线后界面还挂着上一次的
+  「直连」，看起来就像「链路明明是好的，为什么卡住」。
+
+**真正卡住的地方**
+
+1. worker isolate **串行**处理命令，`netdisk_list` / `netdisk_get` 内部是
+   `RT.block_on(...)` 的**同步阻塞** FFI。当时 Rust 侧 `open_bi()` / `read_frame()`
+   没有 tokio 超时，服务端不回帧就会一直等（第二轮已在 native 层补上，见下文）。
+2. Dart 侧 `Completer.future.timeout()` 只能让主 isolate 放弃等待，**取消不了
+   worker 里那条 native 调用**。此后发出的 list / get / paths / init 全部堆在
+   同一个 isolate 的消息队列里 —— 于是列表和预览**同时**一直转圈。
+3. 超时后 `_retry` 还会再发一条，队列越堆越长；超时配置又特别宽松：
+   预览借用大文件传输的 **30 分钟 ×2**、手动刷新 **90 秒 ×3**（约 4.5 分钟），
+   用户在这一段时间内只能看到一个不会结束的 spinner。
+
+**本轮修复（纯 Dart，不用重编 `.so`）**
+
+- `NetdiskWorker` 增加 `isStuck`：RPC 超时后把实例标记为不可信，后续 `_call`
+  立刻抛「后台线程无响应，请重新连接」，不再往堵死的队列里加命令。
+  `version` / `paths` 这类本地查询用 `poisonOnTimeout: false`，避免「传大文件时
+  worker 正忙」被误判成链路卡死。
+- **不做自动 kill、也不 fail 掉其他挂起请求**：worker 串行，传文件时下拉刷新
+  超时是正常排队，贸然重建会打断在途传输。`AppState.connect()` 检测到
+  `isStuck` 才换一个干净 isolate（旧的 `dispose()` 会 kill 掉卡住的 FFI）；
+  `_refreshImpl` 在没有在途传输时自动重建 + 重连 + 补拉列表，有传输时只提示。
+- 新增 `rpcHealthy`：只有**连接 + 列表 RPC 刚刚成功**才允许显示 `pathSummary`；
+  掉线、重连、后台线程中毒、`no active connection` 一律清空，不再留陈旧「直连」。
+- 超时收紧：首屏 15s、手动 30s，都只重试一次；预览 `get` 增加显式
+  `timeLimit: 30s`（最多 30s ×2 出结果）。预览页错误态加「重试」按钮，
+  loading 文案说明不会无限转圈。
+- 状态栏会显示「后台线程无响应，正在重建并重新连接…」或「列表 xxx ms」，
+  便于区分是建连慢、服务端不响应还是列表太大。
+
+**先排除服务端本身**（客户端改完仍连不上时）
+
+```bash
+systemctl status netdiskd --no-pager
+tail -n 80 /mnt/datadisk/netdisk/logs/netdiskd.log
+# 从服务端本机或另一台机器做一次冒烟（见 RUNNING.md §3）
+export NETDISK_SERVER_ADDR='{"id":"<EndpointId>","addrs":[]}'
+cargo run -p netdisk-cli -- ping
+cargo run -p netdisk-cli -- list
+```
+
+CLI 的 `ping` / `list` 也不返回，就是服务端或链路问题，改客户端没用。
+
+**第二轮：native 侧超时（需要重编 `.so`）**
+
+Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂起。现在在
+`netdisk-ffi/src/lib.rs` 给每个导出函数都加了有界超时，保证**每次调用最终都会返回**：
+
+| 阶段 | 上限 | 说明 |
+| --- | --- | --- |
+| `init endpoint` | 30s | relay 探测 / endpoint 绑定 |
+| `connect` / 等待建连锁 | 15s | QUIC 握手；另一条命令卡在建连时不连坐 |
+| 简单 RPC（ping/list/delete/copy/mkdir/rename） | 25s | 整段套 `tokio::time::timeout` |
+| put/get 握手、响应帧 | 25s | 发请求 → 读 Ready / File / Stored |
+| 数据搬运 | 25s **无进展** | 不按总时长；进度在涨就一直续期 |
+| 续传后本地重算 hash | 300s | `spawn_blocking` 读整个文件 |
+
+- 25s 刻意**略小于** Dart 手动刷新 / 预览的 30s：让 native 先带着明确的
+  `timeout / 超时` 错误返回，`_retry` 才能真正重发；否则 Dart 先超时会把 worker
+  判成中毒，后续只能重建 isolate。首屏 15s 快速失败仍由 Dart 负责，两层不冲突。
+- 超时文案同时带 `timeout` 与「超时」，`_isTransient` / `_looksOffline` 都能识别；
+  `finish()` 会顺带清掉缓存连接，下次重新握手。
+- 传输用「无进展超时」而不是总时长：`copy_exact_with_hash_progress` 每写完一个
+  64KiB 块就更新进度计数器，stall 窗口到期时计数还在涨就续一个窗口，没涨才放弃。
+  2GB 文件慢传几小时不会被误杀；调用方没传 `progress`（裸 `netdisk_put/get`）时，
+  内部也会放一个栈上计数器，判定同样生效。
+- 所有简单 RPC 收敛到 `rpc_roundtrip()` 一个入口，避免漏掉某个导出函数。
+- `netdisk_ffi_version()` 现在带 `timeouts: rpc=25s,stall=25s`，可用来确认 APK 里
+  打进去的是不是新 `.so`（旧库没有这个标记；协议错配排查过一次）。
+
+**验证**：`cargo check -p netdisk-ffi` 无警告，`cargo test -p netdisk-ffi --lib`
+3 passed，`cargo test -p netdisk-core --lib` 6 passed。
+⚠️ **改了 Rust 必须重新 `cargo ndk` 编译 `.so` 并重新打包 APK**（§5），
+仅更新 Dart 代码不会把超时带进 native 层。
+
+**仍未根治（需要动服务端 / 协议）**
+
+- `netdiskd` 的 `handle_stream` 在 async 任务里直接调同步的 `list_entries()`
+  （`netdisk-core/src/lib.rs`：递归 `read_dir` + 每个文件一次 `metadata()`），
+  文件一多会阻塞服务端 tokio runtime，所有连接一起无响应。应改用
+  `spawn_blocking` 或做分页 / 增量列表。
+- `MAX_FRAME = 64 KiB`，而 `write_frame()` 只检查 u32 溢出、不检查这个上限：
+  列表 JSON 超过 64 KiB 时服务端会写出、客户端 `read_frame()` 才 bail
+  `frame too large`。文件数上千后大概率会踩到，需要在服务端提前拒绝或改分页。
+
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：
 
@@ -850,7 +951,7 @@ flutter build apk --debug
 | `netdisk_mkdir(handle, path)` | 新建目录（多级）：`{"DirCreated":{"path":..}}` |
 | `netdisk_rename(handle, from, to)` | 重命名 / 移动：`{"Renamed":{"from":..,"to":..}}`；目标已存在时返回 `Error` |
 | `netdisk_paths(handle)` | 当前连接路径：`{"Paths":{"desc":"relay ... | direct* ...","direct":true}}` |
-| `netdisk_ffi_version()` | 能力标记，如 `netdisk-ffi 0.1.0 (relay-modes: n0,custom; proto: netdisk/0)` |
+| `netdisk_ffi_version()` | 能力标记，如 `netdisk-ffi 0.1.0 (relay-modes: n0,custom; proto: netdisk/0; timeouts: rpc=25s,stall=25s)` |
 | `netdisk_string_free(ptr)` | 释放 Rust 返回的字符串（Dart 侧已封装） |
 | `netdisk_close(handle)` | 释放 endpoint 与缓存的连接 |
 
@@ -864,9 +965,15 @@ flutter build apk --debug
 - **进度只有字节计数**：UI 显示「已传 / 总量」，没有瞬时速率与剩余时间估算（要做需要滑动窗口采样）。
 - **回收站不会自动清理**：删除只是移到 `<data>/.trash/`，目前没有保留期策略与恢复 UI。`.trash` 以 `.` 开头，`list_entries` 与 `safe_path` 都会排除它，用户既看不到也访问不到。
 - **目录不能整棵删除**：`Delete` 只接受文件，删目录需要逐个删除文件（服务端会明确报错，不会误删）。
-- **token 与地址未持久化**：退出应用后要重填（n0 模式只需点「连接」，痛点已减轻）。
+- **连接参数已持久化，但真实 EndpointId 不能进公开仓库**：设置页改一次即写入 App
+  私有目录，冷启动自动套用（§4.17 / §4.18）。首次安装仍需填一次，或编译时用
+  `--dart-define` / `--dart-define-from-file` 注入。
 - **续传只按大小匹配**：不校验 `.part` 与本地文件的前缀内容（跨设备同名不同文件仍有拼错可能，靠 24h 过期缓解）。
-- **Windows 桌面仍未验证**（缺 VS 2022 C++ 工具链）；Android 已跑通到「连接」，`list / put / get` 待实测。
-- **「已连接」≠ 可用**：`netdisk_init` 只建 endpoint，不校验 token、不发 RPC。真正的验证是点「刷新列表」。
+- **Windows 桌面跑不起来**：`netdisk_ffi.dart` 在 Windows 上找 `netdisk_ffi.dll`，
+  项目只有 Android arm64 的 `.so`，没有任何 DLL 或 Windows 构建脚本；Flutter 构建
+  Windows 目标还会因插件符号链接要求「开发人员模式」。切回 Android 设备即可。
+- **「已连接」≠ 可用，「直连」也不等于可用**：`netdisk_init` 只建 endpoint，不校验
+  token、不发 RPC；`netdisk_paths()` 更是只读本地连接对象的路径观测。真正的验证
+  是点「刷新列表」并看到 `共 N 个文件 · 列表 xxx ms`（详见 §4.19）。
 
 相关：`docs/RUNNING.md`（服务端与常驻部署）、`docs/ARCHITECTURE.md`（R1 FFI 风险、R14 链路、R15 环境）。

@@ -49,7 +49,9 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  final NetdiskWorker _worker = NetdiskWorker();
+  /// worker 里的 FFI 调用无法取消；一旦卡死，重新连接时会换成一个干净的
+  /// isolate（见 [NetdiskWorker.isStuck]），所以这里不能是 final。
+  NetdiskWorker _worker = NetdiskWorker();
 
   // ---- 连接配置 ----
   String relay = kDefaultRelay;
@@ -91,6 +93,9 @@ class AppState extends ChangeNotifier {
   /// 进行中的刷新。bootstrap 自动刷新与用户下拉同时到达时复用同一个 Future，
   /// 避免 worker 串行排队让第二屏多等一整轮 RPC。
   Future<void>? _refreshFuture;
+
+  /// 是否正在自动重建后台线程，防止并发触发多次重连。
+  bool _recovering = false;
 
   /// 启动时的自动初始化：先渲染缓存列表 → 连接 → 后台拉新列表。
   ///
@@ -136,6 +141,11 @@ class AppState extends ChangeNotifier {
 
   /// 「直连 · 8 ms」/「中继 · 1.2 s」，未连接或旧库不支持时为 null。
   String? pathSummary;
+
+  /// 最近一次**列表 RPC** 是否成功。与 QUIC 路径观测分开：
+  /// 「已连接 / 直连」只说明建过连接，不等于服务端还能响应请求。
+  /// 只有它为真时才显示 [pathSummary]，避免半死连接留下误导性的「直连」。
+  bool rpcHealthy = false;
 
   // ---- 文件浏览 ----
   List<({String path, int size, bool isDir})> files = [];
@@ -212,8 +222,19 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   Future<void> connect() async {
+    // 上一次 RPC 超时后，旧 isolate 里还挂着一条取消不了的 native 调用。
+    // 换一个新的（dispose 会 kill 掉旧的），否则新命令只会继续排队。
+    final rebuilt = _worker.isStuck;
+    if (rebuilt) {
+      _worker.dispose();
+      _worker = NetdiskWorker();
+    }
+    // 每次重连都清掉旧的路径摘要：「直连」只是上一次连接的本地路径观测，
+    // 留着会让人误以为当前链路仍然可用。
+    pathSummary = null;
+    rpcHealthy = false;
     busy = true;
-    status = '正在启动后台线程…';
+    status = rebuilt ? '正在重建后台线程…' : '正在启动后台线程…';
     notifyListeners();
     try {
       await _worker.start(libraryPath: Platform.environment['NETDISK_FFI_DLL']);
@@ -327,10 +348,13 @@ class AppState extends ChangeNotifier {
     final sw = Stopwatch()..start();
     try {
       final list = await _worker.list(
-        // 首屏链路差时，默认 90s 空闲超时会让用户干等一分半。首屏先用
-        // 短超时快速失败并重试一次；手动刷新仍保留宽松超时和 3 次重试。
-        timeLimit: firstLoad ? const Duration(seconds: 15) : null,
-        maxAttempts: firstLoad ? 2 : 3,
+        // 服务端无响应时，旧的 90s ×3 会让人干等四分半还看不到错误。
+        // 首屏 15s、手动 30s，都只重试一次：快速失败后自动重建后台线程，
+        // 比在一个卡死的 isolate 后面反复排队有效得多。
+        timeLimit: firstLoad
+            ? const Duration(seconds: 15)
+            : const Duration(seconds: 30),
+        maxAttempts: 2,
         onAttempt: (n) {
           if (n > 1) {
             status = '链路超时，第 $n 次重试…';
@@ -342,6 +366,7 @@ class AppState extends ChangeNotifier {
       showingCache = false;
       cacheTime = null;
       lastListMs = sw.elapsedMilliseconds;
+      rpcHealthy = true;
       // 当前目录可能已被删除/重命名，退回根目录避免停在空视图。
       if (cwd.isNotEmpty && !files.any((f) => f.path.startsWith(cwd))) {
         cwd = '';
@@ -351,9 +376,20 @@ class AppState extends ChangeNotifier {
       }
       unawaited(ListCache.write(serverAddr.hashCode.toString(), files));
     } catch (e) {
-      // 链路类错误视为掉线：置为未连接，UI 会给出「重试」，下拉也能重连。
-      // 有缓存时保留列表可见，只把状态改成离线提示。
-      if (_looksOffline(e)) {
+      rpcHealthy = false;
+      // worker 被一条取消不了的 FFI 调用堵死了。此时再发请求只会排队，
+      // 所以在没有在途传输时直接换一个干净的 isolate 并重连；有传输时
+      // 不自动重建，避免 kill 掉正在跑的上传/下载。
+      if (_worker.isStuck) {
+        connected = false;
+        pathSummary = null;
+        if (_running == 0) {
+          status = '后台线程无响应，正在重建并重新连接…';
+          unawaited(_recoverWorker());
+        } else {
+          status = '后台线程无响应，传输结束后点「重新连接」';
+        }
+      } else if (_looksOffline(e)) {
         connected = false;
         status = showingCache
             ? '连接已断开，显示上次列表 · 下拉重试'
@@ -386,16 +422,60 @@ class AppState extends ChangeNotifier {
         t.contains('broken pipe');
   }
 
+  /// 自动重建卡死的后台线程并重新连接，成功后补拉一次列表。
+  ///
+  /// 只在没有在途传输时调用：dispose 会 kill 掉旧 isolate，那会打断上传/下载。
+  Future<void> _recoverWorker() async {
+    if (_recovering) return;
+    _recovering = true;
+    try {
+      // connect() 内部检测到 isStuck 会换一个新 worker。
+      await connect();
+      // 等当前那次 refresh 的防抖 Future 收尾，否则补拉会被直接复用掉。
+      final pending = _refreshFuture;
+      if (pending != null) {
+        try {
+          await pending;
+        } catch (_) {
+          // 刷新失败也已经写进 status，这里只负责继续流程。
+        }
+      }
+      await Future<void>.delayed(Duration.zero);
+      if (connected && !_worker.isStuck) {
+        await refresh(silent: true);
+      }
+    } finally {
+      _recovering = false;
+    }
+  }
+
   /// 读取当前连接路径，压成「直连 · 8 ms」这种短文本。
+  ///
+  /// 这个摘要只是**本地缓存连接的路径观测**，本身不发请求、不探测对端存活，
+  /// 不能证明服务端还能响应 RPC。所以只在「连接 + 列表 RPC 刚刚成功」时显示，
+  /// 掉线或后台线程中毒时一律清空，避免留下误导性的「直连」。
   Future<void> _updatePath() async {
+    if (!connected || !rpcHealthy || _worker.isStuck) {
+      _clearPathSummary();
+      return;
+    }
     final info = await _worker.paths();
-    if (info == null) return;
+    if (info == null || info.desc.contains('no active connection')) {
+      _clearPathSummary();
+      return;
+    }
     final m = RegExp(
       r'(direct|relay)\*\s+(\S+)\s+rtt=(\d+)ms',
     ).firstMatch(info.desc);
     pathSummary = m == null
         ? (info.direct ? '直连' : '中继')
         : '${m.group(1) == 'direct' ? '直连' : '中继'} · ${m.group(3)} ms';
+    notifyListeners();
+  }
+
+  void _clearPathSummary() {
+    if (pathSummary == null) return;
+    pathSummary = null;
     notifyListeners();
   }
 
@@ -760,7 +840,13 @@ class AppState extends ChangeNotifier {
     final local = p.join(dir.path, 'preview', p.basename(remote));
     await Directory(p.dirname(local)).create(recursive: true);
 
-    final res = await _worker.get(remote, local);
+    final res = await _worker.get(
+      remote,
+      local,
+      // 预览是「看一眼」，不该沿用大文件传输的 30 分钟超时。服务端没响应
+      // 时最多 30s ×2 就给出明确错误，而不是无限转圈。
+      timeLimit: const Duration(seconds: 30),
+    );
     final err = res['Error'];
     if (err != null) throw Exception(err);
     return local;

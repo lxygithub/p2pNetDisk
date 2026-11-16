@@ -86,6 +86,17 @@ class _PreviewPageState extends State<PreviewPage> {
     }
   }
 
+  /// 失败后让用户就地重试；若后台线程已卡死，AppState 会在重新连接时
+  /// 换一个干净的 isolate，这次重试才能真正发出去。
+  void _retry() {
+    setState(() {
+      _error = null;
+      _localPath = null;
+      _loading = true;
+    });
+    _load();
+  }
+
   @override
   Widget build(BuildContext context) {
     final name = widget.remote.split('/').last;
@@ -127,13 +138,21 @@ class _PreviewPageState extends State<PreviewPage> {
     }
 
     if (_loading) {
-      return const Center(
+      return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 12),
-            Text('正在下载以预览…', style: TextStyle(fontSize: 13)),
+            const CircularProgressIndicator(),
+            const SizedBox(height: 12),
+            const Text('正在下载以预览…', style: TextStyle(fontSize: 13)),
+            const SizedBox(height: 4),
+            Text(
+              '服务端无响应时会自动提示，不会一直转圈',
+              style: TextStyle(
+                fontSize: 11,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
           ],
         ),
       );
@@ -141,6 +160,7 @@ class _PreviewPageState extends State<PreviewPage> {
     if (_error != null) {
       return Center(
         child: GlassCard(
+          padding: const EdgeInsets.all(20),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -150,6 +170,12 @@ class _PreviewPageState extends State<PreviewPage> {
               ),
               const SizedBox(height: 8),
               Text(_error!, textAlign: TextAlign.center),
+              const SizedBox(height: 14),
+              FilledButton.icon(
+                onPressed: _retry,
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('重试'),
+              ),
             ],
           ),
         ),

@@ -53,6 +53,20 @@ class NetdiskWorker {
   int _seq = 0;
   bool _disposed = false;
 
+  /// 这个 isolate 是否已经「中毒」。
+  ///
+  /// worker 里的 FFI 调用是**同步阻塞**的，而 Dart 的 `Future.timeout` 只能让
+  /// 主 isolate 放弃等待，**取消不了** native 侧那条还在 `read_frame` 上挂着的
+  /// 调用。此后发任何命令都只会堆在它后面，表现为列表、预览、路径全部一直转圈。
+  /// 所以一旦超时就把实例标记为不可信，由 AppState 重新连接时换一个干净的
+  /// isolate（旧的一起 kill 掉，卡住的 FFI 也随之消失）。
+  ///
+  /// 这里刻意**不**自动 kill、也不 fail 掉其他挂起请求：worker 是串行的，
+  /// 传大文件时下拉刷新可能让 list 排队超时，贸然重建会把正在跑的传输打断。
+  bool _stuck = false;
+
+  bool get isStuck => _stuck;
+
   /// 大文件按体积放宽传输超时。
   ///
   /// 固定的 30 分钟是按小文件定的：手机走中继时约 1MB/s，600MB 就要
@@ -77,6 +91,9 @@ class NetdiskWorker {
   /// 由 APK 的 `jniLibs` 提供）。
   Future<void> start({String? libraryPath}) async {
     if (_disposed) throw NetdiskWorkerException('worker 已关闭');
+    if (_stuck) {
+      throw NetdiskWorkerException('后台线程无响应，请重新连接');
+    }
     if (_tx != null) return;
 
     final ready = Completer<void>();
@@ -144,20 +161,32 @@ class NetdiskWorker {
   /// 就能在连接前给出「请重新交叉编译」的明确提示，而不是抛一个看不懂的解析错误。
   Future<String?> version() async {
     if (!isRunning) await start();
-    final res = await _call('version');
+    // 本地查符号，不碰网络；worker 正忙时排队超时不该判成链路卡死。
+    final res = await _call('version', poisonOnTimeout: false);
     return res['Version'] as String?;
   }
 
-  /// 当前连接的传输路径；未连接或动态库不支持时返回 null。
+  /// 当前连接的传输路径；未连接、后台线程不可用或动态库不支持时返回 null。
+  ///
+  /// 注意：这个值只反映**本地缓存的 QUIC 连接**的路径观测，不发请求、也不
+  /// 探测对端是否还活着，所以它不能用来判断「服务端能不能响应 RPC」。
   Future<({String desc, bool direct})?> paths() async {
-    if (!isRunning) return null;
-    final res = await _call('paths');
-    final p = res['Paths'];
-    if (p is! Map) return null;
-    return (
-      desc: (p['desc'] as String?) ?? '',
-      direct: (p['direct'] as bool?) ?? false,
-    );
+    if (!isRunning || _stuck) return null;
+    try {
+      final res = await _call(
+        'paths',
+        timeLimit: const Duration(seconds: 5),
+        poisonOnTimeout: false,
+      );
+      final p = res['Paths'];
+      if (p is! Map) return null;
+      return (
+        desc: (p['desc'] as String?) ?? '',
+        direct: (p['direct'] as bool?) ?? false,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 在 worker 内创建 endpoint。失败抛 [NetdiskWorkerException]。
@@ -225,6 +254,7 @@ class NetdiskWorker {
     String local, {
     void Function(int sent, int total)? onProgress,
     int totalBytes = 0,
+    Duration? timeLimit,
     void Function(int attempt)? onAttempt,
   }) async {
     final tracker = _ProgressTracker(onProgress, totalBytes);
@@ -232,7 +262,9 @@ class NetdiskWorker {
       return await _retry(
         'get',
         <Object?>[remote, local, tracker.addr],
-        timeLimit: _transferTimeoutFor(totalBytes),
+        // 预览这类「看一眼」的操作不该按大文件传输给 30 分钟，
+        // 否则服务端一卡就是无限转圈。
+        timeLimit: timeLimit ?? _transferTimeoutFor(totalBytes),
         maxAttempts: 2,
         onAttempt: onAttempt,
       );
@@ -347,7 +379,12 @@ class NetdiskWorker {
     String op, {
     List<Object?> args = const <Object?>[],
     Duration? timeLimit,
+    bool poisonOnTimeout = true,
   }) async {
+    if (_stuck) {
+      // 旧 isolate 里还挂着一条取消不了的 FFI 调用，再发命令只会排队。
+      throw NetdiskWorkerException('后台线程无响应，请重新连接');
+    }
     final tx = _tx;
     if (tx == null) {
       throw NetdiskWorkerException('后台 isolate 未启动，请先调用 start()');
@@ -364,9 +401,13 @@ class NetdiskWorker {
     } on TimeoutException {
       _pending.remove(id);
       final pendingOp = _ops.remove(id);
+      // native 调用无法取消，这个 isolate 后面只会一直堵着。标记后由
+      // AppState 重新连接时换掉；查询类调用（version/paths）不标记，
+      // 避免「传文件时 worker 忙」被误判成链路卡死。
+      if (poisonOnTimeout) _stuck = true;
       throw NetdiskWorkerException(
         '$pendingOp timeout / 超时（${limit.inSeconds}s）：服务端无响应，'
-        '可能是链路丢包，请重试',
+        '${poisonOnTimeout ? '后台线程已隔离，请重新连接' : '可能是链路丢包，请重试'}',
       );
     }
   }

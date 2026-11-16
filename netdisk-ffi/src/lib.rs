@@ -7,12 +7,29 @@
 //! - 字符串由 Rust 分配，必须由 Dart 调 `netdisk_string_free` 释放；
 //! - `netdisk_init` 失败返回 null，详情用 `netdisk_last_error` 取。
 //!
+//! ## 超时边界
+//!
+//! Dart 侧的 `Future.timeout` **取消不了**这里的同步 FFI 调用：主 isolate 放弃等待后，
+//! 这条 native 调用仍会挂在 `read_frame` 上，worker 里后续命令全部排队，界面表现为
+//! 「列表和预览一起永久转圈」。所以这一层必须自己保证**每次调用都有界返回**：
+//! - 简单 RPC、握手、响应帧：整段套 `tokio::time::timeout`（RPC_TIMEOUT）；
+//! - 上传/下载的数据搬运：按「多久没有任何字节流动」判定（TRANSFER_STALL_TIMEOUT），
+//!   而不是按总时长，2GB 文件慢传几小时不会被误杀；
+//! - 建 endpoint、QUIC 握手、等待建连锁单独限时。
+//!
+//! 超时错误文案同时含 `timeout` 和「超时」，Dart 的 `_isTransient` / `_looksOffline`
+//! 会把它判成链路类错误并重试；超时后 `finish()` 会清掉缓存连接，下次重新握手。
+//!
 //! 这一层刻意不含 UI 逻辑，也不做平台特定处理；Android 的 JNI Context 初始化与
 //! .so 打包属于 P0-2 的验证范围。
 
 use std::{
     ffi::{c_char, CStr, CString},
-    sync::{LazyLock, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LazyLock, Mutex,
+    },
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -21,7 +38,11 @@ use netdisk_core::{
     build_endpoint, copy_exact_with_hash_progress, describe_paths, has_direct_path, hash_file,
     parse_addr, read_frame, read_put_ready, write_frame, Request, Response, ALPN,
 };
-use tokio::runtime::Runtime;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    runtime::Runtime,
+    time::timeout,
+};
 
 static RT: LazyLock<Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -31,6 +52,23 @@ static RT: LazyLock<Runtime> = LazyLock::new(|| {
 });
 
 static LAST_ERROR: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+
+/// 建立 endpoint（relay 探测 / 绑定）的上限。
+const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单次 QUIC 握手、以及等待建连锁的上限。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 一次「发请求 → 读响应」RPC 的上限。
+///
+/// 刻意略小于 Dart 侧手动刷新 / 预览的 30s：让 native 先带着明确的超时错误返回，
+/// Dart 就能真正重试；否则 Dart 先超时会把整个 worker 标记为中毒，后续命令只能
+/// 排队等重建 isolate。首屏的 15s 快速失败仍由 Dart 侧负责，两者互不冲突。
+const RPC_TIMEOUT: Duration = Duration::from_secs(25);
+/// 传输阶段「无任何字节流动」的上限。
+///
+/// 大文件可能要传几小时，所以不能按总时长限时；只要进度在涨就一直续期。
+const TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(25);
+/// 续传后本地重算整文件 hash（可能读几个 GB）的上限。
+const HASH_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn set_error(msg: &str) {
     if let Ok(mut guard) = LAST_ERROR.lock() {
@@ -62,11 +100,17 @@ impl Handle {
             return Ok(c);
         }
         // 双重检查：拿到建连锁后可能已被别的任务建好。
-        let _guard = self.connect_lock.lock().await;
+        // 锁本身也要限时：另一条命令卡在 ep.connect() 时，不能让后来者无限等。
+        let _guard = with_timeout(CONNECT_TIMEOUT, "等待建连锁", self.connect_lock.lock()).await?;
         if let Some(c) = self.cached_conn() {
             return Ok(c);
         }
-        let conn = self.ep.connect(self.addr.clone(), ALPN).await?;
+        let conn = with_timeout(
+            CONNECT_TIMEOUT,
+            "connect",
+            self.ep.connect(self.addr.clone(), ALPN),
+        )
+        .await??;
         if let Ok(mut guard) = self.conn.lock() {
             *guard = Some(conn.clone());
         }
@@ -89,6 +133,82 @@ impl Handle {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 超时辅助
+// ---------------------------------------------------------------------------
+
+/// 给任意 future 套一层 tokio 超时。
+///
+/// 错误文案同时带 `timeout` 与「超时」，是为了让 Dart 侧（中英文关键词都匹配）
+/// 把它归为链路类错误而不是确定性失败，从而走重试而不是直接报错。
+async fn with_timeout<F: std::future::Future>(
+    limit: Duration,
+    what: &str,
+    fut: F,
+) -> Result<F::Output> {
+    timeout(limit, fut).await.map_err(|_| {
+        anyhow!(
+            "{what} timeout / 超时（{}s）：服务端无响应或链路无数据流动",
+            limit.as_secs()
+        )
+    })
+}
+
+/// 搬运字节时按「无进展」判定超时，而不是按总时长。
+///
+/// `copy_exact_with_hash_progress` 每写完一个 64KiB 块就更新进度计数器，所以每隔
+/// 一个 stall 窗口比较一次计数：还在涨就续一个窗口，没涨就放弃。被 drop 的只是
+/// `&mut fut` 这层借用，传输 future 本身仍在，续期不会中断流。
+async fn transfer_with_stall<R, W>(
+    r: &mut R,
+    w: &mut W,
+    size: u64,
+    base: u64,
+    progress: &AtomicU64,
+) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let fut = copy_exact_with_hash_progress(r, w, size, base, Some(progress));
+    tokio::pin!(fut);
+    let mut last = progress.load(Ordering::Relaxed);
+    loop {
+        match timeout(TRANSFER_STALL_TIMEOUT, &mut fut).await {
+            Ok(res) => return res,
+            Err(_) => {
+                let now = progress.load(Ordering::Relaxed);
+                if now == last {
+                    return Err(anyhow!(
+                        "transfer stalled / 传输超时（{}s 内无数据流动，停在 {now}/{} 字节）",
+                        TRANSFER_STALL_TIMEOUT.as_secs(),
+                        base.saturating_add(size)
+                    ));
+                }
+                last = now;
+            }
+        }
+    }
+}
+
+/// 一次「建连 → 开流 → 发请求 → 读响应」的通用实现。
+///
+/// 所有简单 RPC 共用它，保证超时边界只有一处、不会漏掉某个导出函数。
+async fn rpc_roundtrip(h: &Handle, req: Request) -> Result<String> {
+    with_timeout(RPC_TIMEOUT, "rpc", async {
+        let conn = h.connection().await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &req).await?;
+        let r: Response = read_frame(&mut recv).await?;
+        Ok::<String, anyhow::Error>(serde_json::to_string(&r)?)
+    })
+    .await?
+}
+
+fn rpc_block(h: &Handle, req: Request) -> Result<String> {
+    RT.block_on(rpc_roundtrip(h, req))
+}
+
 unsafe fn take_str(p: *const c_char, name: &str) -> Result<String> {
     if p.is_null() {
         return Err(anyhow!("{name} is null"));
@@ -108,7 +228,10 @@ fn result_to_ptr(r: Result<String>) -> *mut c_char {
         Err(e) => {
             let msg = format!("{e:#}");
             set_error(&msg);
-            to_cstring(format!("{{\"Error\":{}}}", serde_json::to_string(&msg).unwrap()))
+            to_cstring(format!(
+                "{{\"Error\":{}}}",
+                serde_json::to_string(&msg).unwrap()
+            ))
         }
     }
 }
@@ -130,7 +253,12 @@ pub extern "C" fn netdisk_init(
         let token = unsafe { take_str(token, "token")? };
         let addr_json = unsafe { take_str(server_addr, "server_addr")? };
         let addr = parse_addr(&addr_json)?;
-        let ep = RT.block_on(build_endpoint(&relay, &token))?;
+        // relay 探测卡住时也不能让 native 调用永不返回。
+        let ep = RT.block_on(with_timeout(
+            INIT_TIMEOUT,
+            "init endpoint",
+            build_endpoint(&relay, &token),
+        ))??;
         Ok(Handle {
             ep,
             addr,
@@ -148,75 +276,37 @@ pub extern "C" fn netdisk_init(
 }
 
 fn ping_inner(h: *mut Handle) -> Result<String> {
-    let h = handle_ref(h)?;
-    RT.block_on(async {
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::Ping).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        Ok(serde_json::to_string(&r)?)
-    })
+    rpc_block(handle_ref(h)?, Request::Ping)
 }
 
 fn list_inner(h: *mut Handle) -> Result<String> {
-    let h = handle_ref(h)?;
-    RT.block_on(async {
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::List).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        Ok(serde_json::to_string(&r)?)
-    })
+    rpc_block(handle_ref(h)?, Request::List)
 }
 
 fn delete_inner(h: *mut Handle, path: *const c_char) -> Result<String> {
     let h = handle_ref(h)?;
     let path = unsafe { take_str(path, "path")? };
-    RT.block_on(async {
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::Delete { path }).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        Ok(serde_json::to_string(&r)?)
-    })
+    rpc_block(h, Request::Delete { path })
 }
 
 fn copy_inner(h: *mut Handle, from: *const c_char, to: *const c_char) -> Result<String> {
     let h = handle_ref(h)?;
     let from = unsafe { take_str(from, "from")? };
     let to = unsafe { take_str(to, "to")? };
-    RT.block_on(async {
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::Copy { from, to }).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        Ok(serde_json::to_string(&r)?)
-    })
+    rpc_block(h, Request::Copy { from, to })
 }
 
 fn mkdir_inner(h: *mut Handle, path: *const c_char) -> Result<String> {
     let h = handle_ref(h)?;
     let path = unsafe { take_str(path, "path")? };
-    RT.block_on(async {
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::Mkdir { path }).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        Ok(serde_json::to_string(&r)?)
-    })
+    rpc_block(h, Request::Mkdir { path })
 }
 
 fn rename_inner(h: *mut Handle, from: *const c_char, to: *const c_char) -> Result<String> {
     let h = handle_ref(h)?;
     let from = unsafe { take_str(from, "from")? };
     let to = unsafe { take_str(to, "to")? };
-    RT.block_on(async {
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::Rename { from, to }).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        Ok(serde_json::to_string(&r)?)
-    })
+    rpc_block(h, Request::Rename { from, to })
 }
 
 fn put_inner(
@@ -228,6 +318,10 @@ fn put_inner(
     let h = handle_ref(h)?;
     let remote = unsafe { take_str(remote, "remote")? };
     let local = unsafe { take_str(local, "local")? };
+    // 即使调用方不要进度（netdisk_put），也要有一个内部计数器来判定「无进展」。
+    let fallback = AtomicU64::new(0);
+    let counter = progress_slot(progress, &fallback);
+
     RT.block_on(async {
         let size = std::fs::metadata(&local)
             .with_context(|| format!("cannot stat {local}"))?
@@ -235,26 +329,37 @@ fn put_inner(
         // 不在这里做大小预检：决策点只放服务端一份，否则客户端常量和服务端
         // 一旦不同步又会变成「莫名其妙传不了」。服务端会在一个小的 Put 帧后
         // 立刻回 Error，代价只是一次往返。
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        // offset 只是「建议值」，真正的起点由服务端在 Ready 里给出。
-        write_frame(
-            &mut send,
-            &Request::Put {
-                path: remote.clone(),
-                size,
-                offset: Some(0),
-            },
-        )
-        .await?;
 
-        // 兼容旧服务端：它回的是裸字符串 "Ready"，read_put_ready 两种都认。
-        let start = read_put_ready(&mut recv).await?;
+        // 握手单独限时：发 Put 帧后等服务端 Ready 卡住，就别再打开本地文件了。
+        let (mut send, mut recv, start) = with_timeout(RPC_TIMEOUT, "put handshake", async {
+            let conn = h.connection().await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            // offset 只是「建议值」，真正的起点由服务端在 Ready 里给出。
+            write_frame(
+                &mut send,
+                &Request::Put {
+                    path: remote.clone(),
+                    size,
+                    offset: Some(0),
+                },
+            )
+            .await?;
+            // 兼容旧服务端：它回的是裸字符串 "Ready"，read_put_ready 两种都认。
+            let start = read_put_ready(&mut recv).await?;
+            Ok::<_, anyhow::Error>((send, recv, start))
+        })
+        .await??;
+
         if start > size {
             return Err(anyhow!("server offset {start} exceeds file size {size}"));
         }
 
-        let mut file = tokio::fs::File::open(&local).await?;
+        let mut file = with_timeout(
+            RPC_TIMEOUT,
+            "open local file",
+            tokio::fs::File::open(&local),
+        )
+        .await??;
         if start > 0 {
             use tokio::io::AsyncSeekExt;
             file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -262,24 +367,27 @@ fn put_inner(
         let remaining = size - start;
         // 边传边算的 hash：start=0 时就是完整文件 hash，省掉一次全文件读盘。
         // 只有续传（只发了片段）才需要事后把整个文件重读一遍重算。
-        let stream_hash = copy_exact_with_hash_progress(
-            &mut file,
-            &mut send,
-            remaining,
-            start,
-            progress_ref(progress),
-        )
-        .await?;
+        let stream_hash =
+            transfer_with_stall(&mut file, &mut send, remaining, start, counter).await?;
 
-        let r: Response = read_frame(&mut recv).await?;
+        let r: Response = with_timeout(RPC_TIMEOUT, "put response", async {
+            read_frame(&mut recv).await
+        })
+        .await??;
         match &r {
-            Response::Stored { hash: server_hash, .. } => {
+            Response::Stored {
+                hash: server_hash, ..
+            } => {
                 let expected = if start == 0 {
                     stream_hash
                 } else {
                     let local_for_hash = local.clone();
-                    tokio::task::spawn_blocking(move || {
-                        hash_file(std::path::Path::new(&local_for_hash))
+                    with_timeout(HASH_TIMEOUT, "hash verify", async {
+                        tokio::task::spawn_blocking(move || {
+                            hash_file(std::path::Path::new(&local_for_hash))
+                        })
+                        .await
+                        .context("hash task join")?
                     })
                     .await??
                 };
@@ -304,44 +412,67 @@ fn get_inner(
     let h = handle_ref(h)?;
     let remote = unsafe { take_str(remote, "remote")? };
     let local = unsafe { take_str(local, "local")? };
+    let fallback = AtomicU64::new(0);
+    let counter = progress_slot(progress, &fallback);
+
     RT.block_on(async {
         if let Some(parent) = std::path::Path::new(&local).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = h.connection().await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_frame(&mut send, &Request::Get { path: remote.clone() }).await?;
-        let r: Response = read_frame(&mut recv).await?;
-        let size = match r {
-            Response::File { size } => size,
-            Response::Error(e) => return Err(anyhow!("server: {e}")),
-            _ => return Err(anyhow!("unexpected response to Get")),
-        };
-        let mut file = tokio::fs::File::create(&local).await?;
-        let hash =
-            copy_exact_with_hash_progress(&mut recv, &mut file, size, 0, progress_ref(progress))
-                .await?;
+        // _send 必须留到作用域结束：QUIC 双向流的写半边提前 drop 会被对端
+        // 当作客户端断开，虽然这里已经发完请求，但保持流存活更稳妥。
+        let (_send, mut recv, size) = with_timeout(RPC_TIMEOUT, "get handshake", async {
+            let conn = h.connection().await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            write_frame(
+                &mut send,
+                &Request::Get {
+                    path: remote.clone(),
+                },
+            )
+            .await?;
+            let r: Response = read_frame(&mut recv).await?;
+            let size = match r {
+                Response::File { size } => size,
+                Response::Error(e) => return Err(anyhow!("server: {e}")),
+                _ => return Err(anyhow!("unexpected response to Get")),
+            };
+            Ok::<_, anyhow::Error>((send, recv, size))
+        })
+        .await??;
+
+        let mut file = with_timeout(
+            RPC_TIMEOUT,
+            "create local file",
+            tokio::fs::File::create(&local),
+        )
+        .await??;
+        let hash = transfer_with_stall(&mut recv, &mut file, size, 0, counter).await?;
         Ok(format!(
             "{{\"Downloaded\":{{\"size\":{size},\"hash\":\"{hash}\"}}}}"
         ))
     })
 }
 
-/// 把 C 传入的 `u64*` 当作原子计数器，用于跨语言读取传输进度。
+/// 取一个总是可读写的进度计数器。
 ///
-/// `AtomicU64` 与 `u64` 的内存布局一致（8 字节、8 字节对齐）：调用方用
+/// 调用方传了 `u64*` 就直接用（Dart 侧也轮询它画进度条）；没传就在栈上放一个，
+/// 让「无进展超时」对 `netdisk_put/get` 这两个不带进度的导出函数同样生效。
+///
+/// `AtomicU64` 与 `u64` 内存布局一致（8 字节、8 字节对齐）：调用方用
 /// `malloc(sizeof(uint64_t))` 分配，Rust 写入已传输字节数，Dart 侧轮询读取。
-fn progress_ref<'a>(p: *mut u64) -> Option<&'a std::sync::atomic::AtomicU64> {
+fn progress_slot<'a>(p: *mut u64, fallback: &'a AtomicU64) -> &'a AtomicU64 {
     if p.is_null() {
-        None
+        fallback
     } else {
-        Some(unsafe { &*(p as *const std::sync::atomic::AtomicU64) })
+        unsafe { &*(p as *const AtomicU64) }
     }
 }
 
 /// 统一的收尾：失败时清掉缓存的连接，让下一次调用重新握手。
 ///
 /// 否则一条半死的连接会被反复复用，表现为「一直超时但重连就能好」。
+/// 超时错误也走这里，所以超时后不会继续复用那条已经卡住的 QUIC 连接。
 fn finish(h: *mut Handle, r: Result<String>) -> *mut c_char {
     if r.is_err() && !h.is_null() {
         unsafe { &*h }.drop_conn();
@@ -434,10 +565,7 @@ pub extern "C" fn netdisk_get(
 
 #[no_mangle]
 pub extern "C" fn netdisk_last_error() -> *mut c_char {
-    let s = LAST_ERROR
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let s = LAST_ERROR.lock().map(|g| g.clone()).unwrap_or_default();
     to_cstring(s)
 }
 
@@ -446,7 +574,8 @@ pub extern "C" fn netdisk_last_error() -> *mut c_char {
 /// 返回 `{"Paths":{"desc":"...","direct":true}}`；尚未建立连接时 `desc` 为
 /// `no active connection`、`direct` 为 false。
 ///
-/// UI 用它显示「直连 xx ms / 中继 xx ms」——用户有权知道数据有没有经过服务器。
+/// 注意：这里只读本地缓存的连接路径表，**不发请求、不探测对端是否还活着**，
+/// 所以「直连」不能用来判断服务端能否响应 RPC。UI 已改为只在列表 RPC 成功后展示。
 #[no_mangle]
 pub extern "C" fn netdisk_paths(h: *mut Handle) -> *mut c_char {
     let r: Result<String> = (|| {
@@ -461,9 +590,9 @@ pub extern "C" fn netdisk_paths(h: *mut Handle) -> *mut c_char {
                     has_direct_path(conn)
                 ))
             }
-            None => Ok(
-                "{\"Paths\":{\"desc\":\"no active connection\",\"direct\":false}}".to_string(),
-            ),
+            None => {
+                Ok("{\"Paths\":{\"desc\":\"no active connection\",\"direct\":false}}".to_string())
+            }
         }
     })();
     result_to_ptr(r)
@@ -485,7 +614,7 @@ pub unsafe extern "C" fn netdisk_string_free(p: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn netdisk_ffi_version() -> *mut c_char {
     to_cstring(format!(
-        "netdisk-ffi {} (relay-modes: n0,custom; proto: {})",
+        "netdisk-ffi {} (relay-modes: n0,custom; proto: {}; timeouts: rpc=25s,stall=25s)",
         env!("CARGO_PKG_VERSION"),
         String::from_utf8_lossy(netdisk_core::ALPN)
     ))
@@ -496,5 +625,41 @@ pub extern "C" fn netdisk_ffi_version() -> *mut c_char {
 pub unsafe extern "C" fn netdisk_close(h: *mut Handle) {
     if !h.is_null() {
         drop(Box::from_raw(h));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_error_is_recognizable_by_dart() {
+        // with_timeout 返回 Result<F::Output>，测试里的 F::Output 本身也是 Result。
+        let r = RT.block_on(with_timeout(Duration::from_millis(1), "unit test", async {
+            std::future::pending::<()>().await;
+            Ok::<u8, anyhow::Error>(1)
+        }));
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("timeout"), "{msg}");
+        assert!(msg.contains("超时"), "{msg}");
+    }
+
+    #[test]
+    fn successful_future_is_not_timed_out() {
+        let r = RT.block_on(with_timeout(Duration::from_secs(5), "unit test", async {
+            Ok::<u8, anyhow::Error>(7)
+        }));
+        assert_eq!(r.unwrap().unwrap(), 7);
+    }
+
+    #[test]
+    fn progress_slot_uses_fallback_for_null() {
+        let fallback = AtomicU64::new(11);
+        let slot = progress_slot(std::ptr::null_mut(), &fallback);
+        assert_eq!(slot.load(Ordering::Relaxed), 11);
+        let mut external = 22u64;
+        let slot = progress_slot(&mut external as *mut u64, &fallback);
+        slot.store(33, Ordering::Relaxed);
+        assert_eq!(external, 33);
     }
 }
