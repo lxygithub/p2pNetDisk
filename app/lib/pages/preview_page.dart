@@ -17,7 +17,7 @@ import '../widgets/text_input_dialog.dart';
 /// - 文本：只读前 200 KB。
 /// - 其他：不下载，直接提示。
 ///
-/// 顶部提供下载 / 重命名 / 复制 / 删除 —— 看完一张图想改个名字不用退回列表。
+/// 顶部提供下载 / 重命名 / 删除 —— 看完一张图想改个名字不用退回列表。
 class PreviewPage extends StatefulWidget {
   const PreviewPage({
     super.key,
@@ -170,19 +170,6 @@ class _PreviewPageState extends State<PreviewPage> {
     setState(() => _images[_page] = target);
   }
 
-  Future<void> _copy() async {
-    final path = _current;
-    final dot = path.lastIndexOf('.');
-    final slash = path.lastIndexOf('/');
-    final copyPath = dot > slash
-        ? '${path.substring(0, dot)}_copy${path.substring(dot)}'
-        : '${path}_copy';
-
-    await context.read<AppState>().copyFile(path, copyPath);
-    if (!mounted) return;
-    _toast('已复制为 ${_split(copyPath).$2}');
-  }
-
   Future<void> _delete() async {
     final path = _current;
     final ok = await showDialog<bool>(
@@ -212,8 +199,6 @@ class _PreviewPageState extends State<PreviewPage> {
     switch (action) {
       case 'rename':
         unawaited(_rename());
-      case 'copy':
-        unawaited(_copy());
       case 'delete':
         unawaited(_delete());
     }
@@ -250,14 +235,6 @@ class _PreviewPageState extends State<PreviewPage> {
                   dense: true,
                   leading: Icon(Icons.drive_file_rename_outline),
                   title: Text('重命名'),
-                ),
-              ),
-              PopupMenuItem(
-                value: 'copy',
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(Icons.copy_outlined),
-                  title: Text('复制一份'),
                 ),
               ),
               PopupMenuItem(
