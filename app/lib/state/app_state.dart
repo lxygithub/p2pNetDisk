@@ -343,6 +343,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _stopHeartbeat();
     _statusTimer?.cancel();
+    _disposeTransferPool();
     _worker.dispose();
     super.dispose();
   }
@@ -356,6 +357,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void>? _connecting;
 
   Future<void> connect() {
+    // 有在途传输时绝不能动 worker：close/dispose 会把正在跑的上传下载全部
+    // 打断，表现就是「传输列表突然全红：worker 已关闭 / 后台 isolate 未启动」。
+    if (_running > 0) {
+      status = '还有 $_running 个传输在进行，结束后再重连';
+      notifyListeners();
+      return Future<void>.value();
+    }
     return _connecting ??= _doConnect().whenComplete(() {
       _connecting = null;
     });
@@ -367,10 +375,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       if (error == null) return;
 
       connected = false;
-      // 失败后直接丢掉这个 worker：坏掉的是 isolate 里的 native client，
-      // 留着它，下次重连只会在同一个坏状态上再试一遍。
-      _worker.dispose();
-      _worker = NetdiskWorker();
+      // 失败后丢掉这个 worker（坏掉的是 isolate 里的 native client）；
+      // 但传输中不能重建 —— dispose 会连带打断在跑的任务。
+      if (_running == 0) {
+        // 池 worker 用的是旧连接参数/旧 endpoint，一并重建。
+        _disposeTransferPool();
+        _worker.dispose();
+        _worker = NetdiskWorker();
+      }
 
       // 只有「后台线程 / isolate 起不来」才自动重试一次 —— 这类是进程内瞬态
       // 故障，重建后通常就好了。网络类失败重试只会让用户多等一轮。
@@ -431,6 +443,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       connected = true;
       status = '已连接';
       _startHeartbeat();
+      // 后台再起一个传输专用 endpoint，让上传/下载能并行；失败不影响主连接。
+      unawaited(_ensureTransferPool());
       return null;
     } catch (e) {
       _stopHeartbeat();
@@ -992,12 +1006,81 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// iroh 的一条 QUIC 连接支持多流并发，Rust 侧 `connection()` 用双检锁保证
   /// 只会建一条连接，所以多个 put/get 可以真正并行。上限设 5 是为了避免
   /// 手机网络下过多流互相挤占带宽，反而让每个任务都变慢。
-  static const int maxConcurrency = 5;
-
   int _running = 0;
   bool _anyDone = false;
 
-  /// 消费队列：最多同时跑 [maxConcurrency] 个，其余保持 queued。
+  // ---------------------------------------------------------------------------
+  // 传输专用 worker
+  // ---------------------------------------------------------------------------
+  //
+  // 单个 worker isolate 里的 native 调用是同步的，`put/get` 只能排队执行 ——
+  // 所以「并发 5 个任务」实际是 1 个在传。这里额外起一个独立 endpoint 的
+  // worker 专门跑传输，让上传/下载真正并行（服务端也已按流并发处理）。
+  // 池只是加速：建不起来就退回单 worker，不影响功能。
+
+  static const int _transferPoolSize = 1;
+
+  final List<NetdiskWorker> _pool = [];
+  final Set<NetdiskWorker> _busyPool = {};
+  bool _warmingPool = false;
+
+  Future<void> _ensureTransferPool() async {
+    if (_warmingPool || _pool.length >= _transferPoolSize) return;
+    _warmingPool = true;
+    try {
+      while (_pool.length < _transferPoolSize) {
+        final w = NetdiskWorker();
+        try {
+          await w.start(
+            libraryPath: Platform.environment['NETDISK_FFI_DLL'],
+          );
+          await w.init(relay, token, serverAddr);
+          _pool.add(w);
+        } catch (_) {
+          w.dispose();
+          return;
+        }
+      }
+    } finally {
+      _warmingPool = false;
+    }
+  }
+
+  void _disposeTransferPool() {
+    _busyPool.clear();
+    for (final w in _pool) {
+      w.dispose();
+    }
+    _pool.clear();
+  }
+
+  /// 取一个可用的传输 worker：优先空闲的池 worker，否则退回主 worker。
+  (NetdiskWorker, bool) _acquireTransferWorker() {
+    for (final w in _pool) {
+      if (!_busyPool.contains(w)) {
+        _busyPool.add(w);
+        return (w, true);
+      }
+    }
+    return (_worker, false);
+  }
+
+  void _releaseTransferWorker(
+    NetdiskWorker worker,
+    bool fromPool, {
+    required bool failed,
+  }) {
+    if (!fromPool) return;
+    _busyPool.remove(worker);
+    if (failed) {
+      // 池 worker 出过错就直接丢掉，下次补一个新的；否则会一直用坏连接。
+      _pool.remove(worker);
+      worker.dispose();
+      unawaited(_ensureTransferPool());
+    }
+  }
+
+  /// 消费队列：最多同时跑「1 + 池大小」个，其余保持 queued。
   ///
   /// 用轮询而不是 Completer 池，是因为任务的完成时间不固定，
   /// 60ms 的调度间隔对 UI 完全无感，代码却简单得多。
@@ -1015,7 +1098,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         }
         if (next == null) break;
 
-        if (_running >= maxConcurrency) {
+        // 池里每多一个 worker 就多一条并行通道；池没建好时退化为串行。
+        if (_running >= 1 + _pool.length) {
           await Future<void>.delayed(const Duration(milliseconds: 60));
           continue;
         }
@@ -1047,6 +1131,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _notifyTransfers(force: true);
 
     unawaited(() async {
+      final (worker, fromPool) = _acquireTransferWorker();
+      var failed = false;
       try {
         void onProgress(int sent, int total) {
           task
@@ -1057,13 +1143,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         }
 
         final Map<String, dynamic> res = task.kind == TransferKind.upload
-            ? await _worker.put(
+            ? await worker.put(
                 task.remote,
                 task.local,
                 totalBytes: task.total,
                 onProgress: onProgress,
               )
-            : await _worker.get(
+            : await worker.get(
                 task.remote,
                 task.local,
                 totalBytes: task.total,
@@ -1078,10 +1164,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           ..status = TransferStatus.done;
         _anyDone = true;
       } catch (e) {
+        failed = true;
         task
           ..status = TransferStatus.failed
           ..error = '$e';
       } finally {
+        _releaseTransferWorker(worker, fromPool, failed: failed);
         task
           ..finishedAt = DateTime.now()
           ..speed = 0;

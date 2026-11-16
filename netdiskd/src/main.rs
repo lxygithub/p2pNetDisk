@@ -50,14 +50,21 @@ impl ProtocolHandler for Handler {
             });
         }
         // 一条 QUIC 连接上可以开多条流；每条流处理一个命令。
+        //
+        // 每条流 spawn 出去并发处理：批量上传小文件时不会互相排队。
+        // 连接本身由这个 future 持有（iroh 会为每条连接单独 spawn 一个 task），
+        // 所以这里**不能**提前返回 Ok(()) —— 那样连接会被 drop，客户端立刻 EOF。
         loop {
             let (send, recv) = match connection.accept_bi().await {
                 Ok(pair) => pair,
                 Err(_) => break, // 对端关闭连接
             };
-            if let Err(e) = handle_stream(send, recv, self.root.clone()).await {
-                eprintln!("[netdiskd] stream error: {e:#}");
-            }
+            let root = self.root.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_stream(send, recv, root).await {
+                    eprintln!("[netdiskd] stream error: {e:#}");
+                }
+            });
         }
         Ok(())
     }

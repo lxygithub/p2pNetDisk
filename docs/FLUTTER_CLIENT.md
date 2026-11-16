@@ -1133,7 +1133,35 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 **验证**：`flutter analyze` 无问题、`flutter test` 36 passed。纯 Dart 改动，
 无需重编 `.so` 或重启服务端。
 
-## 5. 平台落地（待工具链）
+### 4.23 传输并发与重连保护
+
+**为什么之前「并发 5」实际只有 1**
+
+单个 worker isolate 里的 native 调用是同步的，`put/get` 只能排队执行 ——
+`_pump` 虽然一次启动 5 个任务，实际只有一个在传。
+
+**服务端**：`accept_bi()` 循环里把每条流 `tokio::spawn` 出去并发处理，
+同一连接上的多条流不再互相排队。连接级并发由 iroh 自己负责 ——
+它**为每条连接单独 spawn 一个 task** 跑 `ProtocolHandler::accept`，
+所以 handler 里不能提前返回 `Ok(())`（返回即连接被 drop，客户端立刻 EOF，
+表现为服务端反复重启）。
+
+**客户端**：额外起一个传输专用 worker（独立 endpoint），
+`_acquireTransferWorker` 优先分配空闲的池 worker，上传/下载变成 2 路并行。
+池 worker 出错就丢弃并补一个新的；建不起来就退回单 worker，功能不受影响。
+
+**重连保护**：之前 `connect()` 无条件 `closeConnection` + `dispose`，
+传输途中被心跳/超时触发重连时，会把正在跑的任务全部打断 ——
+现象是「传输列表突然全红：worker 已关闭 / 后台 isolate 未启动」。现在：
+
+- 有在途传输（`_running > 0`）时 `connect()` 直接返回并提示等待；
+- 连接失败也不在传输中 dispose worker；
+- 池 worker 随主 worker 一起重建。
+
+**验证**：`cargo check` 通过；服务端部署后稳定运行（无重启、无 panic）；
+`flutter analyze` 无问题、`flutter test` 36 passed。
+
+
 
 **Windows 桌面**（本机缺 VS 2022）：
 
