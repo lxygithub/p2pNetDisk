@@ -24,10 +24,11 @@ class TransferStore {
   static const String _table = 'transfer_tasks';
 
   /// 已完成的历史只留最近这么多条（只作参考记录，越老越没用）。
+  ///
+  /// **未完成的任务不设上限**：批量上传一个几千文件的目录时，它们全都在队列里
+  /// 等着，按条数截断会把最早的那批直接从库里删掉 —— 重启后又是「任务没了」。
+  /// SQLite 存几万行也就几 MB，没有必要为了体积牺牲正确性。
   static const int maxDoneHistory = 200;
-
-  /// 未完成的任务理论上全留；这个上限只防病态情况（比如误选十万个文件）。
-  static const int maxPending = 1000;
 
   static Database? _db;
 
@@ -164,7 +165,7 @@ class TransferStore {
     }
   }
 
-  /// 按保留策略裁剪：已完成留最近 [maxDoneHistory] 条，未完成留最近 [maxPending] 条。
+  /// 按保留策略裁剪：**只裁已完成的历史**，未完成的任务一条都不动。
   static Future<void> prune() async {
     try {
       final db = await _open();
@@ -176,16 +177,6 @@ class TransferStore {
         )
         ''',
         [maxDoneHistory],
-      );
-      await db.rawDelete(
-        '''
-        DELETE FROM $_table WHERE status IN ('queued', 'paused', 'failed')
-          AND id NOT IN (
-            SELECT id FROM $_table WHERE status IN ('queued', 'paused', 'failed')
-            ORDER BY created_at DESC, id DESC LIMIT ?
-          )
-        ''',
-        [maxPending],
       );
     } catch (_) {
       // 忽略。
