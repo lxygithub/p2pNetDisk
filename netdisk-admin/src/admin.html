@@ -271,18 +271,26 @@ async function loadTrash() {
     $('#trash-list').innerHTML = '<div class="empty">回收站是空的</div>';
     return;
   }
-  const rows = items.map(t => `
+  const rows = items.map(t => {
+    const icon = t.is_dir ? '📁 ' : '';
+    const kind = t.is_dir ? ' <span class="dim">(目录)</span>' : '';
+    // 目录不能单独下载（里面是整棵树），只能整体恢复或删除。
+    const dl = t.is_dir
+      ? ''
+      : `<a class="btn" href="/api/download?kind=trash&path=${encodeURIComponent(t.name)}">下载</a>`;
+    return `
     <tr>
-      <td class="mono">${esc(t.original)}</td>
+      <td class="mono">${icon}${esc(t.original)}</td>
       <td class="dim mono">${esc(t.name)}</td>
-      <td>${fmtSize(t.size)}</td>
+      <td>${fmtSize(t.size)}${kind}</td>
       <td class="dim">${fmtTime(t.deleted_at)}</td>
       <td class="ops">
-        <button data-name="${esc(t.name)}" data-original="${esc(t.original)}" onclick="restore(this)">恢复</button>
-        <a class="btn" href="/api/download?kind=trash&path=${encodeURIComponent(t.name)}">下载</a>
+        <button data-name="${esc(t.name)}" data-original="${esc(t.original)}" data-dir="${t.is_dir ? '1' : '0'}" onclick="restore(this)">恢复</button>
+        ${dl}
         <button class="danger" data-name="${esc(t.name)}" onclick="purgeOne(this)">彻底删除</button>
       </td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   $('#trash-list').innerHTML = `
     <table>
       <thead><tr><th>原文件名</th><th>回收站内名</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead>
@@ -293,7 +301,11 @@ async function loadTrash() {
 async function restore(btn) {
   const name = btn.dataset.name;
   const original = btn.dataset.original;
-  const target = prompt('恢复到哪个路径？（留空 = 用原文件名放到根目录）', original);
+  const isDir = btn.dataset.dir === '1';
+  const target = prompt(
+    `恢复到哪个路径？（留空 = 用原${isDir ? '目录' : '文件'}名放到根目录）`,
+    original,
+  );
   if (target === null) return;
   try {
     await api('/api/trash/restore', { method: 'POST', body: JSON.stringify({ name, target: target.trim() }) });

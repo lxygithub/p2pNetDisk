@@ -1180,29 +1180,24 @@ class AppState extends ChangeNotifier {
 
   /// 批量删除。路径可以是文件，也可以是目录。
   ///
-  /// 目录的处理是「先把里面的文件逐个移入回收站，再自底向上删空目录」——
-  /// 服务端刻意不允许 `Delete` 直接删目录，避免一次误操作把整棵树吞掉。
+  /// 文件走 `Delete`（单文件进回收站）；目录走 `RemoveDir`，服务端把**整棵目录**
+  /// 一次性 rename 进回收站 —— 保留内部结构，可以整体恢复。不要在这里展开成
+  /// 逐个文件删除：那样回收站里只剩散落的文件，原目录结构就丢了。
   Future<void> deleteMany(List<String> paths) async {
     if (paths.isEmpty) return;
 
     final filePaths = <String>{};
     final dirPaths = <String>{};
     for (final raw in paths) {
-      final isDir = raw.endsWith('/') || files.any((e) => e.path == raw && e.isDir);
-      if (!isDir) {
+      final isDir =
+          raw.endsWith('/') || files.any((e) => e.path == raw && e.isDir);
+      if (isDir) {
+        dirPaths.add(
+          raw.endsWith('/') ? raw.substring(0, raw.length - 1) : raw,
+        );
+      } else {
         filePaths.add(raw);
-        continue;
       }
-      final normalized = raw.endsWith('/') ? raw : '$raw/';
-      // 目录自身与子孙目录都要删；里面的文件全部进回收站。
-      for (final e in entriesUnder(files, normalized)) {
-        if (e.isDir) {
-          dirPaths.add(e.path);
-        } else {
-          filePaths.add(e.path);
-        }
-      }
-      dirPaths.add(normalized.substring(0, normalized.length - 1));
     }
 
     if (filePaths.isEmpty && dirPaths.isEmpty) return;

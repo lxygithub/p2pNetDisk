@@ -998,29 +998,30 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 
 **删除文件夹**
 
-服务端 `Delete` 刻意拒绝目录（避免一次误操作把整棵树吞进回收站），所以新增了
-一个独立协议分支：
+服务端 `Delete` 刻意拒绝目录，删除文件夹走一条独立协议分支：
 
 | 层 | 改动 |
 | --- | --- |
 | `Request` | `RemoveDir { path }` |
 | `Response` | `DirRemoved { path }` |
-| `netdisk-core` | `remove_dir()`：只允许删**可见条目为空**的目录 |
-| `netdiskd` | 新 handler，日志 `rmdir <path>` |
+| `netdisk-core` | `move_dir_to_trash()`：整棵目录 `rename` 进 `.trash` |
+| `netdiskd` | 新 handler，日志 `rmdir <path> -> <trash>` |
 | `netdisk-ffi` | `netdisk_rmdir(h, path)`，能力标记加 `ops: rmdir` |
 | `netdisk-cli` | `rmdir <path>` 子命令，便于运维与端到端验证 |
 | Flutter | `NetdiskClient.rmdir` → worker `rmdir` → `AppState.deleteMany` |
 
-客户端删一个目录的流程：
+**为什么整棵搬走，而不是逐个文件丢进回收站**：早期实现是「文件逐个 `Delete` +
+删空目录」，结果回收站里只剩散落的文件、原目录结构丢失、也没法整体恢复。
+现在一次 `rename` 把整棵目录挪进 `.trash/<unix秒>-<目录名>/`，回收站里能看到
+这个文件夹，恢复时整棵放回原处。同盘 rename 是原子的，也快得多。
 
-1. 从全量列表里用 `entriesUnder()` 取出该目录下所有文件与子目录；
-2. 文件逐个 `Delete`（进回收站，可恢复）；
-3. 目录按路径长度**降序**逐个 `RemoveDir`，保证子目录先空、父目录后删。
+**回收站现在包含目录**：`TrashEntry` 增加 `is_dir`，`size` 对目录递归统计；
+`list_trash` / `restore_from_trash` / `delete_trash_entry` / `purge_trash` 都
+支持目录（彻底删除走 `remove_dir_all`）。管理后台里目录带 📁 与「(目录)」标记、
+不显示「下载」按钮（整棵树没法按单文件下载），恢复时可以改目标路径。
 
-`remove_dir` 要求「可见条目为空」是刻意的：目录里还有文件就报错，迫使调用方
-先走回收站，而不是让一次 RPC 静默抹掉整棵树。列表里看不到的隐藏文件
-（`.DS_Store`、`.nomedia`）会被一并清理 —— 否则它们会让目录永远删不掉，
-而用户完全看不到原因。
+> `netdisk-core` 仍保留 `remove_dir()`（硬删空目录）作为底层能力，但
+> `RemoveDir` 协议已不再使用它 —— 删除文件夹的语义统一为「整体进回收站」。
 
 **多选支持文件夹**
 
@@ -1043,10 +1044,11 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 掉线、重连、worker 中毒时 `pathLatencyMs` 与 `pathSummary` 一起清空，不会留下
 过期的颜色。
 
-**验证**：`cargo test -p netdisk-core --lib` 11 passed（新增 `remove_dir` 用例）、
-`cargo check --workspace` 通过；`flutter analyze` 无问题、`flutter test` 34 passed；
-服务器上 `netdisk-cli mkdir/rmdir` 端到端验证：空目录删除成功、非空目录返回
-`directory not empty`。
+**验证**：`cargo test -p netdisk-core --lib` 13 passed（新增「目录整体进回收站 +
+恢复」「purge 目录」两例）、`cargo check --workspace` 通过；`flutter analyze`
+无问题、`flutter test` 34 passed；服务器端到端：`mkdir` + `put` 造目录 →
+`rmdir` → 管理后台 `/api/trash` 返回 `is_dir: true, size: 11` → `restore` 200
+且文件内容完整。
 
 ⚠️ 改了 Rust 必须重编 `.so` 并重启 `netdiskd`，两边协议要一起升级；旧 `.so`
 没有 `netdisk_rmdir` 时会提示「动态库缺少 netdisk_rmdir」。

@@ -12,8 +12,8 @@ use iroh::{
 };
 use netdisk_core::{
     addr_to_json, build_endpoint_with_secret, copy_exact_with_hash, describe_paths, list_entries,
-    copy_entry, hash_file, load_or_create_secret, make_dir, move_to_trash, public_addr,
-    read_frame, remove_dir, rename_entry, safe_path, write_frame, FileEntry, Request, Response,
+    copy_entry, hash_file, load_or_create_secret, make_dir, move_dir_to_trash, move_to_trash,
+    public_addr, read_frame, rename_entry, safe_path, write_frame, FileEntry, Request, Response,
     ALPN, DEFAULT_RELAY_URL, MAX_FILE_SIZE,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -311,9 +311,9 @@ where
             Err(e) => write_frame(&mut send, &Response::Error(e.to_string())).await,
         },
 
-        Request::RemoveDir { path } => match remove_dir(&root, &path) {
-            Ok(()) => {
-                println!("[netdiskd] rmdir {path}");
+        Request::RemoveDir { path } => match move_dir_to_trash(&root, &path) {
+            Ok(trash) => {
+                println!("[netdiskd] rmdir {path} -> {trash}");
                 write_frame(&mut send, &Response::DirRemoved { path }).await
             }
             Err(e) => write_frame(&mut send, &Response::Error(e.to_string())).await,

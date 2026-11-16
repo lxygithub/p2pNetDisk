@@ -67,10 +67,10 @@ pub enum Request {
     Copy { from: String, to: String },
     /// 新建目录（含多级，父目录自动创建）。
     Mkdir { path: String },
-    /// 删除**空目录**（里面的文件必须先用 `Delete` 移入回收站）。
+    /// 删除目录：**整棵移入回收站**（保留内部结构，可整体恢复）。
     ///
-    /// 不复用 `Delete`：那个接口刻意拒绝目录，避免一次误操作整棵树进回收站。
-    /// 客户端负责先删文件再自底向上删空目录，这里只做最后一步。
+    /// 不复用 `Delete`：那个接口只处理文件。目录单独走一条命令，语义是
+    /// 「整个文件夹进回收站」，而不是把文件逐个散落进去、丢掉原目录结构。
     RemoveDir { path: String },
 }
 
@@ -442,21 +442,42 @@ pub const TRASH_DIR: &str = ".trash";
 /// **不是硬删**：文件仍在数据盘上，只是移出用户可见的树，符合架构 §5.3
 /// 「用户主动删除走回收站」的约定。超过保留期后的真正清理留给后续阶段。
 ///
-/// 同一秒内删除同名文件时会追加序号，避免覆盖之前删的同类文件。
+/// 只接受文件；目录走 [`move_dir_to_trash`]（整棵搬过去，保留内部结构）。
+/// 同一秒内删除同名条目时会追加序号，避免覆盖之前删的同类条目。
 pub fn move_to_trash(root: &Path, rel: &str) -> Result<String> {
     let src = safe_path(root, rel)?;
     let meta = std::fs::symlink_metadata(&src).with_context(|| format!("not found: {rel}"))?;
     if meta.is_dir() {
-        bail!("refusing to delete a directory (delete its files one by one): {rel}");
+        bail!("refusing to delete a directory (use RemoveDir, or delete its files one by one): {rel}");
     }
+    trash_rename(&root.join(TRASH_DIR), &src)
+}
 
+/// 把整个目录移入回收站（保留内部结构）。
+///
+/// 删除文件夹必须整体搬走：如果只把里面的文件逐个丢进回收站，原目录结构就丢了，
+/// 恢复时也拼不回原来的文件夹。整目录 `rename` 在同盘上是原子的，也快得多。
+pub fn move_dir_to_trash(root: &Path, rel: &str) -> Result<String> {
+    let src = safe_path(root, rel)?;
+    let meta = std::fs::symlink_metadata(&src).with_context(|| format!("not found: {rel}"))?;
+    if !meta.is_dir() {
+        bail!("not a directory: {rel}");
+    }
     let trash_dir = root.join(TRASH_DIR);
-    std::fs::create_dir_all(&trash_dir)?;
+    if src == trash_dir {
+        bail!("refusing to trash the trash directory");
+    }
+    trash_rename(&trash_dir, &src)
+}
+
+/// 把 `src` 以 `<unix秒>[-<n>]-<原名>` 的形式挪进 `trash_dir`。
+fn trash_rename(trash_dir: &Path, src: &Path) -> Result<String> {
+    std::fs::create_dir_all(trash_dir)?;
 
     let base = src
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
+        .unwrap_or_else(|| "item".to_string());
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -469,7 +490,7 @@ pub fn move_to_trash(root: &Path, rel: &str) -> Result<String> {
         n += 1;
     }
 
-    std::fs::rename(&src, trash_dir.join(&candidate))?;
+    std::fs::rename(src, trash_dir.join(&candidate))?;
     Ok(format!("{TRASH_DIR}/{candidate}"))
 }
 
@@ -484,6 +505,9 @@ pub struct TrashEntry {
     pub size: u64,
     /// 删除时间（unix 秒）。文件名前缀解析失败时为 0。
     pub deleted_at: u64,
+    /// 是否是目录。目录在回收站里保留内部结构，可整体恢复。
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 /// 解析 `.trash/<stamp>-<n>-<base>` 里的时间戳与原文件名。
@@ -511,7 +535,24 @@ pub fn parse_trash_name(name: &str) -> (u64, String) {
     (stamp, rest.to_string())
 }
 
-/// 列出回收站里的文件（不递归；`move_to_trash` 只放单层文件）。
+/// 递归统计目录占用（不跟随符号链接，避免环）。
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            total += dir_size(&entry.path());
+        } else if ft.is_file() {
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
+/// 列出回收站里的条目（不递归展开；目录只统计占用）。
 pub fn list_trash(root: &Path) -> Result<Vec<TrashEntry>> {
     let dir = root.join(TRASH_DIR);
     if !dir.exists() {
@@ -521,16 +562,23 @@ pub fn list_trash(root: &Path) -> Result<Vec<TrashEntry>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let is_dir = ft.is_dir();
+        if !is_dir && !ft.is_file() {
             continue;
         }
+        let size = if is_dir {
+            dir_size(&entry.path())
+        } else {
+            entry.metadata().map(|m| m.len()).unwrap_or(0)
+        };
         let (deleted_at, original) = parse_trash_name(&name);
         out.push(TrashEntry {
             name,
             original,
-            size: meta.len(),
+            size,
             deleted_at,
+            is_dir,
         });
     }
     out.sort_by(|a, b| {
@@ -550,8 +598,10 @@ fn trash_entry_path(root: &Path, name: &str) -> Result<std::path::PathBuf> {
         bail!("invalid trash entry: {name}");
     }
     let src = root.join(TRASH_DIR).join(name);
-    if !src.is_file() {
-        bail!("not found in trash: {name}");
+    let meta = std::fs::symlink_metadata(&src)
+        .with_context(|| format!("not found in trash: {name}"))?;
+    if !meta.is_file() && !meta.is_dir() {
+        bail!("unsupported trash entry: {name}");
     }
     Ok(src)
 }
@@ -580,10 +630,14 @@ pub fn restore_from_trash(root: &Path, trash_name: &str, target_rel: &str) -> Re
     Ok(())
 }
 
-/// 彻底删除回收站里的单个文件（不可恢复）。
+/// 彻底删除回收站里的单个条目（文件或目录，不可恢复）。
 pub fn delete_trash_entry(root: &Path, name: &str) -> Result<()> {
     let src = trash_entry_path(root, name)?;
-    std::fs::remove_file(src)?;
+    if std::fs::symlink_metadata(&src)?.is_dir() {
+        std::fs::remove_dir_all(&src)?;
+    } else {
+        std::fs::remove_file(&src)?;
+    }
     Ok(())
 }
 
@@ -598,18 +652,24 @@ pub fn purge_trash(root: &Path, older_than: Option<std::time::Duration>) -> Resu
     let mut removed = 0u64;
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let is_dir = ft.is_dir();
+        if !is_dir && !ft.is_file() {
             continue;
         }
         if let Some(age) = older_than {
+            let Ok(meta) = entry.metadata() else { continue };
             let modified = meta.modified().unwrap_or(now);
             let elapsed = now.duration_since(modified).unwrap_or_default();
             if elapsed < age {
                 continue;
             }
         }
-        std::fs::remove_file(entry.path())?;
+        if is_dir {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
         removed += 1;
     }
     Ok(removed)
@@ -825,6 +885,52 @@ mod trash_tests {
         std::fs::write(root.join("c/d/f"), b"y").unwrap();
         let err = remove_dir(&root, "c").unwrap_err().to_string();
         assert!(err.contains("not empty"), "{err}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn directory_goes_to_trash_as_a_whole_and_restores() {
+        let root = temp_root("dirtrash");
+        std::fs::create_dir_all(root.join("album/sub")).unwrap();
+        std::fs::write(root.join("album/a.jpg"), b"aaa").unwrap();
+        std::fs::write(root.join("album/sub/b.jpg"), b"bb").unwrap();
+
+        // 目录不能走 move_to_trash（那是文件专用语义）
+        let err = move_to_trash(&root, "album").unwrap_err().to_string();
+        assert!(err.contains("directory"), "{err}");
+
+        let trash = move_dir_to_trash(&root, "album").unwrap();
+        assert!(trash.starts_with(".trash/"));
+        assert!(!root.join("album").exists());
+
+        let items = list_trash(&root).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_dir);
+        assert_eq!(items[0].original, "album");
+        assert_eq!(items[0].size, 5, "递归统计应包含子目录里的文件");
+
+        restore_from_trash(&root, &items[0].name, "album").unwrap();
+        assert_eq!(std::fs::read(root.join("album/a.jpg")).unwrap(), b"aaa");
+        assert_eq!(
+            std::fs::read(root.join("album/sub/b.jpg")).unwrap(),
+            b"bb"
+        );
+        assert!(list_trash(&root).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn purge_removes_trashed_directories() {
+        let root = temp_root("purgdir");
+        std::fs::create_dir_all(root.join("d/sub")).unwrap();
+        std::fs::write(root.join("d/sub/f"), b"x").unwrap();
+        move_dir_to_trash(&root, "d").unwrap();
+
+        let removed = purge_trash(&root, None).unwrap();
+        assert_eq!(removed, 1);
+        assert!(list_trash(&root).unwrap().is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }
