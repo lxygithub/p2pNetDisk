@@ -24,6 +24,7 @@ relay 默认用 n0 官方公共节点（握手 8/8），自建 relay 保留为�
 | `netdiskd/` | 服务端 daemon：`ping / list / put / get / delete / rename / copy / mkdir`，原子落盘 |
 | `netdisk-cli/` | 命令行客户端，用于端到端验证与路径诊断 |
 | `netdisk-ffi/` | C ABI 动态库（供 Flutter 调用），复用长连接 |
+| `netdisk-admin/` | 服务端管理后台（HTTP，默认只听 127.0.0.1）：概览、回收站、只读文件浏览 |
 | `app/` | Flutter 客户端：`dart:ffi` + 常驻 worker isolate |
 | `infra/` | relay 部署脚本、systemd unit、环境变量模板 |
 | `docs/` | 架构、开发计划、运行手册、客户端说明 |
@@ -50,7 +51,15 @@ flutter run --dart-define=NETDISK_ENDPOINT_ID=<你的 EndpointId>
 
 注入值只是一串十六进制 ID，不含 JSON 引号，PowerShell / Bash 都能直接传。
 
-Relay 填 `n0`、Token 留空；也可以不注入，直接在设置页手填地址（当前版本参数不持久化，重启需重填）。点「连接」→「刷新列表」。
+Relay 填 `n0`、Token 留空；也可以不注入，直接在设置页手填地址（改动会持久化到本机，重启自动套用）。点「连接」→「刷新列表」。
+
+**管理后台**（可选，随服务端启动）：
+
+```text
+http://127.0.0.1:8088/    # token 见 <secret 目录>/.admin-token
+```
+
+远程用 `ssh -L 8088:127.0.0.1:8088 <user>@<host>` 转发；详见 `docs/ADMIN.md`。
 
 更完整的部署（systemd 常驻、数据盘、日志轮转）见 `docs/RUNNING.md`；Android 交叉编译与打包见 `docs/FLUTTER_CLIENT.md`。
 
@@ -67,6 +76,7 @@ Relay 填 `n0`、Token 留空；也可以不注入，直接在设置页手填地
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 架构设计、数据模型、威胁模型、风险登记
 - [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) — 分阶段计划与验收判据
 - [`docs/RUNNING.md`](docs/RUNNING.md) — 运行与部署手册
+- [`docs/ADMIN.md`](docs/ADMIN.md) — 服务端管理后台（回收站、文件浏览、鉴权与安全边界）
 - [`docs/FLUTTER_CLIENT.md`](docs/FLUTTER_CLIENT.md) — Flutter 侧、FFI 契约、问题复盘
 - [`infra/README.md`](infra/README.md) — relay 部署清单
 

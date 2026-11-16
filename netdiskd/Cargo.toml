@@ -12,3 +12,4 @@ tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 netdisk-core.workspace = true
+netdisk-admin.workspace = true

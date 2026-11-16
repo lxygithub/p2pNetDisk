@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["netdisk-core", "netdiskd", "netdisk-cli", "netdisk-ffi"]
+members = ["netdisk-core", "netdiskd", "netdisk-cli", "netdisk-ffi", "netdisk-admin"]
 # P0-1 的验证示例是独立 workspace，不要被根 workspace 自动纳入。
 exclude = ["tools/poc/p0-1"]
 
@@ -20,3 +20,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 blake3 = "1"
 libc = "0.2"
 netdisk-core = { path = "netdisk-core" }
+netdisk-admin = { path = "netdisk-admin" }
+# 管理后台的 HTTP 层：路由 / JSON / 流式下载都在 axum 里，避免手写 HTTP 解析。
+axum = "0.8"
+tokio-util = { version = "0.7", features = ["io"] }
+rand = "0.8"

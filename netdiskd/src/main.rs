@@ -358,6 +358,47 @@ async fn main() -> Result<()> {
     println!("ready. copy NETDISK_SERVER_ADDR to the client, then Ctrl-C to stop.");
     println!("note    : identity persists across restarts; keep the secret file safe (0600).");
 
+    // ---- 管理后台（默认只监听本机；远程走 SSH 隧道）----
+    // `NETDISK_ADMIN_ADDR=off` 可关闭；改成 0.0.0.0:8088 会暴露到局域网，
+    // 请自行加反代与 TLS，不要直接挂公网。
+    let admin_addr =
+        env::var("NETDISK_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
+    let admin_addr = admin_addr.trim().to_string();
+    if !matches!(admin_addr.as_str(), "" | "off" | "none" | "0") {
+        // token 放在 secret 同目录（0700），与用户文件物理隔离。
+        let token_dir = secret_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| data_dir.clone());
+        match netdisk_admin::load_or_create_token(&token_dir) {
+            Ok(token) => {
+                let cfg = netdisk_admin::AdminConfig {
+                    root: data_dir.clone(),
+                    token,
+                    endpoint_id: Some(addr.id.to_string()),
+                    relay: relay_url.clone(),
+                    started_at: std::time::Instant::now(),
+                    bind_addr: "127.0.0.1:0".parse().expect("placeholder addr"),
+                };
+                match netdisk_admin::run(&admin_addr, cfg).await {
+                    Ok(bound) => {
+                        println!("admin   : http://{bound}/");
+                        println!(
+                            "admin   : token = NETDISK_ADMIN_TOKEN 或 {}",
+                            token_dir.join(".admin-token").display()
+                        );
+                        println!(
+                            "admin   : 远程访问 ssh -L {p}:127.0.0.1:{p} <user>@<host>",
+                            p = bound.port()
+                        );
+                    }
+                    Err(e) => eprintln!("[netdiskd] 管理后台未启动: {e:#}"),
+                }
+            }
+            Err(e) => eprintln!("[netdiskd] 管理 token 初始化失败: {e:#}"),
+        }
+    }
+
     // n0 模式下 home relay 由 net_report 异步选出，刚 bind 时 addr 里可能还没有 relay。
     // 稍后再打印一次，便于客户端拿到带 relay 的完整地址。
     if n0 {

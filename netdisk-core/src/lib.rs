@@ -466,6 +466,148 @@ pub fn move_to_trash(root: &Path, rel: &str) -> Result<String> {
     Ok(format!("{TRASH_DIR}/{candidate}"))
 }
 
+/// 回收站条目的元信息。
+///
+/// `name` 是 `.trash` 里的真实文件名（带 `<unix秒>-` 前缀），`original` 是
+/// 解析回去的原文件名。管理后台恢复时默认用 `original`，用户仍可改目标路径。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrashEntry {
+    pub name: String,
+    pub original: String,
+    pub size: u64,
+    /// 删除时间（unix 秒）。文件名前缀解析失败时为 0。
+    pub deleted_at: u64,
+}
+
+/// 解析 `.trash/<stamp>-<n>-<base>` 里的时间戳与原文件名。
+///
+/// 已知歧义：原文件名本身以「数字-」开头时（如 `123-a.txt`），会被当成同秒序号，
+/// 恢复出来的名字少一段。概率很低，而且恢复时可以手动改目标路径。
+pub fn parse_trash_name(name: &str) -> (u64, String) {
+    let Some((head, rest)) = name.split_once('-') else {
+        return (0, name.to_string());
+    };
+    if head.len() != 10 || !head.bytes().all(|b| b.is_ascii_digit()) {
+        return (0, name.to_string());
+    }
+    let Ok(stamp) = head.parse::<u64>() else {
+        return (0, name.to_string());
+    };
+    if let Some((maybe_seq, tail)) = rest.split_once('-') {
+        if !maybe_seq.is_empty()
+            && maybe_seq.bytes().all(|b| b.is_ascii_digit())
+            && !tail.is_empty()
+        {
+            return (stamp, tail.to_string());
+        }
+    }
+    (stamp, rest.to_string())
+}
+
+/// 列出回收站里的文件（不递归；`move_to_trash` 只放单层文件）。
+pub fn list_trash(root: &Path) -> Result<Vec<TrashEntry>> {
+    let dir = root.join(TRASH_DIR);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let (deleted_at, original) = parse_trash_name(&name);
+        out.push(TrashEntry {
+            name,
+            original,
+            size: meta.len(),
+            deleted_at,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.deleted_at
+            .cmp(&a.deleted_at)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(out)
+}
+
+/// 校验并解析回收站条目路径。
+///
+/// 只接受单层文件名：拒绝分隔符与隐藏名，避免管理后台被用来读写 `.trash` 之外
+/// 的任意路径（例如 `../secret.key`）。
+fn trash_entry_path(root: &Path, name: &str) -> Result<std::path::PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        bail!("invalid trash entry: {name}");
+    }
+    let src = root.join(TRASH_DIR).join(name);
+    if !src.is_file() {
+        bail!("not found in trash: {name}");
+    }
+    Ok(src)
+}
+
+/// 从回收站恢复文件到 `target_rel`（相对数据根）。
+///
+/// `target_rel` 为空时用解析出的原名放到根目录。目标已存在时拒绝覆盖 ——
+/// 后台点错一次不该毁掉现有文件；要覆盖就先手动改名或删掉目标。
+pub fn restore_from_trash(root: &Path, trash_name: &str, target_rel: &str) -> Result<()> {
+    let src = trash_entry_path(root, trash_name)?;
+    let target = target_rel.trim();
+    let target = if target.is_empty() {
+        parse_trash_name(trash_name).1
+    } else {
+        target.to_string()
+    };
+    // safe_path 会拒绝绝对路径、`.` / `..` 与隐藏文件，避免写出数据根。
+    let dst = safe_path(root, &target)?;
+    if dst.exists() {
+        bail!("target already exists: {target}");
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&src, &dst)?;
+    Ok(())
+}
+
+/// 彻底删除回收站里的单个文件（不可恢复）。
+pub fn delete_trash_entry(root: &Path, name: &str) -> Result<()> {
+    let src = trash_entry_path(root, name)?;
+    std::fs::remove_file(src)?;
+    Ok(())
+}
+
+/// 清理回收站。`older_than` 为 `None` 时清空全部，否则只删 mtime 早于该时长的
+/// 文件（保留期策略用）。返回删除条数。
+pub fn purge_trash(root: &Path, older_than: Option<std::time::Duration>) -> Result<u64> {
+    let dir = root.join(TRASH_DIR);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let now = std::time::SystemTime::now();
+    let mut removed = 0u64;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if let Some(age) = older_than {
+            let modified = meta.modified().unwrap_or(now);
+            let elapsed = now.duration_since(modified).unwrap_or_default();
+            if elapsed < age {
+                continue;
+            }
+        }
+        std::fs::remove_file(entry.path())?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 /// 重命名 / 移动文件。
 ///
 /// 目标已存在时报错而不是覆盖 —— 覆盖属于 `Put` 的语义（架构 D4 的 LWW），
@@ -575,6 +717,110 @@ pub fn list_entries(root: &Path) -> Result<Vec<FileEntry>> {
     walk(root, root, &mut out)?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+#[cfg(test)]
+mod trash_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "netdisk-trash-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_stamp_and_sequence() {
+        assert_eq!(
+            parse_trash_name("1763000000-a.txt"),
+            (1763000000, "a.txt".to_string())
+        );
+        // 同秒冲突的序号要剥掉
+        assert_eq!(
+            parse_trash_name("1763000000-2-b.txt"),
+            (1763000000, "b.txt".to_string())
+        );
+        // 原名里的连字符要保留
+        assert_eq!(
+            parse_trash_name("1763000000-a-b.txt"),
+            (1763000000, "a-b.txt".to_string())
+        );
+        // 没有合法时间戳前缀时整体当成原名
+        assert_eq!(parse_trash_name("a.txt"), (0, "a.txt".to_string()));
+    }
+
+    #[test]
+    fn move_list_restore_roundtrip() {
+        let root = temp_root("roundtrip");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/report.txt"), b"hello").unwrap();
+
+        let trash = move_to_trash(&root, "docs/report.txt").unwrap();
+        assert!(trash.starts_with(".trash/"));
+        assert!(!root.join("docs/report.txt").exists());
+
+        let items = list_trash(&root).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].original, "report.txt");
+        assert_eq!(items[0].size, 5);
+
+        restore_from_trash(&root, &items[0].name, "docs/report.txt").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("docs/report.txt")).unwrap(),
+            b"hello"
+        );
+        assert!(list_trash(&root).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn restore_refuses_overwrite() {
+        let root = temp_root("overwrite");
+        std::fs::write(root.join("a.txt"), b"new").unwrap();
+        let trash = move_to_trash(&root, "a.txt").unwrap();
+        let name = std::path::Path::new(&trash)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(root.join("a.txt"), b"existing").unwrap();
+
+        let err = restore_from_trash(&root, &name, "a.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn purge_can_be_limited_by_age() {
+        let root = temp_root("purge");
+        std::fs::write(root.join("old.txt"), b"x").unwrap();
+        std::fs::write(root.join("new.txt"), b"y").unwrap();
+        move_to_trash(&root, "old.txt").unwrap();
+        move_to_trash(&root, "new.txt").unwrap();
+
+        // 只清「1 小时前」的：刚放进去的不该被删
+        let removed = purge_trash(&root, Some(std::time::Duration::from_secs(3600))).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(list_trash(&root).unwrap().len(), 2);
+
+        // 清空全部
+        let removed = purge_trash(&root, None).unwrap();
+        assert_eq!(removed, 2);
+        assert!(list_trash(&root).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 #[cfg(test)]

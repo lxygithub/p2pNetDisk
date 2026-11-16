@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>p2pNetDisk 管理后台</title>
+<style>
+  :root {
+    --bg: #0e1320;
+    --panel: #161d2e;
+    --panel-2: #1d2537;
+    --line: #26304a;
+    --text: #e6e9f2;
+    --dim: #8b93a7;
+    --accent: #4f7cf7;
+    --danger: #e05a5a;
+    --ok: #3fbf7f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  .hidden { display: none !important; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  .dim { color: var(--dim); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 20px; }
+
+  /* 登录 */
+  .login { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login .card { width: min(360px, 92vw); background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 28px; }
+  .login h1 { font-size: 18px; margin: 0 0 4px; }
+  .login p { margin: 0 0 18px; color: var(--dim); font-size: 12px; }
+  input {
+    width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); font-size: 14px; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  button, .btn {
+    padding: 7px 12px; border-radius: 9px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); font-size: 13px; cursor: pointer;
+    text-decoration: none; display: inline-block; line-height: 1.4;
+  }
+  button:hover, .btn:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); }
+  button.link { border: none; background: none; color: var(--accent); padding: 0 4px; }
+
+  /* 头部 */
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  header h1 { font-size: 17px; margin: 0; }
+  header .sp { flex: 1; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+  .tabs button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 13px; color: var(--dim); margin: 0 0 12px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .kv { display: flex; gap: 8px; padding: 3px 0; font-size: 13px; }
+  .kv .k { color: var(--dim); min-width: 76px; }
+  .kv .v { word-break: break-all; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  td.ops { white-space: nowrap; }
+
+  .row { display: flex; align-items: center; gap: 10px; padding: 9px 8px; border-bottom: 1px solid var(--line); cursor: default; }
+  .row:hover { background: var(--panel-2); }
+  .row .name { flex: 1; word-break: break-all; }
+  .row .size { color: var(--dim); font-size: 12px; width: 84px; text-align: right; }
+  .row .ops { white-space: nowrap; }
+  .icon { width: 18px; text-align: center; }
+  .crumb { margin-bottom: 10px; font-size: 13px; word-break: break-all; }
+  .crumb a { color: var(--accent); text-decoration: none; cursor: pointer; }
+
+  .empty { color: var(--dim); padding: 24px 8px; text-align: center; font-size: 13px; }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 9px 16px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { border-color: var(--danger); color: #ffb4b4; }
+</style>
+</head>
+<body>
+
+<div id="login" class="login hidden">
+  <form class="card" onsubmit="doLogin(event)">
+    <h1>p2pNetDisk 管理后台</h1>
+    <p>只在本机 / SSH 隧道内使用。token 在服务端数据目录的 <span class="mono">.admin-token</span>，或用 <span class="mono">NETDISK_ADMIN_TOKEN</span> 指定。</p>
+    <input id="token" type="password" placeholder="管理 token" autocomplete="current-password" autofocus>
+    <div style="height:12px"></div>
+    <button class="primary" style="width:100%" type="submit">进入</button>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <div class="wrap">
+    <header>
+      <h1>p2pNetDisk</h1>
+      <span class="dim" id="ver"></span>
+      <span class="sp"></span>
+      <button onclick="loadAll()">刷新</button>
+      <button onclick="doLogout()">登出</button>
+    </header>
+
+    <div class="tabs">
+      <button data-tab="overview" onclick="switchTab('overview')">概览</button>
+      <button data-tab="trash" onclick="switchTab('trash')">回收站</button>
+      <button data-tab="files" onclick="switchTab('files')">文件</button>
+    </div>
+
+    <section id="tab-overview">
+      <div class="grid">
+        <div class="card">
+          <h2>服务端</h2>
+          <div class="kv"><span class="k">EndpointId</span><span class="v"><span class="mono" id="eid"></span> <button class="link" id="eidToggle" onclick="toggleEndpoint()">显示</button></span></div>
+          <div class="kv"><span class="k">Relay</span><span class="v" id="relay"></span></div>
+          <div class="kv"><span class="k">数据目录</span><span class="v mono" id="datadir"></span></div>
+          <div class="kv"><span class="k">监听</span><span class="v mono" id="bind"></span></div>
+          <div class="kv"><span class="k">运行</span><span class="v" id="uptime"></span></div>
+        </div>
+        <div class="card">
+          <h2>容量</h2>
+          <div class="kv"><span class="k">磁盘</span><span class="v" id="disk"></span></div>
+          <div class="kv"><span class="k">文件</span><span class="v" id="files-stat"></span></div>
+          <div class="kv"><span class="k">回收站</span><span class="v" id="trash-stat"></span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-trash" class="hidden">
+      <div class="card">
+        <h2>回收站</h2>
+        <div style="margin-bottom:10px; display:flex; gap:8px; flex-wrap:wrap">
+          <button onclick="purgeOld()">清理 30 天前</button>
+          <button class="danger" onclick="purgeAll()">清空回收站</button>
+          <span class="sp" style="flex:1"></span>
+          <span class="dim" id="trash-hint"></span>
+        </div>
+        <div id="trash-list"></div>
+      </div>
+    </section>
+
+    <section id="tab-files" class="hidden">
+      <div class="card">
+        <h2>文件（只读）</h2>
+        <div class="crumb" id="crumb"></div>
+        <div id="file-list"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+}[c]));
+
+const fmtSize = (n) => {
+  if (!n) return '0 B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
+};
+const fmtTime = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '—';
+const fmtDur = (s) => {
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d} 天 ${h} 小时`;
+  if (h) return `${h} 小时 ${m} 分`;
+  return `${m} 分`;
+};
+
+let state = { endpointId: '', showEndpoint: false, dir: '', tab: 'overview' };
+
+function toast(msg, isErr) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isErr ? ' err' : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { el.className = 'toast'; }, 2600);
+}
+
+async function api(path, opts = {}) {
+  const init = { credentials: 'same-origin', ...opts };
+  if (opts.body) init.headers = { 'Content-Type': 'application/json' };
+  const res = await fetch(path, init);
+  if (res.status === 401) { showLogin(); throw new Error('未登录'); }
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+  return data;
+}
+
+function showLogin() {
+  $('#login').classList.remove('hidden');
+  $('#app').classList.add('hidden');
+  setTimeout(() => $('#token').focus(), 30);
+}
+function showApp() {
+  $('#login').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+}
+
+async function doLogin(e) {
+  e.preventDefault();
+  try {
+    await api('/api/login', { method: 'POST', body: JSON.stringify({ token: $('#token').value }) });
+    $('#token').value = '';
+    showApp();
+    await loadAll();
+  } catch (err) {
+    toast(err.message || '登录失败', true);
+  }
+}
+
+async function doLogout() {
+  try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch (_) {}
+  showLogin();
+}
+
+function mask(id) {
+  if (!id) return '';
+  return id.length <= 12 ? '••••' : id.slice(0, 6) + '••••' + id.slice(-4);
+}
+function toggleEndpoint() {
+  state.showEndpoint = !state.showEndpoint;
+  $('#eid').textContent = state.showEndpoint ? state.endpointId : mask(state.endpointId);
+  $('#eidToggle').textContent = state.showEndpoint ? '隐藏' : '显示';
+}
+
+async function loadAll() {
+  await Promise.all([loadOverview(), loadTrash(), loadFiles(state.dir)]);
+}
+
+async function loadOverview() {
+  const d = await api('/api/overview');
+  state.endpointId = d.endpoint_id || '';
+  $('#ver').textContent = 'v' + d.version;
+  $('#eid').textContent = state.showEndpoint ? state.endpointId : mask(state.endpointId);
+  $('#eidToggle').classList.toggle('hidden', !state.endpointId);
+  $('#relay').textContent = d.relay;
+  $('#datadir').textContent = d.data_dir;
+  $('#bind').textContent = d.bind_addr;
+  $('#uptime').textContent = fmtDur(d.uptime_secs) + '（' + fmtTime(d.started_at) + ' 启动）';
+  if (d.disk_total) {
+    const used = d.disk_total - d.disk_free;
+    const pct = d.disk_total ? Math.round(used / d.disk_total * 100) : 0;
+    $('#disk').textContent = `${fmtSize(used)} / ${fmtSize(d.disk_total)}（${pct}% 已用，剩 ${fmtSize(d.disk_free)}）`;
+  } else {
+    $('#disk').textContent = '—';
+  }
+  $('#files-stat').textContent = `${d.file_count} 个 · ${fmtSize(d.file_bytes)}`;
+  $('#trash-stat').textContent = `${d.trash_count} 个 · ${fmtSize(d.trash_bytes)}`;
+}
+
+async function loadTrash() {
+  const items = await api('/api/trash');
+  $('#trash-hint').textContent = items.length ? `共 ${items.length} 项` : '';
+  if (!items.length) {
+    $('#trash-list').innerHTML = '<div class="empty">回收站是空的</div>';
+    return;
+  }
+  const rows = items.map(t => `
+    <tr>
+      <td class="mono">${esc(t.original)}</td>
+      <td class="dim mono">${esc(t.name)}</td>
+      <td>${fmtSize(t.size)}</td>
+      <td class="dim">${fmtTime(t.deleted_at)}</td>
+      <td class="ops">
+        <button data-name="${esc(t.name)}" data-original="${esc(t.original)}" onclick="restore(this)">恢复</button>
+        <a class="btn" href="/api/download?kind=trash&path=${encodeURIComponent(t.name)}">下载</a>
+        <button class="danger" data-name="${esc(t.name)}" onclick="purgeOne(this)">彻底删除</button>
+      </td>
+    </tr>`).join('');
+  $('#trash-list').innerHTML = `
+    <table>
+      <thead><tr><th>原文件名</th><th>回收站内名</th><th>大小</th><th>删除时间</th><th>操作</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function restore(btn) {
+  const name = btn.dataset.name;
+  const original = btn.dataset.original;
+  const target = prompt('恢复到哪个路径？（留空 = 用原文件名放到根目录）', original);
+  if (target === null) return;
+  try {
+    await api('/api/trash/restore', { method: 'POST', body: JSON.stringify({ name, target: target.trim() }) });
+    toast('已恢复');
+    await loadAll();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function purgeOne(btn) {
+  const name = btn.dataset.name;
+  if (!confirm('彻底删除这一项？不可恢复。')) return;
+  try {
+    await api('/api/trash/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    toast('已彻底删除');
+    await loadAll();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function purgeOld() {
+  const raw = prompt('清理多少天前删除的文件？', '30');
+  if (raw === null) return;
+  const days = parseInt(raw, 10);
+  if (!Number.isFinite(days) || days < 0) { toast('天数不合法', true); return; }
+  if (!confirm(`彻底删除 ${days} 天前删除的文件？不可恢复。`)) return;
+  try {
+    const d = await api('/api/trash/purge', { method: 'POST', body: JSON.stringify({ older_than_days: days }) });
+    toast(`已清理 ${d.removed} 项`);
+    await loadAll();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function purgeAll() {
+  if (!confirm('清空整个回收站？所有文件将被彻底删除，不可恢复。')) return;
+  try {
+    const d = await api('/api/trash/purge', { method: 'POST', body: JSON.stringify({}) });
+    toast(`已清空 ${d.removed} 项`);
+    await loadAll();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function loadFiles(dir) {
+  let d;
+  try {
+    d = await api('/api/files?dir=' + encodeURIComponent(dir || ''));
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  state.dir = d.dir;
+
+  const parts = d.dir.split('/').filter(Boolean);
+  let crumb = '<a data-dir="" onclick="gotoDir(this)">根目录</a>';
+  let acc = '';
+  for (const part of parts) {
+    acc += part + '/';
+    crumb += ' / <a data-dir="' + esc(acc) + '" onclick="gotoDir(this)">' + esc(part) + '</a>';
+  }
+  $('#crumb').innerHTML = crumb;
+
+  if (!d.items.length) {
+    $('#file-list').innerHTML = '<div class="empty">此目录为空</div>';
+    return;
+  }
+  const rows = d.items.map(it => {
+    const icon = it.is_dir ? '📁' : '📄';
+    const ops = it.is_dir
+      ? ''
+      : `<a class="btn" href="/api/download?path=${encodeURIComponent(it.path)}">下载</a>`;
+    return `
+      <div class="row" ${it.is_dir ? `data-path="${esc(it.path)}" onclick="gotoDir(this)"` : ''} style="${it.is_dir ? 'cursor:pointer' : ''}">
+        <span class="icon">${icon}</span>
+        <span class="name">${esc(it.name)}</span>
+        <span class="size">${it.is_dir ? '' : fmtSize(it.size)}</span>
+        <span class="ops">${ops}</span>
+      </div>`;
+  }).join('');
+  $('#file-list').innerHTML = rows;
+}
+
+function gotoDir(el) {
+  loadFiles(el.dataset.dir !== undefined ? el.dataset.dir : el.dataset.path);
+}
+
+function switchTab(tab, silent) {
+  state.tab = tab;
+  for (const name of ['overview', 'trash', 'files']) {
+    $('#tab-' + name).classList.toggle('hidden', name !== tab);
+  }
+  document.querySelectorAll('.tabs button').forEach(b => {
+    b.classList.toggle('on', b.dataset.tab === tab);
+  });
+  if (silent) return;
+  if (tab === 'trash') loadTrash().catch(e => toast(e.message, true));
+  if (tab === 'files') loadFiles(state.dir).catch(e => toast(e.message, true));
+  if (tab === 'overview') loadOverview().catch(e => toast(e.message, true));
+}
+
+(async function boot() {
+  // 先高亮 tab 但不触发加载：未登录时不要弹「未登录」的红色 toast。
+  switchTab('overview', true);
+  try {
+    await loadAll();
+    showApp();
+  } catch (_) {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>
