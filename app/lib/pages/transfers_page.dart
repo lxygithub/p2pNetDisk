@@ -398,8 +398,15 @@ class _StatusLabel extends StatelessWidget {
     final (text, color) = switch (task.status) {
       TransferStatus.queued => ('排队中', scheme.onSurfaceVariant),
       TransferStatus.running => ('${task.kindLabel}中', scheme.primary),
-      TransferStatus.done => ('已完成', scheme.onSurfaceVariant),
-      TransferStatus.failed => ('失败', scheme.error),
+      // 已完成/失败的标签带上方向：只有「已完成」时上传和下载看起来完全一样。
+      TransferStatus.done => (
+        task.kind == TransferKind.upload ? '已上传' : '已下载',
+        scheme.onSurfaceVariant,
+      ),
+      TransferStatus.failed => (
+        task.kind == TransferKind.upload ? '上传失败' : '下载失败',
+        scheme.error,
+      ),
       TransferStatus.paused => ('已暂停', scheme.tertiary),
     };
     return Text(
