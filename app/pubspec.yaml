@@ -53,6 +53,9 @@ dependencies:
   # 传输队列持久化：SQLite 增量写入，避免每次状态变化都全量重写 JSON
   sqflite: ^2.4.3
 
+  # 下载完成后用系统「打开方式」打开文件（内部自带 FileProvider）
+  open_filex: ^4.7.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

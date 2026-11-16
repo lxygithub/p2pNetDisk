@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -1052,7 +1053,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> enqueueDownload(String remote, int size) async {
-    await enqueueDownloads([(path: remote, size: size)]);
+    await enqueueDownloads([
+      (path: remote, size: size),
+    ], openAfterDownload: true);
   }
 
   /// 下载远端整个目录（保持目录结构）。
@@ -1119,6 +1122,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     List<({String path, int size})> items, {
     String? remoteBase,
     List<String> extraDirs = const [],
+    bool openAfterDownload = false,
   }) async {
     if (!connected) {
       status = '请先连接';
@@ -1166,6 +1170,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           remote: item.path,
           local: local,
           total: item.size,
+          // 批量下载不弹打开方式，只有单文件手动下载才弹。
+          openAfterDownload: openAfterDownload && items.length == 1,
         ),
       );
     }
@@ -1375,6 +1381,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           ..sent = task.total
           ..status = TransferStatus.done;
         _anyDone = true;
+        if (task.kind == TransferKind.download && task.openAfterDownload) {
+          unawaited(_openDownloaded(task));
+        }
       } catch (e) {
         failed = true;
         task
@@ -1391,6 +1400,70 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         _markTask(task);
       }
     }());
+  }
+
+  bool _openingFile = false;
+
+  /// 下载完成后用系统「打开方式」打开。
+  ///
+  /// 一次只弹一个：批量下载时连续弹系统选择器会让人抓狂，后面的直接跳过。
+  Future<void> _openDownloaded(TransferTask task) async {
+    if (_openingFile) return;
+    _openingFile = true;
+    try {
+      // 等句柄完全落盘，个别文件管理器会对「刚写完」的文件报错。
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      final result = await OpenFilex.open(task.local);
+      if (result.type != ResultType.done) {
+        setTransientStatus(
+          '无法打开：${result.message}',
+          ttl: const Duration(seconds: 5),
+        );
+      }
+    } catch (e) {
+      setTransientStatus('无法打开：$e', ttl: const Duration(seconds: 5));
+    } finally {
+      _openingFile = false;
+    }
+  }
+
+  /// 移除任务。
+  ///
+  /// - 正在传输的任务不允许移除（native 调用无法中断，强删只会留下幽灵计数）；
+  /// - 下载任务如果还没完成，把已经写入的半截文件一并删掉 —— 否则「移除」之后
+  ///   磁盘上会留一个打不开的残缺文件；
+  /// - 上传任务的 `local` 是用户自己的源文件，**永远不碰**。
+  void removeTasks(Iterable<TransferTask> items) {
+    final removed = <TransferTask>[];
+    for (final t in items) {
+      if (t.status == TransferStatus.running) continue;
+      if (!tasks.remove(t)) continue;
+      _dirtyTaskIds.remove(t.id);
+      removed.add(t);
+      if (t.kind == TransferKind.download && t.status != TransferStatus.done) {
+        unawaited(_deletePartialDownload(t));
+      }
+    }
+    if (removed.isEmpty) return;
+    notifyListeners();
+    unawaited(TransferStore.remove(removed.map((t) => t.id)));
+  }
+
+  /// 移除全部（跳过正在传输的）。
+  void removeAllTasks() => removeTasks(List<TransferTask>.of(tasks));
+
+  Future<void> _deletePartialDownload(TransferTask task) async {
+    try {
+      final file = File(task.local);
+      if (await file.exists()) await file.delete();
+      // 断点续传/临时文件的常见后缀，一并清掉。
+      for (final suffix in const ['.part', '.netdisk-tmp', '.tmp']) {
+        final tmp = File('${task.local}$suffix');
+        if (await tmp.exists()) await tmp.delete();
+      }
+    } catch (_) {
+      // 清理失败不该挡住「移除」本身。
+    }
   }
 
   /// 清掉已完成/失败的任务，保留进行中的。

@@ -6,9 +6,47 @@ import '../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/glass.dart';
 
-/// 传输队列页：上传/下载任务列表，支持暂停、优先、重试与批量操作。
-class TransfersPage extends StatelessWidget {
+/// 传输队列页：上传/下载任务列表，支持暂停、优先、重试、移除与批量操作。
+class TransfersPage extends StatefulWidget {
   const TransfersPage({super.key});
+
+  @override
+  State<TransfersPage> createState() => _TransfersPageState();
+}
+
+class _TransfersPageState extends State<TransfersPage> {
+  bool _selectionMode = false;
+  final Set<int> _selected = <int>{};
+
+  void _enterSelection(TransferTask task) {
+    if (task.status == TransferStatus.running) return;
+    setState(() {
+      _selectionMode = true;
+      _selected.add(task.id);
+    });
+  }
+
+  void _toggle(TransferTask task) {
+    if (task.status == TransferStatus.running) return;
+    setState(() {
+      if (!_selected.add(task.id)) _selected.remove(task.id);
+      if (_selected.isEmpty) _selectionMode = false;
+    });
+  }
+
+  void _exitSelection() {
+    setState(() {
+      _selectionMode = false;
+      _selected.clear();
+    });
+  }
+
+  void _removeSelected(AppState state) {
+    state.removeTasks(
+      state.tasks.where((t) => _selected.contains(t.id)).toList(),
+    );
+    _exitSelection();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -22,66 +60,15 @@ class TransfersPage extends StatelessWidget {
     );
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('传输'),
-        actions: [
-          if (s.tasks.isNotEmpty)
-            PopupMenuButton<String>(
-              tooltip: '批量操作',
-              icon: const Icon(Icons.more_vert),
-              onSelected: (v) {
-                switch (v) {
-                  case 'pause':
-                    s.pauseAll();
-                  case 'resume':
-                    s.resumeAll();
-                  case 'retry':
-                    s.retryAllFailed();
-                  case 'clear':
-                    s.clearFinishedTasks();
-                }
-              },
-              itemBuilder: (_) => [
-                PopupMenuItem(
-                  value: 'pause',
-                  enabled: hasQueued,
-                  child: const ListTile(
-                    dense: true,
-                    leading: Icon(Icons.pause_circle_outline),
-                    title: Text('全部暂停'),
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'resume',
-                  enabled: hasPaused,
-                  child: const ListTile(
-                    dense: true,
-                    leading: Icon(Icons.play_circle_outline),
-                    title: Text('全部开始'),
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'retry',
-                  enabled: hasFailed,
-                  child: const ListTile(
-                    dense: true,
-                    leading: Icon(Icons.refresh),
-                    title: Text('全部重试'),
-                  ),
-                ),
-                PopupMenuItem(
-                  value: 'clear',
-                  enabled: hasFinished,
-                  child: const ListTile(
-                    dense: true,
-                    leading: Icon(Icons.cleaning_services_outlined),
-                    title: Text('清除已完成'),
-                  ),
-                ),
-              ],
+      appBar: _selectionMode
+          ? _selectionAppBar(s)
+          : _normalAppBar(
+              s,
+              hasQueued: hasQueued,
+              hasPaused: hasPaused,
+              hasFailed: hasFailed,
+              hasFinished: hasFinished,
             ),
-        ],
-      ),
       body: s.tasks.isEmpty
           ? const _EmptyTransfers()
           : ListView.separated(
@@ -90,15 +77,121 @@ class TransfersPage extends StatelessWidget {
               separatorBuilder: (_, _) => const SizedBox(height: 8),
               itemBuilder: (context, i) {
                 final task = s.tasks[i];
-                return _TaskTile(
-                  task: task,
-                  onRetry: () => s.retryTask(task),
-                  onPause: () => s.pauseTask(task),
-                  onResume: () => s.resumeTask(task),
-                  onPrioritize: () => s.prioritizeTask(task),
+                final selectable = task.status != TransferStatus.running;
+                return GestureDetector(
+                  onLongPress: selectable ? () => _enterSelection(task) : null,
+                  onTap: _selectionMode ? () => _toggle(task) : null,
+                  child: _TaskTile(
+                    task: task,
+                    selectionMode: _selectionMode,
+                    selected: _selected.contains(task.id),
+                    onToggle: () => _toggle(task),
+                    onRetry: () => s.retryTask(task),
+                    onPause: () => s.pauseTask(task),
+                    onResume: () => s.resumeTask(task),
+                    onPrioritize: () => s.prioritizeTask(task),
+                    onRemove: () => s.removeTasks([task]),
+                  ),
                 );
               },
             ),
+    );
+  }
+
+  AppBar _normalAppBar(
+    AppState s, {
+    required bool hasQueued,
+    required bool hasPaused,
+    required bool hasFailed,
+    required bool hasFinished,
+  }) {
+    return AppBar(
+      title: const Text('传输'),
+      actions: [
+        if (s.tasks.isNotEmpty)
+          PopupMenuButton<String>(
+            tooltip: '批量操作',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (v) {
+              switch (v) {
+                case 'pause':
+                  s.pauseAll();
+                case 'resume':
+                  s.resumeAll();
+                case 'retry':
+                  s.retryAllFailed();
+                case 'clear':
+                  s.clearFinishedTasks();
+                case 'removeAll':
+                  s.removeAllTasks();
+              }
+            },
+            itemBuilder: (_) => [
+              PopupMenuItem(
+                value: 'pause',
+                enabled: hasQueued,
+                child: const ListTile(
+                  dense: true,
+                  leading: Icon(Icons.pause_circle_outline),
+                  title: Text('全部暂停'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'resume',
+                enabled: hasPaused,
+                child: const ListTile(
+                  dense: true,
+                  leading: Icon(Icons.play_circle_outline),
+                  title: Text('全部开始'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'retry',
+                enabled: hasFailed,
+                child: const ListTile(
+                  dense: true,
+                  leading: Icon(Icons.refresh),
+                  title: Text('全部重试'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'clear',
+                enabled: hasFinished,
+                child: const ListTile(
+                  dense: true,
+                  leading: Icon(Icons.cleaning_services_outlined),
+                  title: Text('清除已完成'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'removeAll',
+                child: const ListTile(
+                  dense: true,
+                  leading: Icon(Icons.delete_sweep_outlined),
+                  title: Text('移除全部'),
+                ),
+              ),
+            ],
+          ),
+      ],
+    );
+  }
+
+  AppBar _selectionAppBar(AppState s) {
+    return AppBar(
+      leading: IconButton(
+        tooltip: '退出多选',
+        icon: const Icon(Icons.close),
+        onPressed: _exitSelection,
+      ),
+      title: Text('已选 ${_selected.length} 项'),
+      actions: [
+        IconButton(
+          tooltip: '移除',
+          icon: const Icon(Icons.delete_outline),
+          onPressed: _selected.isEmpty ? null : () => _removeSelected(s),
+        ),
+      ],
     );
   }
 }
@@ -130,17 +223,25 @@ class _EmptyTransfers extends StatelessWidget {
 class _TaskTile extends StatelessWidget {
   const _TaskTile({
     required this.task,
+    required this.selectionMode,
+    required this.selected,
+    required this.onToggle,
     required this.onRetry,
     required this.onPause,
     required this.onResume,
     required this.onPrioritize,
+    required this.onRemove,
   });
 
   final TransferTask task;
+  final bool selectionMode;
+  final bool selected;
+  final VoidCallback onToggle;
   final VoidCallback onRetry;
   final VoidCallback onPause;
   final VoidCallback onResume;
   final VoidCallback onPrioritize;
+  final VoidCallback onRemove;
 
   @override
   Widget build(BuildContext context) {
@@ -158,6 +259,12 @@ class _TaskTile extends StatelessWidget {
         children: [
           Row(
             children: [
+              if (selectionMode)
+                Checkbox(
+                  value: selected,
+                  onChanged: running ? null : (_) => onToggle(),
+                  visualDensity: VisualDensity.compact,
+                ),
               Icon(
                 task.kind == TransferKind.upload
                     ? Icons.upload_file
@@ -235,7 +342,8 @@ class _TaskTile extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
           ],
-          if (!done) ...[
+          // 多选态只做勾选，避免误触；运行中的任务没有操作行（停不下来）。
+          if (!selectionMode && !running) ...[
             const SizedBox(height: 2),
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
@@ -258,19 +366,18 @@ class _TaskTile extends StatelessWidget {
                     icon: const Icon(Icons.play_arrow, size: 16),
                     label: const Text('开始'),
                   ),
-                if (running)
-                  TextButton.icon(
-                    // 已经开始传输的 native 调用无法中断，只能等它结束。
-                    onPressed: null,
-                    icon: const Icon(Icons.pause, size: 16),
-                    label: const Text('暂停'),
-                  ),
                 if (failed)
                   TextButton.icon(
                     onPressed: onRetry,
                     icon: const Icon(Icons.refresh, size: 16),
                     label: const Text('重试'),
                   ),
+                TextButton.icon(
+                  onPressed: onRemove,
+                  style: TextButton.styleFrom(foregroundColor: scheme.error),
+                  icon: const Icon(Icons.delete_outline, size: 16),
+                  label: const Text('移除'),
+                ),
               ],
             ),
           ],

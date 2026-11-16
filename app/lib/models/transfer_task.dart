@@ -16,7 +16,14 @@ class TransferTask {
     required this.local,
     required this.total,
     DateTime? createdAt,
+    this.openAfterDownload = false,
   }) : createdAt = createdAt ?? DateTime.now();
+
+  /// 下载完成后是否用系统「打开方式」打开。
+  ///
+  /// 只有**单文件手动下载**才置 true：批量/目录下载时连续弹出的系统选择器
+  /// 会把人烦死，而且用户多半是想先攒着再统一处理。
+  final bool openAfterDownload;
 
   final int id;
   final TransferKind kind;
