@@ -1161,7 +1161,7 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 **验证**：`cargo check` 通过；服务端部署后稳定运行（无重启、无 panic）；
 `flutter analyze` 无问题、`flutter test` 36 passed。
 
-
+## 5. 平台落地（待工具链）
 
 **Windows 桌面**（本机缺 VS 2022）：
 
