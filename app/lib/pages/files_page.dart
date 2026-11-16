@@ -8,8 +8,10 @@ import '../models/transfer_task.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/breadcrumb.dart';
+import '../widgets/directory_picker.dart';
 import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
+import '../widgets/text_input_dialog.dart';
 import 'preview_page.dart';
 
 /// 条目类型（列表里目录与文件共用）。
@@ -176,6 +178,9 @@ class _FilesPageState extends State<FilesPage> {
   }
 
   AppBar _selectionAppBar(List<_Entry> entries) {
+    final allSelected =
+        entries.isNotEmpty && entries.every((e) => _selected.contains(e.path));
+
     return AppBar(
       leading: IconButton(
         tooltip: '退出多选',
@@ -185,9 +190,14 @@ class _FilesPageState extends State<FilesPage> {
       title: Text('已选 ${_selected.length} 项'),
       actions: [
         IconButton(
-          tooltip: '全选',
-          icon: const Icon(Icons.select_all),
-          onPressed: entries.isEmpty ? null : () => _selectAll(entries),
+          // 全选之后变成「取消全选」：之前只能退出多选再重进，很别扭。
+          tooltip: allSelected ? '取消全选' : '全选',
+          icon: Icon(allSelected ? Icons.deselect : Icons.select_all),
+          onPressed: entries.isEmpty
+              ? null
+              : allSelected
+              ? _exitSelection
+              : () => _selectAll(entries),
         ),
       ],
     );
@@ -225,8 +235,9 @@ class _FilesPageState extends State<FilesPage> {
               _SelectionAction(
                 icon: Icons.drive_file_move_outline,
                 label: '移动',
-                enabled: files.isNotEmpty && online,
-                onTap: () => _batchMove(files),
+                // rename 对文件和目录都有效。
+                enabled: (files.isNotEmpty || dirs.isNotEmpty) && online,
+                onTap: () => _batchMove(entries),
               ),
               _SelectionAction(
                 icon: Icons.delete_outline,
@@ -311,51 +322,40 @@ class _FilesPageState extends State<FilesPage> {
   }
 
   Future<void> _batchCopy(List<_Entry> files) async {
-    final dir = await _askTargetDir('批量复制', '复制到哪个目录？');
-    if (dir == null) return;
+    final dir = await showDirectoryPicker(
+      context,
+      state: _state,
+      title: '复制到',
+    );
+    if (dir == null || !mounted) return;
     final paths = [for (final f in files) f.path];
     _exitSelection();
     await _state.copyMany(paths, dir);
   }
 
-  Future<void> _batchMove(List<_Entry> files) async {
-    final dir = await _askTargetDir('批量移动', '移动到哪个目录？');
-    if (dir == null) return;
-    final paths = [for (final f in files) f.path];
+  /// 批量移动。选中项里可能同时有文件和文件夹 —— 服务端的 rename 两者都支持，
+  /// 所以这里不再只挑文件。
+  Future<void> _batchMove(List<_Entry> entries) async {
+    final selected = entries
+        .where((e) => _selected.contains(e.path))
+        .toList(growable: false);
+    if (selected.isEmpty) return;
+
+    final dir = await showDirectoryPicker(
+      context,
+      state: _state,
+      title: '移动到',
+    );
+    if (dir == null || !mounted) return;
+    // 目录路径在列表里带尾斜杠，rename 时去掉更干净。
+    final paths = [
+      for (final e in selected)
+        e.path.endsWith('/')
+            ? e.path.substring(0, e.path.length - 1)
+            : e.path,
+    ];
     _exitSelection();
     await _state.moveMany(paths, dir);
-  }
-
-  /// 目标目录输入框。留空表示根目录；刻意不预填当前目录，
-  /// 否则同一目录内复制/移动会立刻撞上「目标已存在」。
-  Future<String?> _askTargetDir(String title, String hint) async {
-    final controller = TextEditingController();
-    final result = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(title),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: InputDecoration(
-            labelText: '目标目录',
-            helperText: '$hint（留空 = 根目录）',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('确定'),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
-    return result;
   }
 
   // ---------------------------------------------------------------------------
@@ -461,36 +461,17 @@ class _FilesPageState extends State<FilesPage> {
   }
 
   Future<void> _newDir() async {
-    final state = _state;
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('新建目录'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '目录名',
-            helperText: '可带子路径，例如 photos/2026',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('创建'),
-          ),
-        ],
-      ),
+    final name = await showTextInputDialog(
+      context,
+      title: '新建目录',
+      label: '目录名',
+      helper: '可带子路径，例如 photos/2026',
+      initial: '新文件夹',
+      confirmLabel: '创建',
     );
     final trimmed = name?.trim() ?? '';
-    controller.dispose();
-    if (trimmed.isEmpty) return;
-    await state.createDir(trimmed);
+    if (trimmed.isEmpty || !mounted) return;
+    await _state.createDir(trimmed);
   }
 
   Future<void> _copyDialog(String source) async {
@@ -500,34 +481,16 @@ class _FilesPageState extends State<FilesPage> {
         ? '${source.substring(0, dot)}_copy${source.substring(dot)}'
         : '${source}_copy';
 
-    final controller = TextEditingController(text: suggested);
-    final target = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('复制到'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '目标路径',
-            helperText: '服务端本地复制，不消耗流量',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('复制'),
-          ),
-        ],
-      ),
+    final target = await showTextInputDialog(
+      context,
+      title: '复制到',
+      label: '目标路径',
+      helper: '服务端本地复制，不消耗流量',
+      initial: suggested,
+      confirmLabel: '复制',
     );
     final trimmed = target?.trim() ?? '';
-    controller.dispose();
-    if (trimmed.isEmpty || trimmed == source) return;
+    if (trimmed.isEmpty || trimmed == source || !mounted) return;
     await _state.copyFile(source, trimmed);
   }
 
@@ -541,7 +504,7 @@ class _FilesPageState extends State<FilesPage> {
         title: Text(isDir ? '删除文件夹' : '删除文件'),
         content: Text(
           isDir
-              ? '$path\n\n文件夹里的文件会移入服务端回收站，空目录随后删除。'
+              ? '$path\n\n整个文件夹会移入服务端回收站，可以整体恢复。'
               : '$path\n\n会移入服务端回收站，不会立即物理删除。',
         ),
         actions: [
@@ -561,34 +524,15 @@ class _FilesPageState extends State<FilesPage> {
   }
 
   Future<void> _renameDialog(String path) async {
-    final controller = TextEditingController(text: path);
-    final next = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('重命名 / 移动'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '新路径',
-            helperText: '改目录即移动；目标已存在时不会覆盖',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('确定'),
-          ),
-        ],
-      ),
+    final next = await showTextInputDialog(
+      context,
+      title: '重命名 / 移动',
+      label: '新路径',
+      helper: '改目录即移动；目标已存在时不会覆盖',
+      initial: path,
     );
     final target = next?.trim() ?? '';
-    controller.dispose();
-    if (target.isEmpty || target == path) return;
+    if (target.isEmpty || target == path || !mounted) return;
     await _state.renameFile(path, target);
   }
 }

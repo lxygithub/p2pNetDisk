@@ -1026,8 +1026,24 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 **多选支持文件夹**
 
 `_DirTile` 现在和文件一样支持长按进入多选：多选态下点击是勾选、显示 Checkbox、
-隐藏 ⋮ 菜单（避免误触）；「全选」也包含目录。批量删除会把目录展开成
-「其中的文件 + 空目录」走上面那条链路；批量下载保持目录结构。
+隐藏 ⋮ 菜单（避免误触）；「全选」也包含目录，全选后按钮变成「取消全选」。
+批量删除走「整目录进回收站」；批量移动对文件和目录都生效（服务端 `rename`
+两者都支持）；批量复制仍只对文件（`copy` 只实现到文件级）。
+
+**顺带修的交互问题**
+
+- **新建目录后红屏**：`showDialog` 外面 new 的 `TextEditingController` 在
+  `await` 返回后立刻 `dispose()`，而弹窗关闭动画还没结束、`TextField` 仍挂在
+  widget 树上，触发 `'_dependents.isEmpty': is not true` 断言 —— 表现就是
+  「新建成功但界面红屏报错」。现在统一走 `widgets/text_input_dialog.dart`，
+  controller 由弹窗 State 持有并在 `dispose()` 里释放；新建、重命名、复制共用。
+- **新建文件夹默认名**：输入框预填「新文件夹」并全选，直接输入即可替换。
+- **批量移动/复制不再手输路径**：改用 `widgets/directory_picker.dart`，可逐级
+  浏览、返回上级、就地新建文件夹，最后「选择此目录」。手输既要记路径又容易
+  打错，还会撞上「目标已存在」。
+- **底部状态横幅自动收起**：`AppState.setTransientStatus()` 让「已删除 3 个文件」
+  这类操作结果 4 秒后回到 `idleStatus`（列表摘要 / 已连接），失败信息停留 6–8 秒。
+  之前它会一直挂着，让人以为任务还没结束。
 
 **延迟标签配色**
 
@@ -1046,9 +1062,9 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 
 **验证**：`cargo test -p netdisk-core --lib` 13 passed（新增「目录整体进回收站 +
 恢复」「purge 目录」两例）、`cargo check --workspace` 通过；`flutter analyze`
-无问题、`flutter test` 34 passed；服务器端到端：`mkdir` + `put` 造目录 →
-`rmdir` → 管理后台 `/api/trash` 返回 `is_dir: true, size: 11` → `restore` 200
-且文件内容完整。
+无问题、`flutter test` 36 passed（新增 `childDirNames` 两例）；服务器端到端：
+`mkdir` + `put` 造目录 → `rmdir` → 管理后台 `/api/trash` 返回
+`is_dir: true, size: 11` → `restore` 200 且文件内容完整。
 
 ⚠️ 改了 Rust 必须重编 `.so` 并重启 `netdiskd`，两边协议要一起升级；旧 `.so`
 没有 `netdisk_rmdir` 时会提示「动态库缺少 netdisk_rmdir」。

@@ -68,6 +68,33 @@ List<({String path, int size, bool isDir})> entriesUnder(
   ];
 }
 
+/// 目录 `dir` 的直接子目录名（已排序，不含文件）。
+///
+/// 目录选择器用它逐级浏览：列表里既没有文件也不需要递归，只关心下一层文件夹。
+List<String> childDirNames(
+  List<({String path, int size, bool isDir})> all,
+  String dir,
+) {
+  var d = dir.replaceAll('\\', '/');
+  while (d.endsWith('/')) {
+    d = d.substring(0, d.length - 1);
+  }
+  final prefix = d.isEmpty ? '' : '$d/';
+  final names = <String>{};
+  for (final e in all) {
+    if (!e.path.startsWith(prefix)) continue;
+    final rest = e.path.substring(prefix.length);
+    if (rest.isEmpty) continue;
+    final slash = rest.indexOf('/');
+    if (slash >= 0) {
+      names.add(rest.substring(0, slash));
+    } else if (e.isDir) {
+      names.add(rest);
+    }
+  }
+  return names.toList()..sort();
+}
+
 /// 目录 `dir` 的父目录（以 `/` 结尾；根目录返回空串）。
 ///
 /// 例：`parentOf('photos/2026/')` → `photos/`，`parentOf('photos/')` → ``。

@@ -324,6 +324,7 @@ class AppState extends ChangeNotifier {
 
   @override
   void dispose() {
+    _statusTimer?.cancel();
     _worker.dispose();
     super.dispose();
   }
@@ -1082,10 +1083,13 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     try {
       await _worker.delete(path);
-      status = '已删除：$path（在服务端回收站）';
+      setTransientStatus('已删除：$path（在服务端回收站）');
       await refresh(silent: true);
     } catch (e) {
-      status = '删除失败: $e';
+      setTransientStatus(
+        '删除失败: $e',
+        ttl: const Duration(seconds: 6),
+      );
     } finally {
       busy = false;
       notifyListeners();
@@ -1098,10 +1102,13 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     try {
       await _worker.rename(from, to);
-      status = '已重命名：$from → $to';
+      setTransientStatus('已重命名：$from → $to');
       await refresh(silent: true);
     } catch (e) {
-      status = '重命名失败: $e';
+      setTransientStatus(
+        '重命名失败: $e',
+        ttl: const Duration(seconds: 6),
+      );
     } finally {
       busy = false;
       notifyListeners();
@@ -1115,10 +1122,13 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     try {
       await _worker.copy(from, to);
-      status = '已复制：$from → $to';
+      setTransientStatus('已复制：$from → $to');
       await refresh(silent: true);
     } catch (e) {
-      status = '复制失败: $e';
+      setTransientStatus(
+        '复制失败: $e',
+        ttl: const Duration(seconds: 6),
+      );
     } finally {
       busy = false;
       notifyListeners();
@@ -1127,19 +1137,28 @@ class AppState extends ChangeNotifier {
 
   /// 在当前目录下新建目录。返回是否成功。
   Future<bool> createDir(String name) async {
+    return createDirAt(cwd, name);
+  }
+
+  /// 在指定父目录下建目录（目录选择器里用，不受当前 `cwd` 影响）。
+  Future<bool> createDirAt(String parent, String name) async {
     final trimmed = name.trim();
     if (trimmed.isEmpty) return false;
+    final base = parent.isEmpty || parent.endsWith('/') ? parent : '$parent/';
 
     busy = true;
     status = '正在创建目录 $trimmed …';
     notifyListeners();
     try {
-      await _worker.mkdir('$cwd$trimmed');
-      status = '已创建目录：$cwd$trimmed';
+      await _worker.mkdir('$base$trimmed');
       await refresh(silent: true);
+      setTransientStatus('已创建目录：$base$trimmed');
       return true;
     } catch (e) {
-      status = '创建目录失败: $e';
+      setTransientStatus(
+        '创建目录失败: $e',
+        ttl: const Duration(seconds: 6),
+      );
       return false;
     } finally {
       busy = false;
@@ -1235,9 +1254,14 @@ class AppState extends ChangeNotifier {
       if (okFiles > 0) '$okFiles 个文件',
       if (okDirs > 0) '$okDirs 个文件夹',
     ];
-    status = failures.isEmpty
-        ? '已删除${parts.isEmpty ? '' : ' ${parts.join('、')}'}'
-        : '删除完成 ${parts.join('、')}，失败 ${failures.length} 项：${failures.first}';
+    setTransientStatus(
+      failures.isEmpty
+          ? '已删除${parts.isEmpty ? '' : ' ${parts.join('、')}'}'
+          : '删除完成 ${parts.join('、')}，失败 ${failures.length} 项：${failures.first}',
+      ttl: failures.isEmpty
+          ? const Duration(seconds: 4)
+          : const Duration(seconds: 8),
+    );
     await refresh(silent: true);
     busy = false;
     notifyListeners();
@@ -1262,9 +1286,14 @@ class AppState extends ChangeNotifier {
       }
     }
 
-    status = failures.isEmpty
-        ? '已移动 $ok 个文件'
-        : '移动完成 $ok 个，失败 ${failures.length} 个：${failures.first}';
+    setTransientStatus(
+      failures.isEmpty
+          ? '已移动 $ok 个文件'
+          : '移动完成 $ok 个，失败 ${failures.length} 个：${failures.first}',
+      ttl: failures.isEmpty
+          ? const Duration(seconds: 4)
+          : const Duration(seconds: 8),
+    );
     await refresh(silent: true);
     busy = false;
     notifyListeners();
@@ -1289,9 +1318,14 @@ class AppState extends ChangeNotifier {
       }
     }
 
-    status = failures.isEmpty
-        ? '已复制 $ok 个文件'
-        : '复制完成 $ok 个，失败 ${failures.length} 个：${failures.first}';
+    setTransientStatus(
+      failures.isEmpty
+          ? '已复制 $ok 个文件'
+          : '复制完成 $ok 个，失败 ${failures.length} 个：${failures.first}',
+      ttl: failures.isEmpty
+          ? const Duration(seconds: 4)
+          : const Duration(seconds: 8),
+    );
     await refresh(silent: true);
     busy = false;
     notifyListeners();
@@ -1300,6 +1334,34 @@ class AppState extends ChangeNotifier {
   void setStatus(String value) {
     status = value;
     notifyListeners();
+  }
+
+  Timer? _statusTimer;
+
+  /// 操作结果类消息（已删除/已移动/已创建…）：显示几秒后自动回到空闲状态。
+  ///
+  /// 之前这类消息会一直挂在底部，用户看到「已删除 3 个文件」以为任务还在跑。
+  void setTransientStatus(
+    String value, {
+    Duration ttl = const Duration(seconds: 4),
+  }) {
+    status = value;
+    notifyListeners();
+    _statusTimer?.cancel();
+    _statusTimer = Timer(ttl, () {
+      status = idleStatus;
+      notifyListeners();
+    });
+  }
+
+  /// 空闲状态栏该显示什么：优先复用列表摘要，没有就退回连接状态。
+  String get idleStatus {
+    if (!connected) return '未连接';
+    if (showingCache) return '显示上次列表';
+    if (lastListMs != null) {
+      return '共 ${files.length} 个文件 · 列表 ${lastListMs}ms';
+    }
+    return '已连接';
   }
 
 }

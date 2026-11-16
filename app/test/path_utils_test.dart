@@ -94,6 +94,27 @@ void main() {
     });
   });
 
+  group('childDirNames', () {
+    final all = <({String path, int size, bool isDir})>[
+      (path: 'photos', size: 0, isDir: true),
+      (path: 'photos/2026', size: 0, isDir: true),
+      (path: 'photos/2026/a.jpg', size: 10, isDir: false),
+      (path: 'photos/b.png', size: 20, isDir: false),
+      (path: 'photos2/c.jpg', size: 30, isDir: false),
+      (path: 'videos/d.mp4', size: 40, isDir: false),
+    ];
+
+    test('只返回直接子目录且排序', () {
+      expect(childDirNames(all, ''), ['photos', 'photos2', 'videos']);
+      expect(childDirNames(all, 'photos/'), ['2026']);
+    });
+
+    test('没有子目录时返回空', () {
+      expect(childDirNames(all, 'photos/2026/'), isEmpty);
+      expect(childDirNames(all, 'nope/'), isEmpty);
+    });
+  });
+
   group('joinUnder', () {
     test('拼接并过滤空段与穿越段', () {
       expect(joinUnder('/root', 'a/b.txt'), p.join('/root', 'a', 'b.txt'));
