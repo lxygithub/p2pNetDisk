@@ -1069,7 +1069,47 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 ⚠️ 改了 Rust 必须重编 `.so` 并重启 `netdiskd`，两边协议要一起升级；旧 `.so`
 没有 `netdisk_rmdir` 时会提示「动态库缺少 netdisk_rmdir」。
 
+### 4.22 连接保活、列表缩略图、预览缩放
+
+**连接保活（掉线不再「看起来还连着」）**
+
+之前只有刷新/操作失败才会发现掉线，于是标题栏一直挂着上次的「直连 · 8 ms」，
+用户点了文件才发现断开。现在：
+
+- 连接成功后启动 **15s 心跳**（`netdisk_ping`，单次不重试、10s 超时）；
+  `_probing` 标志防止网络很差时探活请求越积越多。
+- 回到前台（`AppLifecycleState.resumed`）立刻探活一次，切后台暂停心跳省电。
+- 心跳/刷新失败统一走 `_markOffline()`：`connected=false`、
+  **清空 `pathSummary` / `pathLatencyMs`**、停心跳，状态栏提示 15 秒。
+- 标题栏在 `!connected` 时显示红色「未连接」徽标（`OfflineChip`，点击重连），
+  不会再出现「已经断了却还显示直连」。
+- 传输中（`busy`）跳过探活，避免和正在跑的任务抢同一条 RPC 通道。
+
+**列表缩略图**
+
+图片文件的列表项左侧显示缩略图（`_FileThumb`）：
+
+- 只对 **≤ 12MB** 的图片取图，更大的直接显示类型图标 —— 滚一次把几十 MB
+  拉下来不值得。
+- 取图走 `AppState.thumbnail()`：同一路径复用同一个 future；内存 LRU 上限
+  **48MB**；磁盘缓存落在 `getTemporaryDirectory()/netdisk_thumbs/<path hash>`，
+  长度与服务端一致的直接复用。
+- **并发上限 3**（`_thumbConcurrency` + 等待队列）：几十张图一起滚过去时，
+  不会把 worker 那条串行 RPC 通道占满、让用户自己的操作排队。
+- 下载/解码失败静默回退成类型图标，不影响列表。
+
+**预览页缩放**
+
+- `InteractiveViewer` 改为 `minScale 1 / maxScale 8 / boundaryMargin 160`
+  （放大后能拖到边缘看细节），并支持**双击在 1x 与 2.5x 之间切换**。
+- AppBar 增加「还原缩放」按钮；解码宽度上限 2400 → 3200，放大更清楚。
+- 底部一行提示「双指缩放 · 双击放大 / 还原」。
+
+**验证**：`flutter analyze` 无问题、`flutter test` 36 passed。纯 Dart 改动，
+无需重编 `.so` 或重启服务端。
+
 ## 5. 平台落地（待工具链）
+
 **Windows 桌面**（本机缺 VS 2022）：
 
 1. 安装 Visual Studio 2022，勾选「使用 C++ 的桌面开发」；

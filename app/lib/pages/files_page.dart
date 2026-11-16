@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -161,8 +162,10 @@ class _FilesPageState extends State<FilesPage> {
     return AppBar(
       title: const Text('p2pNetDisk'),
       actions: [
-        if (s.pathSummary != null)
-          PathChip(text: s.pathSummary!, latencyMs: s.pathLatencyMs),
+        if (s.connected && s.pathSummary != null)
+          PathChip(text: s.pathSummary!, latencyMs: s.pathLatencyMs)
+        else if (!s.connected)
+          OfflineChip(onTap: s.busy ? null : s.connect),
         IconButton(
           tooltip: '新建目录',
           onPressed: s.busy || !s.connected ? null : _newDir,
@@ -701,7 +704,9 @@ class _FileList extends StatelessWidget {
 
         return _FileTile(
           name: e.name,
+          path: e.path,
           size: e.size,
+          state: state,
           busy: state.busy,
           selectionMode: selectionMode,
           selected: selected.contains(e.path),
@@ -830,7 +835,9 @@ class _DirTile extends StatelessWidget {
 class _FileTile extends StatelessWidget {
   const _FileTile({
     required this.name,
+    required this.path,
     required this.size,
+    required this.state,
     required this.busy,
     required this.selectionMode,
     required this.selected,
@@ -843,7 +850,9 @@ class _FileTile extends StatelessWidget {
   });
 
   final String name;
+  final String path;
   final int size;
+  final AppState state;
   final bool busy;
   final bool selectionMode;
   final bool selected;
@@ -874,8 +883,13 @@ class _FileTile extends StatelessWidget {
               )
             else
               Padding(
-                padding: const EdgeInsets.only(right: 12),
-                child: Icon(_iconFor(name), color: scheme.onSurfaceVariant),
+                padding: const EdgeInsets.only(right: 10),
+                child: _FileThumb(
+                  state: state,
+                  path: path,
+                  name: name,
+                  size: size,
+                ),
               ),
             Expanded(
               child: Column(
@@ -986,6 +1000,70 @@ class _FileTile extends StatelessWidget {
       return Icons.description_outlined;
     }
     return Icons.insert_drive_file_outlined;
+  }
+}
+
+/// 文件列表左侧的缩略图：图片取远端缩略图，其他类型显示类型图标。
+///
+/// 缩略图下载失败/过大时静默回退成图标 —— 列表本身不该因为一张图加载不出来
+/// 而变慢或报错。
+class _FileThumb extends StatelessWidget {
+  const _FileThumb({
+    required this.state,
+    required this.path,
+    required this.name,
+    required this.size,
+  });
+
+  final AppState state;
+  final String path;
+  final String name;
+  final int size;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final fallback = Icon(
+      _FileTile._iconFor(name),
+      color: scheme.onSurfaceVariant,
+    );
+
+    final isImage = _FileTile._iconFor(name) == Icons.image_outlined;
+    if (!isImage || size <= 0) {
+      return SizedBox(width: 32, height: 32, child: Center(child: fallback));
+    }
+
+    return SizedBox(
+      width: 40,
+      height: 40,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: FutureBuilder<Uint8List?>(
+          future: state.thumbnail(path, size),
+          builder: (context, snap) {
+            final bytes = snap.data;
+            if (bytes == null) {
+              return Container(
+                color: scheme.surfaceContainerHighest,
+                child: Icon(
+                  Icons.image_outlined,
+                  size: 18,
+                  color: scheme.onSurfaceVariant,
+                ),
+              );
+            }
+            return Image.memory(
+              bytes,
+              fit: BoxFit.cover,
+              // 列表里最多显示 40dp，按 96px 解码足够，省内存也省解码时间。
+              cacheWidth: 96,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) => Center(child: fallback),
+            );
+          },
+        ),
+      ),
+    );
   }
 }
 

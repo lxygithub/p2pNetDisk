@@ -201,8 +201,16 @@ class NetdiskWorker {
     }
   }
 
-  Future<Map<String, dynamic>> ping({void Function(int attempt)? onAttempt}) =>
-      _retry('ping', const <Object?>[], onAttempt: onAttempt);
+  /// 探活。默认只试一次：心跳失败就是失败，再重试只会占着 RPC 通道。
+  Future<Map<String, dynamic>> ping({
+    void Function(int attempt)? onAttempt,
+    int maxAttempts = 1,
+  }) => _retry(
+    'ping',
+    const <Object?>[],
+    maxAttempts: maxAttempts,
+    onAttempt: onAttempt,
+  );
 
   /// 列出服务端文件。失败抛异常。
   ///

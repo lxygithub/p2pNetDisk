@@ -1,5 +1,51 @@
 import 'package:flutter/material.dart';
 
+/// 断线徽标：红色「未连接」，点击可重新连接。
+///
+/// 掉线时必须**立刻**从「直连 · 8 ms」换成这个，否则用户只能靠操作失败才发现。
+class OfflineChip extends StatelessWidget {
+  const OfflineChip({super.key, this.onTap});
+
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final bg = dark ? const Color(0xFF4A1D1D) : const Color(0xFFFFDADA);
+    final fg = dark ? const Color(0xFFFF9A9A) : const Color(0xFF9B1C1C);
+
+    return Center(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: onTap,
+        child: Container(
+          margin: const EdgeInsets.only(right: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.cloud_off, size: 14, color: fg),
+              const SizedBox(width: 4),
+              Text(
+                '未连接',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: fg,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// 传输路径徽标：直连用闪电图标、中继用云图标，背景色按 RTT 分档。
 ///
 /// 用户有权知道自己的数据有没有经过中继服务器，所以这个信息常驻标题栏；

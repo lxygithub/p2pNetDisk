@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -41,14 +42,29 @@ const kDefaultAddr = '{"id":"$kDefaultEndpointId","addrs":[]}';
 /// 之前所有逻辑都堆在一个 StatefulWidget 的 State 里，页面一多就没法共享
 /// （比如传输页要看队列、文件页要看连接态）。这里统一收进 ChangeNotifier，
 /// 页面通过 provider 订阅。
-class AppState extends ChangeNotifier {
+class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// [savedConfig] 在 runApp 之前由 main() 读入；页面构建时连接参数就已就位，
   /// 不会出现「设置页先显示占位符、随后又被异步覆盖」的竞态。
   AppState({ConnectionConfig? savedConfig}) {
+    WidgetsBinding.instance.addObserver(this);
     if (savedConfig != null) {
       relay = savedConfig.relay;
       token = savedConfig.token;
       serverAddr = savedConfig.addr;
+    }
+  }
+
+  /// 回到前台立刻探活一次：手机锁屏/切后台时连接可能已经断了，
+  /// 不主动探活就会一直显示上一次的「直连」。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (connected) {
+        _startHeartbeat();
+        unawaited(_probe());
+      }
+    } else if (state == AppLifecycleState.paused) {
+      _stopHeartbeat();
     }
   }
 
@@ -324,6 +340,8 @@ class AppState extends ChangeNotifier {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _stopHeartbeat();
     _statusTimer?.cancel();
     _worker.dispose();
     super.dispose();
@@ -364,13 +382,67 @@ class AppState extends ChangeNotifier {
       await _worker.init(relay, token, serverAddr);
       connected = true;
       status = '已连接';
+      _startHeartbeat();
     } catch (e) {
       connected = false;
       status = '连接失败: $e';
+      _stopHeartbeat();
     } finally {
       busy = false;
       notifyListeners();
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 连接保活
+  // ---------------------------------------------------------------------------
+
+  Timer? _heartbeat;
+
+  /// 空闲时也要知道连接还在不在。
+  ///
+  /// 之前只有「刷新/操作失败」才会发现掉线，于是标题栏一直挂着上次的
+  /// 「直连 · 8 ms」，用户点了文件才发现断了。现在每 15s 探活一次，
+  /// 回到前台时也立刻探一次。
+  void _startHeartbeat() {
+    _heartbeat?.cancel();
+    _heartbeat = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => unawaited(_probe()),
+    );
+  }
+
+  void _stopHeartbeat() {
+    _heartbeat?.cancel();
+    _heartbeat = null;
+  }
+
+  bool _probing = false;
+
+  /// 轻量探活。传输中跳过，免得和正在跑的任务抢同一条 RPC 通道。
+  Future<void> _probe() async {
+    // 上一次探活还没回来就不要再发：网络很差时 ping 会挂满超时，
+    // 每 15s 再叠一个只会越积越多。
+    if (_probing || !connected || busy) return;
+    _probing = true;
+    try {
+      await _worker.ping().timeout(const Duration(seconds: 10));
+    } catch (_) {
+      if (!connected) return;
+      _markOffline('连接已断开（心跳超时）· 下拉或点「重连」');
+    } finally {
+      _probing = false;
+    }
+  }
+
+  /// 统一的掉线处理：清掉路径徽标，否则界面会一直显示上一次的「直连」。
+  void _markOffline(String message) {
+    connected = false;
+    rpcHealthy = false;
+    pathSummary = null;
+    pathLatencyMs = null;
+    _stopHeartbeat();
+    setTransientStatus(message, ttl: const Duration(seconds: 15));
   }
 
   // ---------------------------------------------------------------------------
@@ -505,6 +577,10 @@ class AppState extends ChangeNotifier {
         }
       } else if (_looksOffline(e)) {
         connected = false;
+        // 不清掉路径徽标的话，界面会一直显示「直连」直到下次连接。
+        pathSummary = null;
+        pathLatencyMs = null;
+        _stopHeartbeat();
         status = showingCache
             ? '连接已断开，显示上次列表 · 下拉重试'
             : '连接已断开，下拉或点「重试」重新连接';
@@ -1185,6 +1261,88 @@ class AppState extends ChangeNotifier {
     final err = res['Error'];
     if (err != null) throw Exception(err);
     return local;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 缩略图（文件列表用）
+  // ---------------------------------------------------------------------------
+
+  final Map<String, Uint8List> _thumbs = {};
+  final Map<String, Future<Uint8List?>> _thumbPending = {};
+  int _thumbsBytes = 0;
+  int _thumbRunning = 0;
+  final List<Completer<void>> _thumbWaiters = [];
+
+  /// 单张原图超过这个大小就不取缩略图：滚动一次把几十 MB 拉下来不值得。
+  static const int _thumbMaxEntry = 12 * 1024 * 1024;
+  static const int _thumbMaxCache = 48 * 1024 * 1024;
+  static const int _thumbConcurrency = 3;
+
+  /// 取图片缩略图（内存 LRU + 临时文件缓存）。
+  ///
+  /// 同一路径的并发请求会复用同一个 future，列表滚动时不会重复下载。
+  Future<Uint8List?> thumbnail(String path, int size) {
+    if (!connected || size <= 0 || size > _thumbMaxEntry) {
+      return Future.value(null);
+    }
+    final cached = _thumbs[path];
+    if (cached != null) return Future.value(cached);
+    return _thumbPending.putIfAbsent(path, () => _loadThumb(path, size));
+  }
+
+  Future<Uint8List?> _loadThumb(String path, int size) async {
+    await _acquireThumbSlot();
+    try {
+      final tmp = await getTemporaryDirectory();
+      final dir = Directory(p.join(tmp.path, 'netdisk_thumbs'));
+      await dir.create(recursive: true);
+      // 用路径 hash 当文件名：原路径可能含 `/` 和中文，不能直接做文件名。
+      final file = File(p.join(dir.path, path.hashCode.toRadixString(16)));
+
+      if (!await file.exists() || await file.length() != size) {
+        final res = await _worker.get(
+          path,
+          file.path,
+          totalBytes: size,
+          timeLimit: const Duration(seconds: 25),
+        );
+        if (res['Error'] != null) return null;
+      }
+
+      final bytes = await file.readAsBytes();
+      _thumbs[path] = bytes;
+      _thumbsBytes += bytes.length;
+      while (_thumbsBytes > _thumbMaxCache && _thumbs.isNotEmpty) {
+        final oldest = _thumbs.keys.first;
+        _thumbsBytes -= _thumbs.remove(oldest)!.length;
+      }
+      return bytes;
+    } catch (_) {
+      // 缩略图只是锦上添花，失败就当没有，不要影响列表本身。
+      return null;
+    } finally {
+      _releaseThumbSlot();
+      _thumbPending.remove(path);
+    }
+  }
+
+  Future<void> _acquireThumbSlot() async {
+    if (_thumbRunning < _thumbConcurrency) {
+      _thumbRunning++;
+      return;
+    }
+    final waiter = Completer<void>();
+    _thumbWaiters.add(waiter);
+    await waiter.future;
+  }
+
+  void _releaseThumbSlot() {
+    if (_thumbWaiters.isNotEmpty) {
+      // 槽位直接转交给下一个等待者，计数保持不变。
+      _thumbWaiters.removeAt(0).complete();
+    } else {
+      _thumbRunning--;
+    }
   }
 
   /// 目录规范化：去掉开头的 `/`，补上结尾的 `/`；空串表示根目录。

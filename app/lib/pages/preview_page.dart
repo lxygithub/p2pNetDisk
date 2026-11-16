@@ -27,6 +27,24 @@ class _PreviewPageState extends State<PreviewPage> {
   String? _error;
   bool _loading = true;
 
+  /// 图片缩放/平移状态。双击在 1x 与 2.5x 之间切换，AppBar 上还能一键还原。
+  final TransformationController _transform = TransformationController();
+
+  @override
+  void dispose() {
+    _transform.dispose();
+    super.dispose();
+  }
+
+  void _toggleZoom() {
+    final zoomed = _transform.value.getMaxScaleOnAxis() > 1.01;
+    _transform.value = zoomed
+        ? Matrix4.identity()
+        : (Matrix4.identity()..scaleByDouble(2.5, 2.5, 1, 1));
+  }
+
+  void _resetZoom() => _transform.value = Matrix4.identity();
+
   static const _imageExts = {
     'jpg',
     'jpeg',
@@ -102,7 +120,17 @@ class _PreviewPageState extends State<PreviewPage> {
     final name = widget.remote.split('/').last;
     return Scaffold(
       backgroundColor: Colors.transparent,
-      appBar: AppBar(title: Text(name, overflow: TextOverflow.ellipsis)),
+      appBar: AppBar(
+        title: Text(name, overflow: TextOverflow.ellipsis),
+        actions: [
+          if (_imageExts.contains(_ext))
+            IconButton(
+              tooltip: '还原缩放',
+              icon: const Icon(Icons.fit_screen_outlined),
+              onPressed: _resetZoom,
+            ),
+        ],
+      ),
       body: Padding(padding: const EdgeInsets.all(16), child: _body()),
     );
   }
@@ -184,17 +212,51 @@ class _PreviewPageState extends State<PreviewPage> {
 
     final path = _localPath!;
     if (_imageExts.contains(_ext)) {
-      return Center(
-        child: InteractiveViewer(
-          maxScale: 5,
-          child: Image.file(
-            File(path),
-            fit: BoxFit.contain,
-            // 解码尺寸限制，避免大图直接 OOM。
-            cacheWidth: 2400,
-            errorBuilder: (_, _, _) => const Text('图片解码失败'),
+      return Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              onDoubleTap: _toggleZoom,
+              child: InteractiveViewer(
+                transformationController: _transform,
+                minScale: 1,
+                maxScale: 8,
+                // 允许拖到边界外一点，放大后看边缘细节更顺手。
+                boundaryMargin: const EdgeInsets.all(160),
+                child: Center(
+                  child: Image.file(
+                    File(path),
+                    fit: BoxFit.contain,
+                    // 解码尺寸限制，避免大图直接 OOM；放大时也要够清楚。
+                    cacheWidth: 3200,
+                    errorBuilder: (_, _, _) => const Text('图片解码失败'),
+                  ),
+                ),
+              ),
+            ),
           ),
-        ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Text(
+                  '双指缩放 · 双击放大 / 还原',
+                  style: TextStyle(fontSize: 11, color: Colors.white70),
+                ),
+              ),
+            ),
+          ),
+        ],
       );
     }
     if (_textExts.contains(_ext)) {
