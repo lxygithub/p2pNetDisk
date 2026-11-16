@@ -912,6 +912,88 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
   列表 JSON 超过 64 KiB 时服务端会写出、客户端 `read_frame()` 才 bail
   `frame too large`。文件数上千后大概率会踩到，需要在服务端提前拒绝或改分页。
 
+### 4.20 目录上传 / 目录下载 / 下载保存位置
+
+**入口**
+
+- 文件页右下角「上传」改成菜单：**上传文件** / **上传文件夹**。
+- 目录行的 ⋮ 改成菜单：**下载整个目录** / **重命名 · 移动**。
+- 多选支持勾选目录（全选也包含目录）；底部「下载」对文件平铺、对目录保持结构。
+
+**目录上传**（`AppState.enqueueDirectoryUpload`）
+
+- `FilePicker.getDirectoryPath()` 选本地目录，再用 `Directory.list(recursive: true)`
+  递归枚举。远端路径 = 当前目录 + 所选文件夹名 + 相对路径（保留顶层文件夹名）。
+- 服务端 `Put` 会自动 `create_dir_all(parent)`，所以**有文件的目录不必逐个 Mkdir**；
+  只有空目录需要单独 `Mkdir`（`make_dir` 内部是 `create_dir_all`，幂等）。
+- **跳过隐藏项**：`safe_path` 会拒绝 `.` 开头、`secret.key`、`*.netdisk-tmp`。
+  客户端在扫描时就把「路径中任意一段命中」的条目剪掉（`.git/config` 也不会漏），
+  并在状态里报告跳过数量 —— 否则一个含 `.git` 的项目目录会刷出上百个失败任务。
+- 扫描完直接入队，不做二次确认；状态栏显示「已加入 N 个文件（合计大小）」。
+
+**目录下载**（`AppState.enqueueDirectoryDownload`）
+
+- 服务端 `List` 返回的是**整棵树的扁平列表**（`list_entries` 递归，空目录也会返回），
+  所以目录下载不需要新协议：`entriesUnder()` 按 `dir/` 前缀过滤即可。
+- 相对路径映射：`localRelPath(path, remoteBase: parentOf(dir))`，本地落盘为
+  `<下载根>/<目录名>/<子路径>`；空目录同样在本地 `create(recursive: true)`。
+- 前缀判断带 `/`，`photos` 不会误匹配 `photos2`。
+
+**下载保存位置**（`DownloadPrefs` + `StorageAccess`）
+
+- 默认位置是**公共「下载」目录**：`/storage/emulated/0/Download/p2pNetDisk`。
+  这样**卸载 App 不会删掉已下载的文件** —— App 专属目录
+  （`Android/data/<包名>/files/...`）会在卸载时被系统一并清理，不能作为默认落点。
+- Android 11+ 的分区存储不允许普通 App 写公共目录，所以用
+  `MANAGE_EXTERNAL_STORAGE`（「所有文件访问」特殊权限）让 Rust 仍能按**绝对路径
+  直接写盘**，避免「先落临时文件、再由 Kotlin 用 `contentResolver` 复制」的双倍 IO。
+  Android 10 及以下走普通 `WRITE_EXTERNAL_STORAGE` 运行时权限，并带
+  `requestLegacyExternalStorage`。
+- 未授权时 `StorageAccess.hasPublicAccess()` 返回 false，自动退回 App 专属外部目录；
+  设置页显示「卸载后：一并删除」并给出「授予公共目录访问」按钮，点击跳系统
+  「所有文件访问」页。返回 App 时（`AppLifecycleState.resumed`）会重新解析路径，
+  不用手动重启。
+- **旧配置迁移**：早期版本把默认位置记成了 App 专属目录。若 `download_location.json`
+  指向 `/Android/data/` 且当前已有公共权限，会自动迁到公共目录并写回，避免用户
+  授权后路径还停在会被删除的地方。
+- 设置页也可**自选保存位置**：`FilePicker.getDirectoryPath()` 选目录后，用
+  `DownloadPrefs.isWritable()` **实写探针文件**再保存；公共目录在未授权时会被
+  一眼测出来，而不是等下载到一半报 EACCES。选择结果存 `download_location.json`，
+  「恢复默认位置」删掉它。
+- 下载开始后用 SnackBar 提示「保存到 `<路径>`」。
+
+**权限边界**
+
+- 各 ROM 的入口名不同（「所有文件访问」/「特殊应用权限」）；若
+  `ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION` 打不开，会依次回落到权限总列表、
+  应用详情页，至少让用户找得到。
+- `MANAGE_EXTERNAL_STORAGE` 在 Google Play 上架需要单独申报用途；本项目是自用/侧载，
+  不走商店分发。若将来要上架，需改成 MediaStore 或 SAF 逐文件导出。
+- Android 11+ 的公共目录即使有权限，`/Android/data` 与 `/Android/obb` 仍不可写
+  （系统限制），自定义位置不要选这两个目录。
+
+**为什么没做「SAF 任意目录直写」**
+
+要把 Rust 的写盘链路直接接到 SAF tree URI，需要每个文件先落临时文件、再由 Kotlin
+用 `contentResolver.openOutputStream` 复制过去（双倍 IO + 一层平台代码）。
+当前方案用「可写绝对路径 + 实写探测」覆盖了绝大多数场景；要往公共目录交付，
+可以先用系统文件管理器移动。后续若确实需要，可以再加一条独立的「导出到 SAF」通道。
+
+**已知限制**
+
+- 上传会覆盖远端同名文件（服务端 `Put` 语义），不做增量跳过或冲突询问。
+- 目录任务按**单个文件**进队列，没有「一个目录一个进度」的聚合视图；
+  上千文件时通知只显示计数。目录不会单独出现在完成列表里。
+- 目录下载依赖最近一次 `List` 的结果：列表还是缓存且未刷新时可能漏掉新文件，
+  先下拉刷新再下载。
+- 平铺下载（单文件/多选文件）同名会互相覆盖；目录下载靠结构天然避开了这个问题。
+
+**验证**：`path_utils_test.dart` 覆盖相对路径映射、前缀过滤（含 `photos` vs
+`photos2`）、隐藏项过滤、`joinUnder` 防穿越共 16 例；`flutter analyze` 无问题、
+`flutter test` 34 passed；`./gradlew :app:compileDebugKotlin` 与
+`:app:processDebugMainManifest` 均 `BUILD SUCCESSFUL`（验证 MethodChannel 与
+权限声明可编译）；APK 未构建。
+
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：
 
@@ -961,7 +1043,10 @@ flutter build apk --debug
 
 ## 7. 已知限制 / 下一步
 
-- **下载文件在 App 私有目录**：`.../AppDocuments/downloads/`，用户需通过文件管理器或后续接「分享 / 另存」（`share_plus`）才能拿到。
+- **下载默认落在公共「下载」目录**：`Download/p2pNetDisk`，卸载 App 后文件仍在
+  （需要「所有文件访问」权限，未授权时退回 App 专属目录并在设置页提示）；
+  也可在设置页改成其他可写目录（§4.20）。
+- **目录上传/下载按单文件进队列**：没有目录级聚合进度，上传会覆盖远端同名文件（§4.20）。
 - **进度只有字节计数**：UI 显示「已传 / 总量」，没有瞬时速率与剩余时间估算（要做需要滑动窗口采样）。
 - **回收站不会自动清理**：删除只是移到 `<data>/.trash/`，目前没有保留期策略与恢复 UI。`.trash` 以 `.` 开头，`list_entries` 与 `safe_path` 都会排除它，用户既看不到也访问不到。
 - **目录不能整棵删除**：`Delete` 只接受文件，删目录需要逐个删除文件（服务端会明确报错，不会误删）。

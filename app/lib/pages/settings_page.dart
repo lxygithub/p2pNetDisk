@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -21,7 +22,8 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends State<SettingsPage>
+    with WidgetsBindingObserver {
   /// 电池优化豁免状态；null 表示查询中或平台不支持。
   bool? _ignoringBattery;
   Map<String, Object?>? _device;
@@ -29,7 +31,69 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     super.initState();
+    // 从系统「所有文件访问」设置页返回时，权限可能刚变化，需要重新解析下载目录。
+    WidgetsBinding.instance.addObserver(this);
     _loadDevice();
+    _loadDownloadRoot();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _loadDownloadRoot();
+    }
+  }
+
+  /// 下载根目录是惰性解析的（依赖 path_provider 与存储权限），进入设置页时补一次，
+  /// 让「保存到」一行显示真实路径而不是「默认」。
+  Future<void> _loadDownloadRoot() async {
+    final s = context.read<AppState>();
+    // 用 refresh 而不是 ensure：从系统设置返回时权限可能刚变，需要重新解析
+    // 默认位置（用户手动选过的自定义位置仍然优先，不会被冲掉）。
+    await s.refreshDownloadRoot();
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  Future<void> _grantPublicStorage() async {
+    final s = context.read<AppState>();
+    final opened = await s.requestPublicStorageAccess();
+    if (!mounted) return;
+    _snack(
+      opened
+          ? '请在系统设置里允许「所有文件访问」，返回后自动生效'
+          : '无法打开权限设置，请在系统设置 → 应用 → 特殊应用权限里手动授予',
+    );
+  }
+
+  Future<void> _pickDownloadDir() async {
+    final s = context.read<AppState>();
+    String? dir;
+    try {
+      dir = await FilePicker.getDirectoryPath(dialogTitle: '选择下载保存位置');
+    } catch (e) {
+      _snack('打开目录选择器失败: $e');
+      return;
+    }
+    if (dir == null || dir.isEmpty) return;
+    final ok = await s.setDownloadRoot(dir);
+    if (!mounted) return;
+    _snack(
+      ok ? '下载位置已更新' : '该目录不可写（Android 11+ 公共目录需要系统授权），已保留原位置',
+    );
+  }
+
+  Future<void> _resetDownloadDir() async {
+    final s = context.read<AppState>();
+    await s.resetDownloadRoot();
+    if (!mounted) return;
+    _snack('已恢复默认下载位置');
   }
 
   void _openConnectionPage() {
@@ -165,6 +229,8 @@ class _SettingsPageState extends State<SettingsPage> {
             ],
           ),
           const SizedBox(height: 16),
+          _downloadCard(s),
+          const SizedBox(height: 16),
           _backgroundCard(),
           const SizedBox(height: 16),
           _SectionCard(
@@ -222,6 +288,85 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _downloadCard(AppState s) {
+    final scheme = Theme.of(context).colorScheme;
+    final path = s.downloadRoot;
+    return _SectionCard(
+      title: '下载',
+      children: [
+        _InfoRow(
+          label: '保存到',
+          value: path.isEmpty ? '默认位置（首次下载时创建）' : path,
+        ),
+        _InfoRow(
+          label: '卸载后',
+          value: path.isEmpty
+              ? '未知'
+              : (s.downloadRootSurvivesUninstall
+                    ? '保留（公共目录）'
+                    : '一并删除（App 专属目录）'),
+        ),
+        if (s.publicStorageSupported && !s.publicStorageGranted) ...[
+          const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: scheme.errorContainer.withValues(alpha: 0.5),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(
+              '未获得「所有文件访问」权限：下载会落到 App 专属目录，'
+              '卸载 App 时会被系统删除。授予后默认保存到公共 Download/p2pNetDisk。',
+              style: TextStyle(
+                fontSize: 12,
+                color: scheme.onErrorContainer,
+                height: 1.5,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _grantPublicStorage,
+              icon: const Icon(Icons.folder_special, size: 18),
+              label: const Text('授予公共目录访问'),
+            ),
+          ),
+        ],
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _pickDownloadDir,
+            icon: const Icon(Icons.folder_open, size: 18),
+            label: const Text('选择保存位置'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: TextButton.icon(
+            onPressed: _resetDownloadDir,
+            icon: const Icon(Icons.restore, size: 18),
+            label: const Text('恢复默认位置'),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '默认保存到公共「下载」目录（Download/p2pNetDisk）：卸载 App 后文件仍在，'
+          '系统文件管理器可直接打开。Android 11+ 需要「所有文件访问」权限才能写'
+          '公共目录，未授权时会退到 App 专属目录。任何自定义位置都会先实测写入再保存。',
+          style: TextStyle(
+            fontSize: 12,
+            color: scheme.onSurfaceVariant,
+            height: 1.5,
+          ),
+        ),
+      ],
     );
   }
 

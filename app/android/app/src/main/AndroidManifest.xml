@@ -1,4 +1,6 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <!-- Android 13+ 发送通知需要运行时授权（在 MainActivity 里请求）。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 传输期间用前台服务保活；Android 14+ 需要声明前台服务类型。 -->
@@ -8,10 +10,32 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 传输期间保持 CPU 唤醒，避免锁屏后网络栈被挂起。 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      下载落到公共目录（Download/p2pNetDisk），这样卸载 App 不会连带删掉已下载
+      的文件。App 专属目录（Android/data/<包名>）会在卸载时被系统清理，所以不能
+      作为默认落点。
+
+      Android 11+ 的公共目录受分区存储保护，普通 App 写不进去；这里用
+      MANAGE_EXTERNAL_STORAGE（「所有文件访问」特殊权限）让 Rust 侧仍能按绝对
+      路径直接写盘，避免「先下临时文件、再由 Kotlin 复制」的双倍 IO。
+      未授权时客户端会回退到 App 专属目录，并在设置页提示卸载会丢。
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <!-- Android 10 及以下用传统的写外部存储权限（11+ 由上面的特殊权限覆盖）。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
     <application
         android:label="p2pNetDisk"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:requestLegacyExternalStorage="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"

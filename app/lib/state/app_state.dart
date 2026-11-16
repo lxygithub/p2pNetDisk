@@ -7,8 +7,11 @@ import 'package:path_provider/path_provider.dart';
 
 import '../models/transfer_task.dart';
 import '../services/connection_prefs.dart';
+import '../services/download_prefs.dart';
 import '../services/endpoint_addr.dart';
 import '../services/list_cache.dart';
+import '../services/path_utils.dart';
+import '../services/storage_access.dart';
 import '../services/transfer_notifications.dart';
 import '../src/netdisk_worker.dart';
 
@@ -152,6 +155,111 @@ class AppState extends ChangeNotifier {
 
   /// 当前目录，空串表示根，否则以 `/` 结尾。
   String cwd = '';
+
+  // ---- 下载位置 ----
+  String _downloadRoot = '';
+
+  /// 是否已获得公共目录写权限（Android 11+ 的「所有文件访问」）。
+  ///
+  /// 为 false 时默认下载位置会退到 App 专属目录，卸载 App 会连带删掉文件，
+  /// 设置页据此给出授权引导。
+  bool publicStorageGranted = false;
+
+  /// 当前下载根目录。空串表示还没初始化，调用方应先 await [ensureDownloadRoot]。
+  String get downloadRoot => _downloadRoot;
+
+  /// 只有 Android 存在公共目录权限问题，其他平台恒为 true（不影响 UI 分支）。
+  bool get publicStorageSupported => Platform.isAndroid;
+
+  /// 当前下载目录是否在卸载 App 后仍然保留。
+  ///
+  /// App 专属目录形如 `/storage/emulated/0/Android/data/<包名>/...`，卸载时会被
+  /// 系统清掉；公共目录（Download）与 SD 卡路径会保留。
+  bool get downloadRootSurvivesUninstall {
+    final root = _downloadRoot.replaceAll('\\', '/');
+    if (root.isEmpty) return false;
+    return !root.contains('/Android/data/');
+  }
+
+  /// 取（必要时初始化）下载根目录，并确保目录存在。
+  ///
+  /// 优先用户自定义位置，其次公共「下载」目录（卸载保留），最后回退 App 专属
+  /// 外部目录与系统临时目录 —— 保证下载入口不会因为拿不到路径直接报错。
+  Future<String> ensureDownloadRoot() async {
+    if (_downloadRoot.isNotEmpty) return _downloadRoot;
+    if (Platform.isAndroid) {
+      publicStorageGranted = await StorageAccess.hasPublicAccess();
+    }
+    try {
+      final override = await DownloadPrefs.readOverride();
+      // 旧版本的默认位置曾落在 App 专属目录（Android/data/...）。用户现在拿到了
+      // 公共目录权限，就不能再沿用那条「卸载即删除」的路径，自动迁到新默认值。
+      final appScoped =
+          override?.replaceAll('\\', '/').contains('/Android/data/') ?? false;
+      final migrate = override != null && appScoped && publicStorageGranted;
+      if (override != null && !migrate) {
+        _downloadRoot = override;
+      } else {
+        _downloadRoot = await DownloadPrefs.defaultRoot();
+        if (migrate) await DownloadPrefs.saveOverride(_downloadRoot);
+      }
+    } catch (_) {
+      try {
+        final docs = await getApplicationDocumentsDirectory();
+        _downloadRoot = p.join(docs.path, 'downloads');
+      } catch (_) {
+        _downloadRoot = p.join(Directory.systemTemp.path, 'p2pNetDisk');
+      }
+    }
+    try {
+      await Directory(_downloadRoot).create(recursive: true);
+    } catch (_) {
+      // 目录建不出来时保留路径，具体错误会在第一个任务里暴露。
+    }
+    return _downloadRoot;
+  }
+
+  /// 重新解析下载目录。用户从系统设置返回、权限状态可能已变化时调用。
+  ///
+  /// 自定义位置优先，所以这里不会把用户手动选的目录冲掉。
+  Future<void> refreshDownloadRoot() async {
+    _downloadRoot = '';
+    await ensureDownloadRoot();
+    notifyListeners();
+  }
+
+  /// 打开系统「所有文件访问」授权页。返回 false 表示设置页都打不开。
+  Future<bool> requestPublicStorageAccess() async {
+    final opened = await StorageAccess.requestPublicAccess();
+    if (!opened) {
+      status = '无法打开权限设置页，请在系统设置里手动授予「所有文件访问」';
+      notifyListeners();
+    }
+    return opened;
+  }
+
+  /// 设置自定义下载位置。返回 false 表示目录不可写，原位置保持不变。
+  Future<bool> setDownloadRoot(String path) async {
+    if (!await DownloadPrefs.isWritable(path)) return false;
+    _downloadRoot = DownloadPrefs.normalize(path);
+    await DownloadPrefs.saveOverride(_downloadRoot);
+    status = '下载位置已更新：$_downloadRoot';
+    notifyListeners();
+    return true;
+  }
+
+  /// 恢复默认下载位置（清掉本机记住的自定义目录）。
+  Future<void> resetDownloadRoot() async {
+    await DownloadPrefs.clearOverride();
+    _downloadRoot = await DownloadPrefs.defaultRoot();
+    try {
+      await Directory(_downloadRoot).create(recursive: true);
+    } catch (_) {
+      // 同上，留给首个任务报错。
+    }
+    status = '下载位置已恢复默认：$_downloadRoot';
+    notifyListeners();
+  }
 
   // ---- 传输队列 ----
   final List<TransferTask> tasks = [];
@@ -506,34 +614,235 @@ class AppState extends ChangeNotifier {
     await _pump();
   }
 
-  Future<void> enqueueDownload(String remote, int size) async {
-    await enqueueDownloads([(path: remote, size: size)]);
-  }
-
-  /// 批量下载：一次建好所有任务，再交给队列按并发上限调度。
-  Future<void> enqueueDownloads(List<({String path, int size})> items) async {
+  /// 上传整个本地目录，保持相对结构。
+  ///
+  /// 服务端 `Put` 会自动 `create_dir_all(parent)`，所以有文件的目录不必逐个
+  /// Mkdir；只有**空目录**需要单独创建，否则远端会丢掉空目录结构。
+  ///
+  /// 隐藏文件/目录会被跳过：服务端 `safe_path` 明确拒绝 `.` 开头的路径，
+  /// 不剪掉的话 `.git/`、`.nomedia` 会刷出一串失败任务。
+  Future<void> enqueueDirectoryUpload(String localDir) async {
     if (!connected) {
       status = '请先连接';
       notifyListeners();
       return;
     }
-    if (items.isEmpty) return;
+    final dir = Directory(localDir);
+    if (!await dir.exists()) {
+      status = '目录不存在：$localDir';
+      notifyListeners();
+      return;
+    }
+    final rootName = p.basename(DownloadPrefs.normalize(localDir));
+    if (rootName.isEmpty || rootName == '.' || rootName == '..') {
+      status = '无法识别目录名：$localDir';
+      notifyListeners();
+      return;
+    }
 
-    final dir = await getApplicationDocumentsDirectory();
-    final target = p.join(dir.path, 'downloads');
-    await Directory(target).create(recursive: true);
+    status = '正在扫描 $rootName …';
+    notifyListeners();
+
+    final picked = <({String name, String path, int size})>[];
+    final emptyDirs = <String>[];
+    var skipped = 0;
+    var totalBytes = 0;
+    try {
+      await for (final entity in dir.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        final rel = p
+            .relative(entity.path, from: localDir)
+            .replaceAll('\\', '/');
+        if (rel.isEmpty || rel.startsWith('..')) continue;
+        if (shouldSkipUploadPath(rel)) {
+          skipped++;
+          continue;
+        }
+        if (entity is Directory) {
+          // 空目录（含只有隐藏项）不会因为上传文件而被创建，得单独记下来。
+          if (await entity.list().isEmpty) {
+            emptyDirs.add('$cwd$rootName/$rel');
+          }
+        } else if (entity is File) {
+          final stat = await entity.stat();
+          totalBytes += stat.size;
+          picked.add((name: '$rootName/$rel', path: entity.path, size: stat.size));
+        }
+      }
+    } catch (e) {
+      status = '扫描目录失败: $e';
+      notifyListeners();
+      return;
+    }
+
+    if (picked.isEmpty && emptyDirs.isEmpty) {
+      status = '目录为空（或只含隐藏文件）：$rootName';
+      notifyListeners();
+      return;
+    }
+
+    var dirFailures = 0;
+    for (final d in emptyDirs) {
+      try {
+        await _worker.mkdir(d);
+      } catch (_) {
+        dirFailures++;
+      }
+    }
+
+    // 只含空目录的文件夹：没有文件要传，但目录结构已经建好了。
+    if (picked.isEmpty) {
+      final created = emptyDirs.length - dirFailures;
+      status = created > 0
+          ? '已在远端创建 $created 个空目录'
+          : '空目录创建失败（$dirFailures 个）';
+      notifyListeners();
+      return;
+    }
+
+    for (final f in picked) {
+      tasks.add(
+        TransferTask(
+          id: _nextTaskId++,
+          kind: TransferKind.upload,
+          remote: '$cwd${f.name}',
+          local: f.path,
+          total: f.size,
+        ),
+      );
+    }
+
+    final skippedText = skipped > 0 ? '，跳过 $skipped 项隐藏内容' : '';
+    final failText = dirFailures > 0 ? '，$dirFailures 个空目录创建失败' : '';
+    status =
+        '已加入 ${picked.length} 个文件（${humanSize(totalBytes)}）'
+        '$skippedText$failText';
+    notifyListeners();
+    await _pump();
+  }
+
+  Future<void> enqueueDownload(String remote, int size) async {
+    await enqueueDownloads([(path: remote, size: size)]);
+  }
+
+  /// 下载远端整个目录（保持目录结构）。
+  ///
+  /// 服务端 `List` 返回的是整棵树的扁平列表，所以目录下载不需要新协议：
+  /// 直接按前缀过滤出所有条目，再把相对路径映射到本地下载根目录下。
+  Future<void> enqueueDirectoryDownload(String remoteDir) async {
+    if (!connected) {
+      status = '请先连接';
+      notifyListeners();
+      return;
+    }
+    var dir = remoteDir.replaceAll('\\', '/');
+    while (dir.endsWith('/')) {
+      dir = dir.substring(0, dir.length - 1);
+    }
+    if (dir.isEmpty) {
+      status = '根目录请逐项选择下载';
+      notifyListeners();
+      return;
+    }
+
+    final under = entriesUnder(files, dir);
+    final items = <({String path, int size})>[
+      for (final e in under)
+        if (!e.isDir) (path: e.path, size: e.size),
+    ];
+    final dirs = <String>[
+      for (final e in under)
+        if (e.isDir) e.path,
+    ];
+    if (items.isEmpty && dirs.isEmpty) {
+      status = '目录为空或列表尚未刷新：$dir';
+      notifyListeners();
+      return;
+    }
+
+    final base = parentOf(dir);
+    if (items.isEmpty) {
+      // 只有空目录：本地也建出来，别让用户以为下载失败。
+      final root = await ensureDownloadRoot();
+      final local = joinUnder(root, localRelPath(dir, remoteBase: base));
+      try {
+        await Directory(local).create(recursive: true);
+        status = '目录为空，已在本地创建 $local';
+      } catch (e) {
+        status = '创建本地目录失败: $e';
+      }
+      notifyListeners();
+      return;
+    }
+
+    status = '正在准备下载 ${dirName(dir)}（${items.length} 个文件）…';
+    notifyListeners();
+    await enqueueDownloads(items, remoteBase: base, extraDirs: dirs);
+  }
+
+  /// 批量下载。
+  ///
+  /// [remoteBase] 为 null 时按单文件/多选处理：文件**平铺**到下载根目录，
+  /// 只保留文件名（保持原有行为）。非 null 时保留结构，供目录下载使用；
+  /// [extraDirs] 里的远端目录会在本地创建出来，避免空目录丢失。
+  Future<void> enqueueDownloads(
+    List<({String path, int size})> items, {
+    String? remoteBase,
+    List<String> extraDirs = const [],
+  }) async {
+    if (!connected) {
+      status = '请先连接';
+      notifyListeners();
+      return;
+    }
+    if (items.isEmpty && extraDirs.isEmpty) return;
+
+    final String root;
+    try {
+      root = await ensureDownloadRoot();
+    } catch (e) {
+      status = '无法准备下载目录: $e';
+      notifyListeners();
+      return;
+    }
+
+    final base = remoteBase ?? '';
+    final keepStructure = remoteBase != null;
+
+    for (final dir in extraDirs) {
+      final rel = keepStructure ? localRelPath(dir, remoteBase: base) : '';
+      if (rel.isEmpty) continue;
+      try {
+        await Directory(joinUnder(root, rel)).create(recursive: true);
+      } catch (_) {
+        // 单个目录建不出来不影响后续文件，最终会在任务里暴露。
+      }
+    }
 
     for (final item in items) {
+      final rel = keepStructure
+          ? localRelPath(item.path, remoteBase: base)
+          : p.basename(item.path);
+      final local = joinUnder(root, rel.isEmpty ? p.basename(item.path) : rel);
+      try {
+        await Directory(p.dirname(local)).create(recursive: true);
+      } catch (_) {
+        // 同上：目录创建失败会在打开文件时变成明确错误。
+      }
       tasks.add(
         TransferTask(
           id: _nextTaskId++,
           kind: TransferKind.download,
           remote: item.path,
-          local: p.join(target, p.basename(item.path)),
+          local: local,
           total: item.size,
         ),
       );
     }
+
+    status = '已加入 ${items.length} 个下载任务 → $root';
     notifyListeners();
     await _pump();
   }

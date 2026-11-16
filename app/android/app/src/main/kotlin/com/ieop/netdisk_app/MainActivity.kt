@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
@@ -31,6 +32,7 @@ class MainActivity : FlutterActivity() {
     private val channelId = "netdisk_transfer"
     private val notificationId = 1001
     private val permissionRequestCode = 1001
+    private val storagePermissionRequestCode = 1002
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -108,6 +110,19 @@ class MainActivity : FlutterActivity() {
                     ),
                 )
 
+                else -> result.notImplemented()
+            }
+        }
+
+        // 公共目录访问：下载要落在 Download/ 下，卸载 App 后文件才不会丢。
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "netdisk/storage",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "hasPublicAccess" -> result.success(hasPublicStorageAccess())
+                "requestPublicAccess" -> result.success(requestPublicStorageAccess())
+                "publicDownloadsPath" -> result.success(publicDownloadsPath())
                 else -> result.notImplemented()
             }
         }
@@ -325,6 +340,78 @@ class MainActivity : FlutterActivity() {
         true
     } catch (_: Exception) {
         false
+    }
+
+    // ---------------------------------------------------------------------
+    // 公共存储（下载落盘位置）
+    // ---------------------------------------------------------------------
+
+    /**
+     * 是否可以在公共目录（Download 等）按绝对路径直接写文件。
+     *
+     * Android 11（R）起分区存储生效，普通 App 只能写自己的目录；要写到
+     * `/storage/emulated/0/Download` 必须拿到「所有文件访问」特殊权限。
+     * 10 及以下仍是传统的运行时写外部存储权限。
+     */
+    private fun hasPublicStorageAccess(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                Environment.isExternalStorageManager()
+            } catch (_: Throwable) {
+                false
+            }
+        } else {
+            ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    /**
+     * 引导用户授予公共目录访问权限。
+     *
+     * Android 11+ 直接跳「所有文件访问」页（部分 ROM 没有该 Intent，回落到总列表）；
+     * 10 及以下走普通运行时权限弹窗。两种方式都要等用户操作后回来才能确认结果，
+     * 所以 Dart 侧在 App resume 时重新查询，而不是在这里同步返回。
+     */
+    private fun requestPublicStorageAccess(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName"),
+                    ),
+                )
+                true
+            } catch (_: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    true
+                } catch (_: Exception) {
+                    openAppSettings()
+                }
+            }
+        }
+        return try {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                storagePermissionRequestCode,
+            )
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** 公共「下载」目录的绝对路径，如 `/storage/emulated/0/Download`。 */
+    @Suppress("DEPRECATION")
+    private fun publicDownloadsPath(): String? = try {
+        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            ?.absolutePath
+    } catch (_: Throwable) {
+        null
     }
 
     /** HarmonyOS 的 Build.MANUFACTURER 仍是 huawei，用系统属性进一步区分。 */

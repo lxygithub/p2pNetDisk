@@ -62,7 +62,9 @@ class _FilesPageState extends State<FilesPage> {
     setState(() {
       _selected
         ..clear()
-        ..addAll(entries.where((e) => !e.isDir).map((e) => e.path));
+        // 目录也能入选：批量下载需要支持「整个目录」。复制/移动/删除
+        // 仍只会作用于其中的文件（服务端 Delete 不接受目录）。
+        ..addAll(entries.map((e) => e.path));
     });
   }
 
@@ -132,8 +134,9 @@ class _FilesPageState extends State<FilesPage> {
               onCopy: (path) => _runOnline(() => _copyDialog(path)),
               onRename: (path) => _runOnline(() => _renameDialog(path)),
               onDelete: (path) => _runOnline(() => _deleteConfirm(path)),
-              onDownload: (entry) =>
-                  _runOnline(() => s.enqueueDownload(entry.path, entry.size)),
+              onDownload: (entry) => _runOnline(() => _startDownload(entry)),
+              onDownloadDir: (entry) =>
+                  _runOnline(() => _startDirDownload(entry)),
             ),
           ),
           if (!_selectionMode) _StatusBar(text: s.status),
@@ -144,8 +147,8 @@ class _FilesPageState extends State<FilesPage> {
           : null,
       floatingActionButton: (!_selectionMode && s.connected)
           ? FloatingActionButton.extended(
-              onPressed: s.busy ? null : _pickAndUpload,
-              icon: const Icon(Icons.upload_file),
+              onPressed: s.busy ? null : _showUploadMenu,
+              icon: const Icon(Icons.add),
               label: const Text('上传'),
             )
           : null,
@@ -172,7 +175,6 @@ class _FilesPageState extends State<FilesPage> {
   }
 
   AppBar _selectionAppBar(List<_Entry> entries) {
-    final selectable = entries.where((e) => !e.isDir).length;
     return AppBar(
       leading: IconButton(
         tooltip: '退出多选',
@@ -184,7 +186,7 @@ class _FilesPageState extends State<FilesPage> {
         IconButton(
           tooltip: '全选',
           icon: const Icon(Icons.select_all),
-          onPressed: selectable == 0 ? null : () => _selectAll(entries),
+          onPressed: entries.isEmpty ? null : () => _selectAll(entries),
         ),
       ],
     );
@@ -196,6 +198,7 @@ class _FilesPageState extends State<FilesPage> {
     bool online,
   ) {
     final files = _selectedFiles(entries);
+    final dirs = _selectedDirs(entries);
 
     return SafeArea(
       child: Padding(
@@ -208,8 +211,9 @@ class _FilesPageState extends State<FilesPage> {
               _SelectionAction(
                 icon: Icons.download,
                 label: '下载',
-                enabled: files.isNotEmpty && online,
-                onTap: () => _batchDownload(files),
+                // 目录可以整棵下载，所以这里不能只数文件。
+                enabled: (files.isNotEmpty || dirs.isNotEmpty) && online,
+                onTap: () => _batchDownload(entries),
               ),
               _SelectionAction(
                 icon: Icons.copy_outlined,
@@ -240,14 +244,31 @@ class _FilesPageState extends State<FilesPage> {
       .where((e) => !e.isDir && _selected.contains(e.path))
       .toList(growable: false);
 
+  List<_Entry> _selectedDirs(List<_Entry> entries) => entries
+      .where((e) => e.isDir && _selected.contains(e.path))
+      .toList(growable: false);
+
   // ---------------------------------------------------------------------------
   // 批量操作
   // ---------------------------------------------------------------------------
 
-  Future<void> _batchDownload(List<_Entry> files) async {
-    final items = [for (final f in files) (path: f.path, size: f.size)];
+  Future<void> _batchDownload(List<_Entry> entries) async {
+    final selected = entries
+        .where((e) => _selected.contains(e.path))
+        .toList(growable: false);
+    final items = [
+      for (final e in selected)
+        if (!e.isDir) (path: e.path, size: e.size),
+    ];
+    final dirs = [for (final e in selected) if (e.isDir) e.path];
     _exitSelection();
-    await _state.enqueueDownloads(items);
+
+    // 文件平铺到下载根目录（保持原有行为），目录保持各自的相对结构。
+    if (items.isNotEmpty) await _state.enqueueDownloads(items);
+    for (final dir in dirs) {
+      await _state.enqueueDirectoryDownload(dir);
+    }
+    _toastSaved();
   }
 
   Future<void> _batchDelete(List<_Entry> files) async {
@@ -325,6 +346,77 @@ class _FilesPageState extends State<FilesPage> {
   // ---------------------------------------------------------------------------
   // 单个操作
   // ---------------------------------------------------------------------------
+
+  /// 下载完成后把保存位置提示出来 —— 用户在 Android 上很难自己找到
+  /// `Android/data/<包名>/files` 这种目录，不提示等于「下载了但不知道在哪」。
+  void _toastSaved() {
+    if (!mounted) return;
+    final root = _state.downloadRoot;
+    if (root.isEmpty) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('保存到 $root'),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  Future<void> _startDownload(_Entry entry) async {
+    await _state.enqueueDownload(entry.path, entry.size);
+    _toastSaved();
+  }
+
+  Future<void> _startDirDownload(_Entry entry) async {
+    await _state.enqueueDirectoryDownload(entry.path);
+    _toastSaved();
+  }
+
+  /// 上传入口菜单：文件 / 文件夹分开，避免把「选文件夹」藏进多选逻辑里。
+  Future<void> _showUploadMenu() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.upload_file),
+              title: const Text('上传文件'),
+              subtitle: const Text('可一次选多个'),
+              onTap: () => Navigator.pop(ctx, 'files'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.drive_folder_upload),
+              title: const Text('上传文件夹'),
+              subtitle: const Text('保持目录结构；隐藏文件会跳过'),
+              onTap: () => Navigator.pop(ctx, 'dir'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (choice == 'files') {
+      await _pickAndUpload();
+    } else if (choice == 'dir') {
+      await _pickAndUploadDir();
+    }
+  }
+
+  Future<void> _pickAndUploadDir() async {
+    final state = _state;
+    String? dir;
+    try {
+      dir = await FilePicker.getDirectoryPath(dialogTitle: '选择要上传的文件夹');
+    } catch (e) {
+      state.setStatus('打开目录选择器失败: $e');
+      return;
+    }
+    if (dir == null || dir.isEmpty) return;
+    await state.enqueueDirectoryUpload(dir);
+  }
 
   Future<void> _pickAndUpload() async {
     final state = _state;
@@ -529,6 +621,7 @@ class _FileList extends StatelessWidget {
     required this.onRename,
     required this.onDelete,
     required this.onDownload,
+    required this.onDownloadDir,
   });
 
   final AppState state;
@@ -542,6 +635,7 @@ class _FileList extends StatelessWidget {
   final void Function(String path) onRename;
   final void Function(String path) onDelete;
   final void Function(_Entry entry) onDownload;
+  final void Function(_Entry entry) onDownloadDir;
 
   @override
   Widget build(BuildContext context) {
@@ -629,6 +723,7 @@ class _FileList extends StatelessWidget {
             name: e.name,
             onTap: state.busy ? null : () => onEnterDir(e.name),
             onRename: () => onRename(e.path),
+            onDownload: () => onDownloadDir(e),
           );
         }
 
@@ -654,11 +749,17 @@ class _FileList extends StatelessWidget {
 }
 
 class _DirTile extends StatelessWidget {
-  const _DirTile({required this.name, this.onTap, required this.onRename});
+  const _DirTile({
+    required this.name,
+    this.onTap,
+    required this.onRename,
+    required this.onDownload,
+  });
 
   final String name;
   final VoidCallback? onTap;
   final VoidCallback onRename;
+  final VoidCallback onDownload;
 
   @override
   Widget build(BuildContext context) {
@@ -683,11 +784,38 @@ class _DirTile extends StatelessWidget {
               ),
             ),
           ),
-          IconButton(
-            tooltip: '重命名 / 移动',
-            visualDensity: VisualDensity.compact,
+          PopupMenuButton<String>(
+            tooltip: '更多',
             icon: const Icon(Icons.more_vert, size: 20),
-            onPressed: onRename,
+            onSelected: (value) {
+              if (value == 'rename') {
+                onRename();
+              } else if (value == 'download') {
+                onDownload();
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'download',
+                child: Row(
+                  children: [
+                    Icon(Icons.download, size: 20),
+                    SizedBox(width: 12),
+                    Text('下载整个目录'),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'rename',
+                child: Row(
+                  children: [
+                    Icon(Icons.drive_file_rename_outline, size: 20),
+                    SizedBox(width: 12),
+                    Text('重命名 / 移动'),
+                  ],
+                ),
+              ),
+            ],
           ),
         ],
       ),
