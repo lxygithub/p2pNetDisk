@@ -159,7 +159,8 @@ class _FilesPageState extends State<FilesPage> {
     return AppBar(
       title: const Text('p2pNetDisk'),
       actions: [
-        if (s.pathSummary != null) PathChip(text: s.pathSummary!),
+        if (s.pathSummary != null)
+          PathChip(text: s.pathSummary!, latencyMs: s.pathLatencyMs),
         IconButton(
           tooltip: '新建目录',
           onPressed: s.busy || !s.connected ? null : _newDir,
@@ -230,8 +231,9 @@ class _FilesPageState extends State<FilesPage> {
               _SelectionAction(
                 icon: Icons.delete_outline,
                 label: '删除',
-                enabled: files.isNotEmpty && online,
-                onTap: () => _batchDelete(files),
+                // 目录也能删（里面的文件进回收站，空壳随后移除）。
+                enabled: (files.isNotEmpty || dirs.isNotEmpty) && online,
+                onTap: () => _batchDelete(entries),
               ),
             ],
           ),
@@ -271,12 +273,24 @@ class _FilesPageState extends State<FilesPage> {
     _toastSaved();
   }
 
-  Future<void> _batchDelete(List<_Entry> files) async {
+  Future<void> _batchDelete(List<_Entry> entries) async {
+    final selected = entries
+        .where((e) => _selected.contains(e.path))
+        .toList(growable: false);
+    if (selected.isEmpty) return;
+
+    final fileCount = selected.where((e) => !e.isDir).length;
+    final dirCount = selected.length - fileCount;
+    final what = [
+      if (fileCount > 0) '$fileCount 个文件',
+      if (dirCount > 0) '$dirCount 个文件夹（含其中所有文件）',
+    ].join('、');
+
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('删除 ${files.length} 个文件'),
-        content: const Text('会移入服务端回收站，不会立即物理删除。'),
+        title: Text('删除 $what'),
+        content: const Text('会移入服务端回收站，不会立即物理删除；文件夹的空壳会被移除。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -290,7 +304,8 @@ class _FilesPageState extends State<FilesPage> {
       ),
     );
     if (ok != true) return;
-    final paths = [for (final f in files) f.path];
+    if (!mounted) return;
+    final paths = [for (final e in selected) e.path];
     _exitSelection();
     await _state.deleteMany(paths);
   }
@@ -517,11 +532,18 @@ class _FilesPageState extends State<FilesPage> {
   }
 
   Future<void> _deleteConfirm(String path) async {
+    final isDir =
+        path.endsWith('/') ||
+        _state.files.any((e) => e.path == path && e.isDir);
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('删除文件'),
-        content: Text('$path\n\n会移入服务端回收站，不会立即物理删除。'),
+        title: Text(isDir ? '删除文件夹' : '删除文件'),
+        content: Text(
+          isDir
+              ? '$path\n\n文件夹里的文件会移入服务端回收站，空目录随后删除。'
+              : '$path\n\n会移入服务端回收站，不会立即物理删除。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -534,7 +556,8 @@ class _FilesPageState extends State<FilesPage> {
         ],
       ),
     );
-    if (ok == true) await _state.deleteFile(path);
+    if (ok != true || !mounted) return;
+    await _state.deleteMany([path]);
   }
 
   Future<void> _renameDialog(String path) async {
@@ -724,6 +747,11 @@ class _FileList extends StatelessWidget {
             onTap: state.busy ? null : () => onEnterDir(e.name),
             onRename: () => onRename(e.path),
             onDownload: () => onDownloadDir(e),
+            onDelete: () => onDelete(e.path),
+            onToggle: () => onToggle(e.path),
+            onLongPress: () => onLongPress(e.path),
+            selectionMode: selectionMode,
+            selected: selected.contains(e.path),
           );
         }
 
@@ -754,70 +782,102 @@ class _DirTile extends StatelessWidget {
     this.onTap,
     required this.onRename,
     required this.onDownload,
+    required this.onDelete,
+    required this.onToggle,
+    required this.onLongPress,
+    this.selectionMode = false,
+    this.selected = false,
   });
 
   final String name;
   final VoidCallback? onTap;
   final VoidCallback onRename;
   final VoidCallback onDownload;
+  final VoidCallback onDelete;
+  final VoidCallback onToggle;
+  final VoidCallback onLongPress;
+  final bool selectionMode;
+  final bool selected;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return GlassCard(
-      padding: const EdgeInsets.fromLTRB(14, 4, 4, 4),
-      onTap: onTap,
-      child: Row(
-        children: [
-          Icon(Icons.folder_rounded, color: scheme.primary),
-          const SizedBox(width: 12),
-          Expanded(
-            child: SizedBox(
-              height: 44,
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  name,
-                  style: const TextStyle(fontWeight: FontWeight.w500),
-                  overflow: TextOverflow.ellipsis,
+    return GestureDetector(
+      // 长按进多选；多选态下点击是勾选，不再是「进入目录」。
+      onLongPress: onLongPress,
+      onTap: selectionMode ? onToggle : onTap,
+      child: GlassCard(
+        padding: EdgeInsets.fromLTRB(selectionMode ? 4 : 14, 4, 4, 4),
+        child: Row(
+          children: [
+            if (selectionMode)
+              Checkbox(value: selected, onChanged: (_) => onToggle())
+            else
+              Icon(Icons.folder_rounded, color: scheme.primary),
+            const SizedBox(width: 12),
+            Expanded(
+              child: SizedBox(
+                height: 44,
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    name,
+                    style: const TextStyle(fontWeight: FontWeight.w500),
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
               ),
             ),
-          ),
-          PopupMenuButton<String>(
-            tooltip: '更多',
-            icon: const Icon(Icons.more_vert, size: 20),
-            onSelected: (value) {
-              if (value == 'rename') {
-                onRename();
-              } else if (value == 'download') {
-                onDownload();
-              }
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(
-                value: 'download',
-                child: Row(
-                  children: [
-                    Icon(Icons.download, size: 20),
-                    SizedBox(width: 12),
-                    Text('下载整个目录'),
-                  ],
-                ),
+            // 多选态隐藏菜单：此时整行都是勾选目标，避免误触。
+            if (!selectionMode)
+              PopupMenuButton<String>(
+                tooltip: '更多',
+                icon: const Icon(Icons.more_vert, size: 20),
+                onSelected: (value) {
+                  switch (value) {
+                    case 'download':
+                      onDownload();
+                    case 'rename':
+                      onRename();
+                    case 'delete':
+                      onDelete();
+                  }
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(
+                    value: 'download',
+                    child: Row(
+                      children: [
+                        Icon(Icons.download, size: 20),
+                        SizedBox(width: 12),
+                        Text('下载整个目录'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'rename',
+                    child: Row(
+                      children: [
+                        Icon(Icons.drive_file_rename_outline, size: 20),
+                        SizedBox(width: 12),
+                        Text('重命名 / 移动'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Row(
+                      children: [
+                        Icon(Icons.delete_outline, size: 20),
+                        SizedBox(width: 12),
+                        Text('删除文件夹'),
+                      ],
+                    ),
+                  ),
+                ],
               ),
-              PopupMenuItem(
-                value: 'rename',
-                child: Row(
-                  children: [
-                    Icon(Icons.drive_file_rename_outline, size: 20),
-                    SizedBox(width: 12),
-                    Text('重命名 / 移动'),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

@@ -14,7 +14,7 @@ use netdisk_core::{
 };
 
 fn usage() -> String {
-    "usage: netdisk-cli <ping|list|put <local> <remote>|get <remote> <local>|delete <remote>|rename <from> <to>|copy <from> <to>|mkdir <path>>"
+    "usage: netdisk-cli <ping|list|put <local> <remote>|get <remote> <local>|delete <remote>|rename <from> <to>|copy <from> <to>|mkdir <path>|rmdir <path>>"
         .to_string()
 }
 
@@ -220,6 +220,20 @@ async fn run_command(conn: Connection, cmd: &[String]) -> Result<()> {
             let r: Response = read_frame(&mut recv).await?;
             match r {
                 Response::DirCreated { .. } => println!("mkdir {path}"),
+                Response::Error(e) => bail!("server: {e}"),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+
+        "rmdir" => {
+            if cmd.len() != 2 {
+                bail!("{}", usage());
+            }
+            let path = cmd[1].clone();
+            write_frame(&mut send, &Request::RemoveDir { path: path.clone() }).await?;
+            let r: Response = read_frame(&mut recv).await?;
+            match r {
+                Response::DirRemoved { .. } => println!("rmdir {path}"),
                 Response::Error(e) => bail!("server: {e}"),
                 other => bail!("unexpected response: {other:?}"),
             }

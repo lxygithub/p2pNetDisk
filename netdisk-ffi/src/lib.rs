@@ -302,6 +302,12 @@ fn mkdir_inner(h: *mut Handle, path: *const c_char) -> Result<String> {
     rpc_block(h, Request::Mkdir { path })
 }
 
+fn rmdir_inner(h: *mut Handle, path: *const c_char) -> Result<String> {
+    let h = handle_ref(h)?;
+    let path = unsafe { take_str(path, "path")? };
+    rpc_block(h, Request::RemoveDir { path })
+}
+
 fn rename_inner(h: *mut Handle, from: *const c_char, to: *const c_char) -> Result<String> {
     let h = handle_ref(h)?;
     let from = unsafe { take_str(from, "from")? };
@@ -529,6 +535,12 @@ pub extern "C" fn netdisk_mkdir(h: *mut Handle, path: *const c_char) -> *mut c_c
     finish(h, mkdir_inner(h, path))
 }
 
+/// 删除空目录（里面的文件要先用 `netdisk_delete` 移入回收站）。
+#[no_mangle]
+pub extern "C" fn netdisk_rmdir(h: *mut Handle, path: *const c_char) -> *mut c_char {
+    finish(h, rmdir_inner(h, path))
+}
+
 /// 删除文件（移入服务端回收站，不是硬删）。
 #[no_mangle]
 pub extern "C" fn netdisk_delete(h: *mut Handle, path: *const c_char) -> *mut c_char {
@@ -614,7 +626,7 @@ pub unsafe extern "C" fn netdisk_string_free(p: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn netdisk_ffi_version() -> *mut c_char {
     to_cstring(format!(
-        "netdisk-ffi {} (relay-modes: n0,custom; proto: {}; timeouts: rpc=25s,stall=25s)",
+        "netdisk-ffi {} (relay-modes: n0,custom; proto: {}; timeouts: rpc=25s,stall=25s; ops: rmdir)",
         env!("CARGO_PKG_VERSION"),
         String::from_utf8_lossy(netdisk_core::ALPN)
     ))

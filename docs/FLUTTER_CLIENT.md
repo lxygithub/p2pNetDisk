@@ -994,6 +994,63 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 `:app:processDebugMainManifest` 均 `BUILD SUCCESSFUL`（验证 MethodChannel 与
 权限声明可编译）；APK 未构建。
 
+### 4.21 删除文件夹、多选目录、延迟标签配色
+
+**删除文件夹**
+
+服务端 `Delete` 刻意拒绝目录（避免一次误操作把整棵树吞进回收站），所以新增了
+一个独立协议分支：
+
+| 层 | 改动 |
+| --- | --- |
+| `Request` | `RemoveDir { path }` |
+| `Response` | `DirRemoved { path }` |
+| `netdisk-core` | `remove_dir()`：只允许删**可见条目为空**的目录 |
+| `netdiskd` | 新 handler，日志 `rmdir <path>` |
+| `netdisk-ffi` | `netdisk_rmdir(h, path)`，能力标记加 `ops: rmdir` |
+| `netdisk-cli` | `rmdir <path>` 子命令，便于运维与端到端验证 |
+| Flutter | `NetdiskClient.rmdir` → worker `rmdir` → `AppState.deleteMany` |
+
+客户端删一个目录的流程：
+
+1. 从全量列表里用 `entriesUnder()` 取出该目录下所有文件与子目录；
+2. 文件逐个 `Delete`（进回收站，可恢复）；
+3. 目录按路径长度**降序**逐个 `RemoveDir`，保证子目录先空、父目录后删。
+
+`remove_dir` 要求「可见条目为空」是刻意的：目录里还有文件就报错，迫使调用方
+先走回收站，而不是让一次 RPC 静默抹掉整棵树。列表里看不到的隐藏文件
+（`.DS_Store`、`.nomedia`）会被一并清理 —— 否则它们会让目录永远删不掉，
+而用户完全看不到原因。
+
+**多选支持文件夹**
+
+`_DirTile` 现在和文件一样支持长按进入多选：多选态下点击是勾选、显示 Checkbox、
+隐藏 ⋮ 菜单（避免误触）；「全选」也包含目录。批量删除会把目录展开成
+「其中的文件 + 空目录」走上面那条链路；批量下载保持目录结构。
+
+**延迟标签配色**
+
+`PathChip` 增加 `latencyMs`，背景与文字按 RTT 分三档（`AppState.pathLatencyMs`
+由 `_updatePath()` 从 `paths` 描述里的 `rtt=NNms` 解析）：
+
+| RTT | 颜色 | 含义 |
+| --- | --- | --- |
+| ≤ 60ms | 绿 | 直连的典型区间 |
+| ≤ 160ms | 橘 | 可用，但列表/预览手感开始变差 |
+| > 160ms | 红 | 多为中继或链路质量差 |
+| 未知 | 原配色 | 旧库 / 还没探测到 |
+
+掉线、重连、worker 中毒时 `pathLatencyMs` 与 `pathSummary` 一起清空，不会留下
+过期的颜色。
+
+**验证**：`cargo test -p netdisk-core --lib` 11 passed（新增 `remove_dir` 用例）、
+`cargo check --workspace` 通过；`flutter analyze` 无问题、`flutter test` 34 passed；
+服务器上 `netdisk-cli mkdir/rmdir` 端到端验证：空目录删除成功、非空目录返回
+`directory not empty`。
+
+⚠️ 改了 Rust 必须重编 `.so` 并重启 `netdiskd`，两边协议要一起升级；旧 `.so`
+没有 `netdisk_rmdir` 时会提示「动态库缺少 netdisk_rmdir」。
+
 ## 5. 平台落地（待工具链）
 **Windows 桌面**（本机缺 VS 2022）：
 

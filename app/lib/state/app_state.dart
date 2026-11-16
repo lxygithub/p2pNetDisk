@@ -145,6 +145,9 @@ class AppState extends ChangeNotifier {
   /// 「直连 · 8 ms」/「中继 · 1.2 s」，未连接或旧库不支持时为 null。
   String? pathSummary;
 
+  /// 当前链路 RTT（毫秒），用于给徽标上色；null 表示未知（旧库 / 未连接）。
+  int? pathLatencyMs;
+
   /// 最近一次**列表 RPC** 是否成功。与 QUIC 路径观测分开：
   /// 「已连接 / 直连」只说明建过连接，不等于服务端还能响应请求。
   /// 只有它为真时才显示 [pathSummary]，避免半死连接留下误导性的「直连」。
@@ -340,6 +343,7 @@ class AppState extends ChangeNotifier {
     // 每次重连都清掉旧的路径摘要：「直连」只是上一次连接的本地路径观测，
     // 留着会让人误以为当前链路仍然可用。
     pathSummary = null;
+    pathLatencyMs = null;
     rpcHealthy = false;
     busy = true;
     status = rebuilt ? '正在重建后台线程…' : '正在启动后台线程…';
@@ -491,6 +495,7 @@ class AppState extends ChangeNotifier {
       if (_worker.isStuck) {
         connected = false;
         pathSummary = null;
+        pathLatencyMs = null;
         if (_running == 0) {
           status = '后台线程无响应，正在重建并重新连接…';
           unawaited(_recoverWorker());
@@ -578,12 +583,14 @@ class AppState extends ChangeNotifier {
     pathSummary = m == null
         ? (info.direct ? '直连' : '中继')
         : '${m.group(1) == 'direct' ? '直连' : '中继'} · ${m.group(3)} ms';
+    pathLatencyMs = m == null ? null : int.tryParse(m.group(3) ?? '');
     notifyListeners();
   }
 
   void _clearPathSummary() {
-    if (pathSummary == null) return;
+    if (pathSummary == null && pathLatencyMs == null) return;
     pathSummary = null;
+    pathLatencyMs = null;
     notifyListeners();
   }
 
@@ -1171,28 +1178,71 @@ class AppState extends ChangeNotifier {
     return d.endsWith('/') ? d : '$d/';
   }
 
-  /// 批量删除。服务端只有单个 Delete，这里串行调用，最后统一刷新一次，
-  /// 避免每删一个都重拉整个列表。
+  /// 批量删除。路径可以是文件，也可以是目录。
+  ///
+  /// 目录的处理是「先把里面的文件逐个移入回收站，再自底向上删空目录」——
+  /// 服务端刻意不允许 `Delete` 直接删目录，避免一次误操作把整棵树吞掉。
   Future<void> deleteMany(List<String> paths) async {
     if (paths.isEmpty) return;
+
+    final filePaths = <String>{};
+    final dirPaths = <String>{};
+    for (final raw in paths) {
+      final isDir = raw.endsWith('/') || files.any((e) => e.path == raw && e.isDir);
+      if (!isDir) {
+        filePaths.add(raw);
+        continue;
+      }
+      final normalized = raw.endsWith('/') ? raw : '$raw/';
+      // 目录自身与子孙目录都要删；里面的文件全部进回收站。
+      for (final e in entriesUnder(files, normalized)) {
+        if (e.isDir) {
+          dirPaths.add(e.path);
+        } else {
+          filePaths.add(e.path);
+        }
+      }
+      dirPaths.add(normalized.substring(0, normalized.length - 1));
+    }
+
+    if (filePaths.isEmpty && dirPaths.isEmpty) return;
+
     busy = true;
-    status = '正在删除 ${paths.length} 个文件…';
+    status =
+        '正在删除 ${filePaths.length} 个文件'
+        '${dirPaths.isEmpty ? '' : '、${dirPaths.length} 个文件夹'}…';
     notifyListeners();
 
-    var ok = 0;
+    var okFiles = 0;
     final failures = <String>[];
-    for (final path in paths) {
+    for (final path in filePaths) {
       try {
         await _worker.delete(path);
-        ok++;
+        okFiles++;
       } catch (e) {
         failures.add('${p.basename(path)}（$e）');
       }
     }
 
+    // 深的目录先删，父目录才会变空。
+    final ordered = dirPaths.toList()..sort((a, b) => b.length.compareTo(a.length));
+    var okDirs = 0;
+    for (final dir in ordered) {
+      try {
+        await _worker.rmdir(dir);
+        okDirs++;
+      } catch (e) {
+        failures.add('${p.basename(dir)}/（$e）');
+      }
+    }
+
+    final parts = <String>[
+      if (okFiles > 0) '$okFiles 个文件',
+      if (okDirs > 0) '$okDirs 个文件夹',
+    ];
     status = failures.isEmpty
-        ? '已删除 $ok 个文件'
-        : '删除完成 $ok 个，失败 ${failures.length} 个：${failures.first}';
+        ? '已删除${parts.isEmpty ? '' : ' ${parts.join('、')}'}'
+        : '删除完成 ${parts.join('、')}，失败 ${failures.length} 项：${failures.first}';
     await refresh(silent: true);
     busy = false;
     notifyListeners();

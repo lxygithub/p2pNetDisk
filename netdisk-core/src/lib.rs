@@ -67,6 +67,11 @@ pub enum Request {
     Copy { from: String, to: String },
     /// 新建目录（含多级，父目录自动创建）。
     Mkdir { path: String },
+    /// 删除**空目录**（里面的文件必须先用 `Delete` 移入回收站）。
+    ///
+    /// 不复用 `Delete`：那个接口刻意拒绝目录，避免一次误操作整棵树进回收站。
+    /// 客户端负责先删文件再自底向上删空目录，这里只做最后一步。
+    RemoveDir { path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +91,8 @@ pub enum Response {
     Renamed { from: String, to: String },
     Copied { from: String, to: String },
     DirCreated { path: String },
+    /// 空目录已删除。
+    DirRemoved { path: String },
     Error(String),
 }
 
@@ -655,6 +662,47 @@ pub fn make_dir(root: &Path, rel: &str) -> Result<()> {
     Ok(())
 }
 
+/// 删除一个目录。
+///
+/// 只允许删**可见条目为空**的目录：目录里还有文件/子目录就报错，迫使调用方先
+/// 把文件逐个 `move_to_trash`。这样「删除文件夹」永远是「里面的文件进回收站、
+/// 空壳删掉」，不会出现整棵树被静默抹掉的情况。
+///
+/// `list_entries` 不返回隐藏项，所以隐藏文件（`.DS_Store` / `.nomedia`）会被
+/// 一并清理 —— 否则它们会让目录永远删不掉，而用户根本看不到原因。
+pub fn remove_dir(root: &Path, rel: &str) -> Result<()> {
+    let dir = safe_path(root, rel)?;
+    let meta = std::fs::symlink_metadata(&dir).with_context(|| format!("not found: {rel}"))?;
+    if !meta.is_dir() {
+        bail!("not a directory: {rel}");
+    }
+
+    let mut visible = 0usize;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        visible += 1;
+    }
+    if visible > 0 {
+        bail!("directory not empty: {rel}（还有 {visible} 项，请先删除其中的文件）");
+    }
+
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    std::fs::remove_dir(&dir)?;
+    Ok(())
+}
+
 /// 计算整个文件的 BLAKE3。
 ///
 /// 续传场景专用：服务端只收到剩余部分，`copy_exact_with_hash` 返回的只是片段 hash，
@@ -755,6 +803,30 @@ mod trash_tests {
         );
         // 没有合法时间戳前缀时整体当成原名
         assert_eq!(parse_trash_name("a.txt"), (0, "a.txt".to_string()));
+    }
+
+    #[test]
+    fn remove_dir_requires_visible_entries_empty() {
+        let root = temp_root("rmdir");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/keep.txt"), b"x").unwrap();
+
+        let err = remove_dir(&root, "a").unwrap_err().to_string();
+        assert!(err.contains("not empty"), "{err}");
+
+        // 删掉可见文件后，残留的隐藏文件（列表里看不到）应被一并清理
+        std::fs::remove_file(root.join("a/keep.txt")).unwrap();
+        std::fs::write(root.join("a/.DS_Store"), b"x").unwrap();
+        remove_dir(&root, "a").unwrap();
+        assert!(!root.join("a").exists());
+
+        // 非空子目录同样拒绝
+        std::fs::create_dir_all(root.join("c/d")).unwrap();
+        std::fs::write(root.join("c/d/f"), b"y").unwrap();
+        let err = remove_dir(&root, "c").unwrap_err().to_string();
+        assert!(err.contains("not empty"), "{err}");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

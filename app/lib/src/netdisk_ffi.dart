@@ -67,6 +67,7 @@ class NetdiskClient {
   _Call4Fn? _putProgressFn;
   _Call4Fn? _getProgressFn;
   _Call2Fn? _mkdirFn;
+  _Call2Fn? _rmdirFn;
   _Call3Fn? _copyFn;
 
   Pointer<NetdiskHandle>? _handle;
@@ -121,6 +122,11 @@ class NetdiskClient {
       _mkdirFn = lib.lookupFunction<_Call2Fn, _Call2Fn>('netdisk_mkdir');
     } catch (_) {
       _mkdirFn = null;
+    }
+    try {
+      _rmdirFn = lib.lookupFunction<_Call2Fn, _Call2Fn>('netdisk_rmdir');
+    } catch (_) {
+      _rmdirFn = null;
     }
     try {
       _copyFn = lib.lookupFunction<_Call3Fn, _Call3Fn>('netdisk_copy');
@@ -247,9 +253,20 @@ class NetdiskClient {
     return _decode(res);
   }
 
+  /// 删除空目录（目录里的文件要先用 [delete] 移入回收站）。
+  Map<String, dynamic> rmdir(String path) {
+    final fn = _rmdirFn;
+    if (fn == null) {
+      throw StateError('动态库缺少 netdisk_rmdir：请重新交叉编译 .so');
+    }
+    final a = path.toNativeUtf8();
+    final res = fn(_h, a);
+    malloc.free(a);
+    return _decode(res);
+  }
+
   /// 删除文件（服务端移入回收站，不是硬删）。
-  Map<String, dynamic> delete(String path) {
-    final fn = _deleteFn;
+  Map<String, dynamic> delete(String path) {    final fn = _deleteFn;
     if (fn == null) {
       throw StateError('动态库缺少 netdisk_delete：请重新交叉编译 .so');
     }

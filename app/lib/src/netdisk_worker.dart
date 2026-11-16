@@ -308,6 +308,15 @@ class NetdiskWorker {
     void Function(int attempt)? onAttempt,
   }) => _retry('mkdir', <Object?>[path], maxAttempts: 2, onAttempt: onAttempt);
 
+  /// 删除空目录。目录里的文件需要先逐个 [delete]（进回收站）。
+  ///
+  /// 同样只重试 2 次：第一次可能已删成功但响应丢了，第二次会报 `not found`，
+  /// 那是成功，不必当失败。
+  Future<Map<String, dynamic>> rmdir(
+    String path, {
+    void Function(int attempt)? onAttempt,
+  }) => _retry('rmdir', <Object?>[path], maxAttempts: 2, onAttempt: onAttempt);
+
   /// 只对「链路类」错误重试（超时 / 连接失败）。
   ///
   /// token 被拒、路径不存在、hash 不一致这类确定性错误重试只会浪费时间，
@@ -493,6 +502,8 @@ void _workerMain(List<Object?> boot) {
           payload = _require(client).copy(msg[2] as String, msg[3] as String);
         case 'mkdir':
           payload = _require(client).mkdir(msg[2] as String);
+        case 'rmdir':
+          payload = _require(client).rmdir(msg[2] as String);
         default:
           throw NetdiskWorkerException('unknown op: $op');
       }

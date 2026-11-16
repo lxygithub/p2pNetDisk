@@ -212,7 +212,7 @@ class _SettingsPageState extends State<SettingsPage>
                       ),
                     ),
                     const Spacer(),
-                    PathChip(text: s.pathSummary!),
+                    PathChip(text: s.pathSummary!, latencyMs: s.pathLatencyMs),
                   ],
                 ),
               ],
