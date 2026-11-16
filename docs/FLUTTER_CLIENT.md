@@ -1084,6 +1084,15 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 - 标题栏在 `!connected` 时显示红色「未连接」徽标（`OfflineChip`，点击重连），
   不会再出现「已经断了却还显示直连」。
 - 传输中（`busy`）跳过探活，避免和正在跑的任务抢同一条 RPC 通道。
+- **isolate 起不来时快速失败**：之前 worker 收到 isolate 异常/退出只标记 pending
+  请求失败，`start()` 仍在等 `ready`，于是调用方干等 30s，用户只看到「后台
+  isolate 启动超时」，真实异常被吞掉。现在异常/退出会立刻 `completeError` 到
+  `ready`（能看到具体原因），ready 超时从 30s 降到 15s，`dispose()` 也会让
+  等待中的 `start()` 立刻失败。
+- `start()` 与 `connect()` 都做了并发合并（`_starting` / `_connecting`）：
+  连点「重试」、自动重试和心跳恢复不会 spawn 出多个 isolate 互相覆盖。
+- 连接拆成「单次尝试 + 一次重建重试」：只有错误属于后台线程 / isolate 启动类
+  才自动重建 worker 再试一次，网络类失败不做额外等待。
 - **重连要先真正关掉旧 endpoint**：iroh 的 `Endpoint::close` 是异步的，只 drop
   不等待就 bind 新 endpoint，relay 会短暂看到同 IP 的两条连接，新连接容易被判成
   重复而失败 —— 现象就是「掉线后重连一直失败，杀进程重开才恢复」。现在

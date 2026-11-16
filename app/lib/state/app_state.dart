@@ -351,7 +351,42 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   // 连接
   // ---------------------------------------------------------------------------
 
-  Future<void> connect() async {
+  /// 进行中的连接尝试。用户连点「重试」、自动重试和心跳恢复可能同时触发，
+  /// 并发 connect 会多次 spawn isolate 并互相覆盖，最后谁都连不上。
+  Future<void>? _connecting;
+
+  Future<void> connect() {
+    return _connecting ??= _doConnect().whenComplete(() {
+      _connecting = null;
+    });
+  }
+
+  Future<void> _doConnect() async {
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      final error = await _attemptConnect();
+      if (error == null) return;
+
+      connected = false;
+      // 失败后直接丢掉这个 worker：坏掉的是 isolate 里的 native client，
+      // 留着它，下次重连只会在同一个坏状态上再试一遍。
+      _worker.dispose();
+      _worker = NetdiskWorker();
+
+      // 只有「后台线程 / isolate 起不来」才自动重试一次 —— 这类是进程内瞬态
+      // 故障，重建后通常就好了。网络类失败重试只会让用户多等一轮。
+      if (attempt == 2 || !_isWorkerBootError(error)) {
+        status = '连接失败: $error';
+        notifyListeners();
+        return;
+      }
+      status = '后台线程启动失败，正在重建并重试…';
+      notifyListeners();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    }
+  }
+
+  /// 单次连接尝试。成功返回 null，失败返回错误文本（不直接覆盖 status）。
+  Future<String?> _attemptConnect() async {
     // 先释放旧的 endpoint 句柄。
     //
     // 掉线时 worker 通常没「卡死」，connect() 会复用它，旧的 iroh endpoint
@@ -371,6 +406,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _worker.dispose();
       _worker = NetdiskWorker();
     }
+
     // 每次重连都清掉旧的路径摘要：「直连」只是上一次连接的本地路径观测，
     // 留着会让人误以为当前链路仍然可用。
     pathSummary = null;
@@ -379,14 +415,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     busy = true;
     status = rebuilt ? '正在重建后台线程…' : '正在启动后台线程…';
     notifyListeners();
+
     try {
       await _worker.start(libraryPath: Platform.environment['NETDISK_FFI_DLL']);
 
       // 前置校验：确认打包进 APK 的 .so 与当前 UI 版本匹配。
       final ver = await _worker.version();
       if (ver == null || !ver.contains('n0')) {
-        status = '动态库过旧（不支持 n0）：请重新交叉编译 .so 后再打 APK';
-        return;
+        return '动态库过旧（不支持 n0）：请重新交叉编译 .so 后再打 APK';
       }
 
       status = '正在建立 endpoint…';
@@ -395,19 +431,22 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       connected = true;
       status = '已连接';
       _startHeartbeat();
+      return null;
     } catch (e) {
-      connected = false;
       _stopHeartbeat();
-      status = '连接失败: $e';
-      // 失败后直接丢掉这个 worker：坏掉的是 isolate 里的 native client，
-      // 留着它，下次重连只会在同一个坏状态上再试一遍。重建之后用户再点
-      // 「重新连接」就等价于一次干净启动，不必杀进程。
-      _worker.dispose();
-      _worker = NetdiskWorker();
+      return '$e';
     } finally {
       busy = false;
       notifyListeners();
     }
+  }
+
+  /// 判断错误是否属于「后台线程 / isolate 起不来」这类重建就能修的问题。
+  static bool _isWorkerBootError(String error) {
+    final t = error.toLowerCase();
+    return t.contains('isolate') ||
+        t.contains('worker 已关闭') ||
+        t.contains('启动超时');
   }
 
   // ---------------------------------------------------------------------------

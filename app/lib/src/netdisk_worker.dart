@@ -65,6 +65,13 @@ class NetdiskWorker {
   /// 传大文件时下拉刷新可能让 list 排队超时，贸然重建会把正在跑的传输打断。
   bool _stuck = false;
 
+  /// 进行中的启动。并发调用共享同一次 spawn，避免连点「重试」spawn 出多个
+  /// isolate（它们抢同一个 `_rx`，`_tx` 会被后到的 ready 覆盖）。
+  Future<void>? _starting;
+
+  /// 正在等的 ready。dispose 时要让它立即失败，别让调用方干等超时。
+  Completer<void>? _boot;
+
   bool get isStuck => _stuck;
 
   /// 大文件按体积放宽传输超时。
@@ -89,14 +96,20 @@ class NetdiskWorker {
   ///
   /// [libraryPath] 为 null 时使用平台默认库名（Android 为 `libnetdisk_ffi.so`，
   /// 由 APK 的 `jniLibs` 提供）。
-  Future<void> start({String? libraryPath}) async {
+  Future<void> start({String? libraryPath}) {
     if (_disposed) throw NetdiskWorkerException('worker 已关闭');
     if (_stuck) {
       throw NetdiskWorkerException('后台线程无响应，请重新连接');
     }
-    if (_tx != null) return;
+    if (_tx != null) return Future<void>.value();
+    return _starting ??= _spawn(libraryPath).whenComplete(() {
+      _starting = null;
+    });
+  }
 
+  Future<void> _spawn(String? libraryPath) async {
     final ready = Completer<void>();
+    _boot = ready;
 
     _rx.listen((Object? msg) {
       // worker 启动完毕，回传自己的命令端口。
@@ -131,28 +144,41 @@ class NetdiskWorker {
       }
       // isolate 未捕获异常：[ error, stackTrace ]
       if (msg is List && msg.isNotEmpty && msg[0] is! String) {
-        _failAll('后台 isolate 异常: ${msg[0]}');
+        final err = NetdiskWorkerException('后台 isolate 异常: ${msg[0]}');
+        // 关键：让 start() 立即失败。只 _failAll 的话调用方会干等超时，
+        // 界面上只剩「启动超时」，把真正的异常吞掉。
+        if (!ready.isCompleted) ready.completeError(err);
+        _failAll('$err');
         return;
       }
       // isolate 退出（onExit 发 null）。
       if (msg == null) {
-        _failAll('后台 isolate 已退出');
+        final err = NetdiskWorkerException('后台 isolate 已退出');
+        if (!ready.isCompleted) ready.completeError(err);
+        _failAll('$err');
       }
     });
 
-    _isolate = await Isolate.spawn<List<Object?>>(
-      _workerMain,
-      <Object?>[_rx.sendPort, libraryPath],
-      onError: _rx.sendPort,
-      onExit: _rx.sendPort,
-      debugName: 'netdisk-ffi-worker',
-    );
+    try {
+      _isolate = await Isolate.spawn<List<Object?>>(
+        _workerMain,
+        <Object?>[_rx.sendPort, libraryPath],
+        onError: _rx.sendPort,
+        onExit: _rx.sendPort,
+        debugName: 'netdisk-ffi-worker',
+      );
 
-    // 首次加载 .so 可能稍慢，这里给足时间。
-    await ready.future.timeout(
-      const Duration(seconds: 30),
-      onTimeout: () => throw NetdiskWorkerException('后台 isolate 启动超时'),
-    );
+      // 正常情况几百毫秒就能 ready；迟迟不来说明 isolate 起不来，
+      // 没必要干等 30s 让用户以为卡死。
+      await ready.future.timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => throw NetdiskWorkerException(
+          '后台线程启动超时（isolate 无响应），请重试或重启 App',
+        ),
+      );
+    } finally {
+      if (identical(_boot, ready)) _boot = null;
+    }
   }
 
   /// 读取动态库的能力标记。旧库没有该符号，返回 null。
@@ -393,6 +419,11 @@ class NetdiskWorker {
     _isolate?.kill(priority: Isolate.immediate);
     _isolate = null;
     _tx = null;
+    final boot = _boot;
+    if (boot != null && !boot.isCompleted) {
+      // 让还在 await start() 的调用方立刻失败，不用干等超时。
+      boot.completeError(NetdiskWorkerException('worker 已关闭'));
+    }
     _failAll('worker 已关闭');
     _rx.close();
   }
