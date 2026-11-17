@@ -617,11 +617,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       status = '正在建立 endpoint…';
       notifyListeners();
       await _worker.init(relay, token, serverAddr);
+
+      // `init` 只是把本地 endpoint 建起来（打洞 / relay 注册），**不代表能连到
+      // 服务端**。之前这里直接 `connected = true`，链路其实不通时界面就显示
+      // 「已连接」，下拉刷新又超时 —— 也就是所谓的「虚假已连接」。
+      // 用一次真实 RPC 验证：ping 通才算连上。刚建好 endpoint 时首包可能
+      // 要几秒，给 12s 余量（探活用 8s）。
+      await _worker.ping(timeLimit: const Duration(seconds: 12));
+
       connected = true;
+      rpcHealthy = true;
       status = '已连接';
       _startHeartbeat();
-      // 后台再起一个传输专用 endpoint，让上传/下载能并行；失败不影响主连接。
       unawaited(_syncTransferPool());
+      // 路径摘要只在 RPC 成功后才可信，主动探一次，顶部才有状态可显示。
+      unawaited(_updatePath());
       return null;
     } catch (e) {
       _stopHeartbeat();
@@ -797,11 +807,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     try {
       final list = await _worker.list(
         // 服务端无响应时，旧的 90s ×3 会让人干等四分半还看不到错误。
-        // 首屏 15s、手动 30s，都只重试一次：快速失败后自动重建后台线程，
+        // 首屏 15s、手动 20s，都只重试一次：快速失败后自动重建后台线程，
         // 比在一个卡死的 isolate 后面反复排队有效得多。
         timeLimit: firstLoad
             ? const Duration(seconds: 15)
-            : const Duration(seconds: 30),
+            : const Duration(seconds: 20),
         maxAttempts: 2,
         onAttempt: (n) {
           if (n > 1) {

@@ -1084,6 +1084,11 @@ Dart 的「隔离 + 重建」只是兜底，FFI 调用本身仍可能无限挂�
 - 标题栏在 `!connected` 时显示红色「未连接」徽标（`OfflineChip`，点击重连），
   不会再出现「已经断了却还显示直连」。
 - 传输中（`busy`）跳过探活，避免和正在跑的任务抢同一条 RPC 通道。
+- **连上 ≠ 能用**：`init` 只建本地 endpoint（打洞 / relay 注册），不代表能连到
+  服务端。`connected = true` 现在必须发生在一次真实 `ping` 成功之后，否则会回到
+  「底部已连接、顶部无状态、下拉又超时」的假连接。同时置 `rpcHealthy`，顶部才
+  探得到路径；`connected && pathSummary == null` 时显示灰色「连接中」徽标。
+- 手动刷新超时 30s → 20s，失败反馈更短。
 - **探活超时不再判定 worker 卡死**：`ping` 用 8s 短超时且 `poisonOnTimeout:
   false`，`closeConnection` 同样不 poison。之前从后台切回来、链路还没恢复时
   ping 超时会把 worker 标记成卡死 → 重连只能 dispose isolate 重建，而旧

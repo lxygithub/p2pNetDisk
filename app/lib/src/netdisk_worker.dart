@@ -235,11 +235,12 @@ class NetdiskWorker {
   Future<Map<String, dynamic>> ping({
     void Function(int attempt)? onAttempt,
     int maxAttempts = 1,
+    Duration timeLimit = const Duration(seconds: 8),
   }) => _retry(
     'ping',
     const <Object?>[],
     maxAttempts: maxAttempts,
-    timeLimit: const Duration(seconds: 8),
+    timeLimit: timeLimit,
     poisonOnTimeout: false,
     onAttempt: onAttempt,
   );

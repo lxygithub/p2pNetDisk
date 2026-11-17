@@ -240,7 +240,10 @@ class _FilesPageState extends State<FilesPage> {
         ),
         if (s.connected && s.pathSummary != null)
           PathChip(text: s.pathSummary!, latencyMs: s.pathLatencyMs)
-        else if (!s.connected)
+        else if (s.connected)
+          // 已连上但路径还没探测出来：给个中性状态，别让顶部空着。
+          const ConnectingChip()
+        else
           OfflineChip(onTap: s.busy ? null : s.connect),
         IconButton(
           tooltip: '新建目录',

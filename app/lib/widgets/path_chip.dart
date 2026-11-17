@@ -1,5 +1,46 @@
 import 'package:flutter/material.dart';
 
+/// 「已连接但路径还没探测出来」时的中性徽标。
+///
+/// 没有它的时候，`connected == true && pathSummary == null` 会让顶部**什么都不
+/// 显示**，用户看不出到底在连还是断了。
+class ConnectingChip extends StatelessWidget {
+  const ConnectingChip({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.only(right: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(
+                strokeWidth: 1.6,
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '连接中',
+              style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// 断线徽标：红色「未连接」，点击可重新连接。
 ///
 /// 掉线时必须**立刻**从「直连 · 8 ms」换成这个，否则用户只能靠操作失败才发现。
@@ -110,7 +151,11 @@ class PathChip extends StatelessWidget {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(direct ? Icons.bolt : Icons.cloud_queue, size: 14, color: fg),
+              Icon(
+                direct ? Icons.bolt : Icons.cloud_queue,
+                size: 14,
+                color: fg,
+              ),
               const SizedBox(width: 4),
               Text(
                 text,
