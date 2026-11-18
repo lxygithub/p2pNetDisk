@@ -621,9 +621,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       // `init` 只是把本地 endpoint 建起来（打洞 / relay 注册），**不代表能连到
       // 服务端**。之前这里直接 `connected = true`，链路其实不通时界面就显示
       // 「已连接」，下拉刷新又超时 —— 也就是所谓的「虚假已连接」。
-      // 用一次真实 RPC 验证：ping 通才算连上。刚建好 endpoint 时首包可能
-      // 要几秒，给 12s 余量（探活用 8s）。
-      await _worker.ping(timeLimit: const Duration(seconds: 12));
+      // 用一次真实 RPC 验证：ping 通才算连上。
+      //
+      // 给 30s：打洞失败只能走 relay 时，端到端 RTT 实测能到 2s 以上
+      // （家宽 CGNAT + 海外 relay），QUIC 握手 + 首包 10s 都不够。
+      // 宁可慢一点连上，也不要让「明明能通」的连接被判死。
+      await _worker.ping(timeLimit: const Duration(seconds: 30));
 
       connected = true;
       rpcHealthy = true;
