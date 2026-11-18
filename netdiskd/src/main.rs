@@ -9,10 +9,11 @@ use anyhow::{bail, Result};
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, TransportAddr,
 };
 use netdisk_core::{
-    addr_to_json, build_endpoint_with_secret, copy_exact_with_hash, describe_paths, list_entries,
-    copy_entry, hash_file, load_or_create_secret, make_dir, move_dir_to_trash, move_to_trash,
+    addr_to_json, build_endpoint_with_secret, copy_entry, copy_exact_with_hash, describe_paths,
+    hash_file, list_entries, load_or_create_secret, make_dir, move_dir_to_trash, move_to_trash,
     public_addr, read_frame, rename_entry, safe_path, write_frame, FileEntry, Request, Response,
     ALPN, DEFAULT_RELAY_URL, MAX_FILE_SIZE,
 };
@@ -262,20 +263,12 @@ where
             let meta = match std::fs::metadata(&target) {
                 Ok(m) => m,
                 Err(_) => {
-                    write_frame(
-                        &mut send,
-                        &Response::Error(format!("not found: {path}")),
-                    )
-                    .await?;
+                    write_frame(&mut send, &Response::Error(format!("not found: {path}"))).await?;
                     return Ok(());
                 }
             };
             if !meta.is_file() {
-                write_frame(
-                    &mut send,
-                    &Response::Error(format!("not a file: {path}")),
-                )
-                .await?;
+                write_frame(&mut send, &Response::Error(format!("not a file: {path}"))).await?;
                 return Ok(());
             }
             let size = meta.len();
@@ -339,9 +332,8 @@ where
 async fn main() -> Result<()> {
     let relay_url = env::var("NETDISK_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
     let token = env::var("NETDISK_RELAY_TOKEN").unwrap_or_default();
-    let data_dir = PathBuf::from(
-        env::var("NETDISK_DATA_DIR").unwrap_or_else(|_| "./data".to_string()),
-    );
+    let data_dir =
+        PathBuf::from(env::var("NETDISK_DATA_DIR").unwrap_or_else(|_| "./data".to_string()));
 
     if !netdisk_core::is_n0_relay(&relay_url) && token.is_empty() {
         bail!(
@@ -357,87 +349,152 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| data_dir.join("secret.key"));
     let secret = load_or_create_secret(&secret_path)?;
 
-    let ep = build_endpoint_with_secret(&relay_url, &token, Some(secret)).await?;
-    let addr = public_addr(&ep, &relay_url)?;
-    println!("NETDISK_SERVER_ADDR={}", addr_to_json(&addr)?);
-    let n0 = netdisk_core::is_n0_relay(&relay_url);
-    if n0 {
-        println!("relay   : n0 public (aps1-1 / euc1-1 / use1-1 / usw1-1, auto-selected)");
-        println!("lookup  : dns.iroh.link (publish + resolve)");
-    } else {
-        println!("relay   : {relay_url}");
-    }
-    println!("data_dir: {}", data_dir.display());
-    println!("secret  : {}", secret_path.display());
-    println!("ALPN    : {}", String::from_utf8_lossy(ALPN));
-    println!("ready. copy NETDISK_SERVER_ADDR to the client, then Ctrl-C to stop.");
-    println!("note    : identity persists across restarts; keep the secret file safe (0600).");
+    // 连接层自愈：家宽在运营商 CGNAT 后面，UDP 映射会被静默清理，iroh 的
+    // relay 长连接撑不住（实测 20 小时后 relay 注册失效、客户端完全连不上，
+    // 只能重启进程）。这里把 endpoint 做成可重建的：watch_endpoint 判定需要
+    // 重建时，关掉旧的、建新的、重新挂 Router —— 进程与管理后台都不动。
+    let handler = Handler {
+        root: Arc::new(data_dir.clone()),
+    };
+    let mut ep = build_endpoint_with_secret(&relay_url, &token, Some(secret.clone())).await?;
+    let mut rebuilds: u32 = 0;
 
-    // ---- 管理后台（默认只监听本机；远程走 SSH 隧道）----
-    // `NETDISK_ADMIN_ADDR=off` 可关闭；改成 0.0.0.0:8088 会暴露到局域网，
-    // 请自行加反代与 TLS，不要直接挂公网。
-    let admin_addr =
-        env::var("NETDISK_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
-    let admin_addr = admin_addr.trim().to_string();
-    if !matches!(admin_addr.as_str(), "" | "off" | "none" | "0") {
-        // token 放在 secret 同目录（0700），与用户文件物理隔离。
-        let token_dir = secret_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| data_dir.clone());
-        match netdisk_admin::load_or_create_token(&token_dir) {
-            Ok(token) => {
-                let cfg = netdisk_admin::AdminConfig {
-                    root: data_dir.clone(),
-                    token,
-                    endpoint_id: Some(addr.id.to_string()),
-                    relay: relay_url.clone(),
-                    started_at: std::time::Instant::now(),
-                    bind_addr: "127.0.0.1:0".parse().expect("placeholder addr"),
-                };
-                match netdisk_admin::run(&admin_addr, cfg).await {
-                    Ok(bound) => {
-                        println!("admin   : http://{bound}/");
-                        println!(
-                            "admin   : token = NETDISK_ADMIN_TOKEN 或 {}",
-                            token_dir.join(".admin-token").display()
-                        );
-                        println!(
-                            "admin   : 远程访问 ssh -L {p}:127.0.0.1:{p} <user>@<host>",
-                            p = bound.port()
-                        );
+    loop {
+        let addr = public_addr(&ep, &relay_url)?;
+        println!("NETDISK_SERVER_ADDR={}", addr_to_json(&addr)?);
+        let n0 = netdisk_core::is_n0_relay(&relay_url);
+
+        if rebuilds == 0 {
+            if n0 {
+                println!("relay   : n0 public (pinned: aps1-1, euc1-1; NETDISK_RELAY_NODE=auto to restore auto-pick)");
+                println!("lookup  : dns.iroh.link (publish + resolve)");
+            } else {
+                println!("relay   : {relay_url}");
+            }
+            println!("data_dir: {}", data_dir.display());
+            println!("secret  : {}", secret_path.display());
+            println!("ALPN    : {}", String::from_utf8_lossy(ALPN));
+            println!("ready. copy NETDISK_SERVER_ADDR to the client, then Ctrl-C to stop.");
+            println!(
+                "note    : identity persists across restarts; keep the secret file safe (0600)."
+            );
+
+            // ---- 管理后台（默认只监听本机；远程走 SSH 隧道）----
+            // `NETDISK_ADMIN_ADDR=off` 可关闭；改成 0.0.0.0:8088 会暴露到局域网，
+            // 请自行加反代与 TLS，不要直接挂公网。
+            let admin_addr =
+                env::var("NETDISK_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1:8088".to_string());
+            let admin_addr = admin_addr.trim().to_string();
+            if !matches!(admin_addr.as_str(), "" | "off" | "none" | "0") {
+                // token 放在 secret 同目录（0700），与用户文件物理隔离。
+                let token_dir = secret_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| data_dir.clone());
+                match netdisk_admin::load_or_create_token(&token_dir) {
+                    Ok(token) => {
+                        let cfg = netdisk_admin::AdminConfig {
+                            root: data_dir.clone(),
+                            token,
+                            endpoint_id: Some(addr.id.to_string()),
+                            relay: relay_url.clone(),
+                            started_at: std::time::Instant::now(),
+                            bind_addr: "127.0.0.1:0".parse().expect("placeholder addr"),
+                        };
+                        match netdisk_admin::run(&admin_addr, cfg).await {
+                            Ok(bound) => {
+                                println!("admin   : http://{bound}/");
+                                println!(
+                                    "admin   : token = NETDISK_ADMIN_TOKEN 或 {}",
+                                    token_dir.join(".admin-token").display()
+                                );
+                                println!(
+                                    "admin   : 远程访问 ssh -L {p}:127.0.0.1:{p} <user>@<host>",
+                                    p = bound.port()
+                                );
+                            }
+                            Err(e) => eprintln!("[netdiskd] 管理后台未启动: {e:#}"),
+                        }
                     }
-                    Err(e) => eprintln!("[netdiskd] 管理后台未启动: {e:#}"),
+                    Err(e) => eprintln!("[netdiskd] 管理 token 初始化失败: {e:#}"),
                 }
             }
-            Err(e) => eprintln!("[netdiskd] 管理 token 初始化失败: {e:#}"),
+
+            // n0 模式下 home relay 由 net_report 异步选出，刚 bind 时 addr 里可能还没有 relay。
+            // 稍后再打印一次，便于客户端拿到带 relay 的完整地址。
+            if n0 {
+                let ep_late = ep.clone();
+                let relay_for_log = relay_url.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    if let Ok(late) = public_addr(&ep_late, &relay_for_log) {
+                        if let Ok(json) = addr_to_json(&late) {
+                            println!("NETDISK_SERVER_ADDR_LATE={json}");
+                        }
+                    }
+                });
+            }
+        } else {
+            println!("[netdiskd] endpoint 已重建（第 {rebuilds} 次），新地址见上");
+        }
+
+        let router = Router::builder(ep.clone())
+            .accept(ALPN, handler.clone())
+            .spawn();
+
+        let reason = tokio::select! {
+            _ = tokio::signal::ctrl_c() => None,
+            r = watch_endpoint(ep.clone()) => Some(r),
+        };
+
+        let _ = router.shutdown().await;
+
+        let Some(reason) = reason else {
+            println!("[netdiskd] 收到 Ctrl-C，退出");
+            return Ok(());
+        };
+        eprintln!("[netdiskd] {reason}，重建 endpoint");
+        let _ = ep.close().await;
+        ep = build_endpoint_with_secret(&relay_url, &token, Some(secret.clone())).await?;
+        rebuilds += 1;
+    }
+}
+
+/// 监控 endpoint 健康，返回「为什么要重建」。
+///
+/// 两个判据：
+/// 1. `ep.addr()` 里连续 3 次（15 分钟）没有 relay 地址 —— 到 relay 的连接断了；
+/// 2. 连续运行满 4 小时 —— `ep.addr()` 未必能反映 relay 的真实存活（可能还挂着
+///    缓存的 home relay），加一道硬性周期保底。
+async fn watch_endpoint(ep: Endpoint) -> String {
+    const TICK: std::time::Duration = std::time::Duration::from_secs(300);
+    const FORCE_AFTER: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+    let started = std::time::Instant::now();
+    let mut misses = 0u32;
+
+    loop {
+        tokio::time::sleep(TICK).await;
+
+        if started.elapsed() >= FORCE_AFTER {
+            return format!("已连续运行 {} 小时", FORCE_AFTER.as_secs() / 3600);
+        }
+
+        let has_relay = ep
+            .addr()
+            .addrs
+            .iter()
+            .any(|a| matches!(a, TransportAddr::Relay(_)));
+        if has_relay {
+            misses = 0;
+            continue;
+        }
+        misses += 1;
+        eprintln!("[netdiskd] 地址里没有 relay（{misses}/3）");
+        if misses >= 3 {
+            return "relay 掉线".to_string();
         }
     }
-
-    // n0 模式下 home relay 由 net_report 异步选出，刚 bind 时 addr 里可能还没有 relay。
-    // 稍后再打印一次，便于客户端拿到带 relay 的完整地址。
-    if n0 {
-        let ep_late = ep.clone();
-        let relay_for_log = relay_url.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-            if let Ok(late) = public_addr(&ep_late, &relay_for_log) {
-                if let Ok(json) = addr_to_json(&late) {
-                    println!("NETDISK_SERVER_ADDR_LATE={json}");
-                }
-            }
-        });
-    }
-
-    let router = Router::builder(ep)
-        .accept(ALPN, Handler {
-            root: Arc::new(data_dir),
-        })
-        .spawn();
-
-    tokio::signal::ctrl_c().await?;
-    let _ = router.shutdown().await;
-    Ok(())
 }
 
 #[cfg(test)]

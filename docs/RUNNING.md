@@ -20,6 +20,7 @@
 | 变量 | 用在 | 说明 |
 | --- | --- | --- |
 | `NETDISK_RELAY_URL` | 两端 | 默认 **`n0`**（n0 官方公共 relay）。填 `https://<host>:8443` 则走自建 |
+| `NETDISK_RELAY_NODE` | 两端 | `n0` 模式下钉住的 relay 节点，默认 `aps1-1`（亚太）。写 `auto` 恢复自动择优，也可写 `aps1-1,euc1-1` 给多个候选 |
 | `NETDISK_RELAY_TOKEN` | 两端 | **仅自建 relay 必填**；`n0` 模式下忽略（公共 relay 免费有速率限制） |
 | `NETDISK_DATA_DIR` | 服务端 | 默认 `./data` |
 | `NETDISK_SERVER_ADDR` | 客户端 | 服务端启动时打印的 `EndpointAddr` JSON。**n0 模式只需 `{"id":"<EndpointId>","addrs":[]}`**，地址由 `dns.iroh.link` 解析 |
@@ -35,6 +36,28 @@
 | 适用 | 先用起来 | 要自主可控 / 隐私边界 |
 
 `n0` 模式下 `netdiskd` 启动后会异步打印第二行 `NETDISK_SERVER_ADDR_LATE=`，那是 `net_report` 选好 home relay（实测自动选中 `aps1-1`）之后的完整地址，含公网映射；客户端用第一行就够。
+
+### relay 节点固定与 endpoint 自愈
+
+`n0` 模式仍用 `presets::N0`（保留 `dns.iroh.link` 地址发布/解析），但 relay 不再
+交给 `net_report` 自动择优 —— 实测它经常落到 `usw1-1`（RTT 441–659ms、握手
+1.76–4.32s），而 `aps1-1` 只要 1.29–1.43s，首连和 ping 很容易超时。现在默认
+钉在 `aps1-1`；给多个候选时 iroh 反而选了欧洲，所以默认只给一个。
+
+**endpoint 自愈**：家宽在运营商 CGNAT 后面，UDP 映射会被静默清理，iroh 的
+relay 长连接撑不住 —— 实测 20 小时无客户端访问后注册失效，客户端完全连不上，
+只能重启进程。`netdiskd` 现在用 `watch_endpoint` 监控：
+
+- 每 5 分钟检查 `ep.addr()` 里是否还有 relay 地址；
+- 连续 3 次（15 分钟）缺失 → 重建；
+- 连续运行满 **4 小时**无条件重建（`addr()` 可能保留缓存的 home relay，
+  检测不一定准，周期是保底）。
+
+重建 = 关掉旧 endpoint → 用同一个 secret 建新的（**EndpointId 不变**）→ 重新
+挂 `Router`。进程和管理后台都不重启，传输会断几秒、客户端自动重连。
+重建后会重新打印 `NETDISK_SERVER_ADDR`，地址里的 IP 可能变化，但客户端靠
+`dns.iroh.link` 解析 EndpointId，不用改配置。
+
 
 ## 跑起来
 

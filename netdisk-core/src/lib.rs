@@ -58,41 +58,78 @@ pub enum Request {
         #[serde(default)]
         offset: Option<u64>,
     },
-    Get { path: String },
+    Get {
+        path: String,
+    },
     /// 删除：移入回收站，**不是硬删**（架构 §5.3 约定，30 天后才真正清理）。
-    Delete { path: String },
+    Delete {
+        path: String,
+    },
     /// 重命名 / 移动。`to` 是目标相对路径，可与 `from` 不同目录。
-    Rename { from: String, to: String },
+    Rename {
+        from: String,
+        to: String,
+    },
     /// 复制文件（服务端内部 copy，不经过网络）。
-    Copy { from: String, to: String },
+    Copy {
+        from: String,
+        to: String,
+    },
     /// 新建目录（含多级，父目录自动创建）。
-    Mkdir { path: String },
+    Mkdir {
+        path: String,
+    },
     /// 删除目录：**整棵移入回收站**（保留内部结构，可整体恢复）。
     ///
     /// 不复用 `Delete`：那个接口只处理文件。目录单独走一条命令，语义是
     /// 「整个文件夹进回收站」，而不是把文件逐个散落进去、丢掉原目录结构。
-    RemoveDir { path: String },
+    RemoveDir {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Pong,
-    Entries { entries: Vec<FileEntry> },
+    Entries {
+        entries: Vec<FileEntry>,
+    },
     /// 服务端已准备好接收 `Put` 的裸数据流，并从 `offset` 开始。
     ///
     /// 断点续传的关键：服务端发现 `.part` 已有 N 字节时返回 `offset = N`，
     /// 客户端只需补发剩余部分，不必重传。
-    Ready { offset: u64 },
+    Ready {
+        offset: u64,
+    },
     /// `Get` 的响应头，随后紧跟 `size` 字节裸数据。
-    File { size: u64 },
-    Stored { path: String, size: u64, hash: String },
+    File {
+        size: u64,
+    },
+    Stored {
+        path: String,
+        size: u64,
+        hash: String,
+    },
     /// 删除成功。`trash` 是回收站内的相对路径，保留以便将来实现恢复。
-    Deleted { path: String, trash: String },
-    Renamed { from: String, to: String },
-    Copied { from: String, to: String },
-    DirCreated { path: String },
+    Deleted {
+        path: String,
+        trash: String,
+    },
+    Renamed {
+        from: String,
+        to: String,
+    },
+    Copied {
+        from: String,
+        to: String,
+    },
+    DirCreated {
+        path: String,
+    },
     /// 空目录已删除。
-    DirRemoved { path: String },
+    DirRemoved {
+        path: String,
+    },
     Error(String),
 }
 
@@ -167,9 +204,9 @@ pub async fn read_put_ready<R>(r: &mut R) -> Result<u64>
 where
     R: AsyncRead + Unpin,
 {
-    let v: serde_json::Value = read_frame(r).await.context(
-        "服务端未响应 Put（协议版本不匹配？请确认 netdiskd 与客户端已同步升级）",
-    )?;
+    let v: serde_json::Value = read_frame(r)
+        .await
+        .context("服务端未响应 Put（协议版本不匹配？请确认 netdiskd 与客户端已同步升级）")?;
     parse_ready_value(&v)
 }
 
@@ -220,7 +257,10 @@ where
         remaining -= n as u64;
         if let Some(p) = progress {
             // 续传时进度要从已有字节数起算，否则进度条会从 0 重新跳到一半。
-            p.store(base + (size - remaining), std::sync::atomic::Ordering::Relaxed);
+            p.store(
+                base + (size - remaining),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
     w.flush().await?;
@@ -267,6 +307,49 @@ pub async fn build_endpoint(relay_url: &str, token: &str) -> Result<Endpoint> {
     build_endpoint_with_secret(relay_url, token, None).await
 }
 
+/// n0 模式默认钉住的 relay 节点（主 + 备）。
+///
+/// n0 preset 会在 4 个公共节点里自动择优，但实测经常落到美西
+/// （RTT 441–659ms、握手 1.76–4.32s），而亚太节点 RTT 48ms、握手 1.29–1.43s
+/// —— 差一个数量级，首连和 ping 很容易超时。
+///
+/// `NETDISK_RELAY_NODE` 可覆盖：
+/// - `auto` / 空 → 不钉，回到 n0 自动择优
+/// - `aps1-1` 或完整 URL → 单个节点
+/// - 逗号分隔 → 多个候选（iroh 自行择优，主节点挂了可用备用）
+fn pinned_n0_relay_map() -> Option<RelayMap> {
+    // 只给亚太一个候选：给多个时 iroh 会自己择优，实测它常选欧洲（RTT 539ms），
+    // 反而比亚太慢十倍。真要兜底可以用 NETDISK_RELAY_NODE=aps1-1,euc1-1。
+    const DEFAULT_NODES: &str = "aps1-1";
+
+    let raw = std::env::var("NETDISK_RELAY_NODE").unwrap_or_else(|_| DEFAULT_NODES.to_string());
+    let raw = raw.trim().to_string();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+
+    let mut cfgs = Vec::new();
+    for part in raw.split(',') {
+        let v = part.trim();
+        if v.is_empty() {
+            continue;
+        }
+        let url = if v.starts_with("http") {
+            v.to_string()
+        } else {
+            format!("https://{v}.relay.n0.iroh.link./")
+        };
+        if let Ok(u) = url.parse::<RelayUrl>() {
+            cfgs.push(RelayConfig::from(u));
+        }
+    }
+    if cfgs.is_empty() {
+        None
+    } else {
+        Some(RelayMap::from_iter(cfgs))
+    }
+}
+
 /// 与 `build_endpoint` 相同，但可注入持久化的 `SecretKey`。
 /// 服务端常驻必须用这个，否则每次重启 `EndpointId` 变化、所有客户端都要重新配对。
 pub async fn build_endpoint_with_secret(
@@ -279,8 +362,13 @@ pub async fn build_endpoint_with_secret(
 
     let mut builder = if is_n0_relay(relay_url) {
         // presets::N0 自带 crypto provider、官方 relay 与 dns.iroh.link 地址发现，
-        // 这里只需追加 ALPN 与（可选的）持久化密钥。
-        Endpoint::builder(presets::N0)
+        // 这里只把「自动择优的 relay」换成固定节点：地址发现照旧，客户端仍然
+        // 只需 EndpointId 就能找到对端。
+        let mut b = Endpoint::builder(presets::N0);
+        if let Some(map) = pinned_n0_relay_map() {
+            b = b.relay_mode(RelayMode::Custom(map));
+        }
+        b
     } else {
         let map = relay_map(relay_url, token)?;
         Endpoint::builder(presets::Empty)
@@ -385,10 +473,7 @@ pub fn describe_paths(conn: &Connection) -> String {
             other => format!("{other:?}"),
         };
         let mark = if p.is_selected() { "*" } else { " " };
-        parts.push(format!(
-            "{kind}{mark} {addr} rtt={}ms",
-            p.rtt().as_millis()
-        ));
+        parts.push(format!("{kind}{mark} {addr} rtt={}ms", p.rtt().as_millis()));
     }
     parts.join(" | ")
 }
@@ -418,10 +503,7 @@ pub fn safe_path(root: &Path, raw: &str) -> Result<PathBuf> {
             Component::Normal(s) => {
                 let name = s.to_string_lossy();
                 // 内部状态文件绝不能通过网盘协议被读取（身份私钥、临时文件等）。
-                if name.starts_with('.')
-                    || name == "secret.key"
-                    || name.ends_with(".netdisk-tmp")
-                {
+                if name.starts_with('.') || name == "secret.key" || name.ends_with(".netdisk-tmp") {
                     bail!("internal or hidden file not accessible: {raw}");
                 }
                 out.push(s);
@@ -448,7 +530,9 @@ pub fn move_to_trash(root: &Path, rel: &str) -> Result<String> {
     let src = safe_path(root, rel)?;
     let meta = std::fs::symlink_metadata(&src).with_context(|| format!("not found: {rel}"))?;
     if meta.is_dir() {
-        bail!("refusing to delete a directory (use RemoveDir, or delete its files one by one): {rel}");
+        bail!(
+            "refusing to delete a directory (use RemoveDir, or delete its files one by one): {rel}"
+        );
     }
     trash_rename(&root.join(TRASH_DIR), &src)
 }
@@ -598,8 +682,8 @@ fn trash_entry_path(root: &Path, name: &str) -> Result<std::path::PathBuf> {
         bail!("invalid trash entry: {name}");
     }
     let src = root.join(TRASH_DIR).join(name);
-    let meta = std::fs::symlink_metadata(&src)
-        .with_context(|| format!("not found in trash: {name}"))?;
+    let meta =
+        std::fs::symlink_metadata(&src).with_context(|| format!("not found in trash: {name}"))?;
     if !meta.is_file() && !meta.is_dir() {
         bail!("unsupported trash entry: {name}");
     }
@@ -770,8 +854,8 @@ pub fn remove_dir(root: &Path, rel: &str) -> Result<()> {
 /// 代价是一次顺序读盘，换取「拼接错误能被发现」。
 pub fn hash_file(path: &Path) -> Result<String> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -912,10 +996,7 @@ mod trash_tests {
 
         restore_from_trash(&root, &items[0].name, "album").unwrap();
         assert_eq!(std::fs::read(root.join("album/a.jpg")).unwrap(), b"aaa");
-        assert_eq!(
-            std::fs::read(root.join("album/sub/b.jpg")).unwrap(),
-            b"bb"
-        );
+        assert_eq!(std::fs::read(root.join("album/sub/b.jpg")).unwrap(), b"bb");
         assert!(list_trash(&root).unwrap().is_empty());
 
         std::fs::remove_dir_all(&root).ok();
@@ -1007,11 +1088,14 @@ mod protocol_compat_tests {
 
     #[test]
     fn old_put_without_offset_is_accepted() {
-        let r: Request =
-            serde_json::from_str(r#"{"Put":{"path":"a.bin","size":10}}"#).unwrap();
+        let r: Request = serde_json::from_str(r#"{"Put":{"path":"a.bin","size":10}}"#).unwrap();
         assert!(matches!(
             r,
-            Request::Put { offset: None, size: 10, .. }
+            Request::Put {
+                offset: None,
+                size: 10,
+                ..
+            }
         ));
     }
 
@@ -1019,7 +1103,13 @@ mod protocol_compat_tests {
     fn new_put_with_offset_is_accepted() {
         let r: Request =
             serde_json::from_str(r#"{"Put":{"path":"a.bin","size":10,"offset":5}}"#).unwrap();
-        assert!(matches!(r, Request::Put { offset: Some(5), .. }));
+        assert!(matches!(
+            r,
+            Request::Put {
+                offset: Some(5),
+                ..
+            }
+        ));
     }
 
     #[test]
