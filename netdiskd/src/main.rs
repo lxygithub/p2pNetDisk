@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint, TransportAddr,
+    Endpoint,
 };
 use netdisk_core::{
     addr_to_json, build_endpoint_with_secret, copy_entry, copy_exact_with_hash, describe_paths,
@@ -462,13 +462,15 @@ async fn main() -> Result<()> {
 
 /// 监控 endpoint 健康，返回「为什么要重建」。
 ///
-/// 两个判据：
-/// 1. `ep.addr()` 里连续 3 次（15 分钟）没有 relay 地址 —— 到 relay 的连接断了；
-/// 2. 连续运行满 4 小时 —— `ep.addr()` 未必能反映 relay 的真实存活（可能还挂着
-///    缓存的 home relay），加一道硬性周期保底。
+/// 判据用 `home_relay_status()` 的 `is_connected()` —— 这是 relay 连接的**真实**
+/// 状态。之前用 `ep.addr()` 里有没有 relay 地址判断是错的：地址是缓存的，
+/// 连接早断了它还在，导致自愈从未触发（实测 3 小时没一条重建日志）。
+///
+/// 另外每 3 小时无条件重建一次兜底：即使 relay 显示 connected，NAT 映射也可能
+/// 已经失效、客户端连不进来（状态 API 看不到这一层）。
 async fn watch_endpoint(ep: Endpoint) -> String {
-    const TICK: std::time::Duration = std::time::Duration::from_secs(300);
-    const FORCE_AFTER: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+    const TICK: std::time::Duration = std::time::Duration::from_secs(120);
+    const FORCE_AFTER: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
 
     let started = std::time::Instant::now();
     let mut misses = 0u32;
@@ -480,17 +482,26 @@ async fn watch_endpoint(ep: Endpoint) -> String {
             return format!("已连续运行 {} 小时", FORCE_AFTER.as_secs() / 3600);
         }
 
-        let has_relay = ep
-            .addr()
-            .addrs
-            .iter()
-            .any(|a| matches!(a, TransportAddr::Relay(_)));
-        if has_relay {
+        // 取所有 home relay 的状态；至少有一个真正连上才算健康。
+        // 用 watcher 的 `get()` 拿当前快照（不是等变化）。
+        use iroh::Watcher;
+        let relay_statuses = ep.home_relay_status().get();
+        let connected = relay_statuses.iter().any(|s| s.is_connected());
+        if connected {
+            if misses > 0 {
+                println!("[netdiskd] relay 连接已恢复");
+            }
             misses = 0;
             continue;
         }
+
         misses += 1;
-        eprintln!("[netdiskd] 地址里没有 relay（{misses}/3）");
+        let first_err = relay_statuses
+            .first()
+            .and_then(|s| s.last_error())
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "无".to_string());
+        eprintln!("[netdiskd] relay 未连接（{misses}/3）: {first_err}");
         if misses >= 3 {
             return "relay 掉线".to_string();
         }
