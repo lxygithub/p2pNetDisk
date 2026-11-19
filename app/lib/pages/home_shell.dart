@@ -7,6 +7,7 @@ import '../state/app_state.dart';
 import 'files_page.dart';
 import 'settings_page.dart';
 import 'transfers_page.dart';
+import '../widgets/app_icons.dart';
 
 /// 底部导航外壳：文件 / 传输 / 设置。
 ///
@@ -38,28 +39,28 @@ class _HomeShellState extends State<HomeShell> {
             onDestinationSelected: (i) => setState(() => _index = i),
             destinations: [
               const NavigationDestination(
-                icon: Icon(Icons.folder_outlined),
-                selectedIcon: Icon(Icons.folder),
+                icon: AppIconView(AppIcons.folder_outlined, stroke: 1.5),
+                selectedIcon: AppIconView(AppIcons.folder, stroke: 2.1),
                 label: '文件',
               ),
               NavigationDestination(
                 icon: active > 0
                     ? Badge(
                         label: Text('$active'),
-                        child: const Icon(Icons.swap_vert),
+                        child: const AppIconView(AppIcons.swap_vert),
                       )
-                    : const Icon(Icons.swap_vert),
+                    : const AppIconView(AppIcons.swap_vert),
                 selectedIcon: active > 0
                     ? Badge(
                         label: Text('$active'),
-                        child: const Icon(Icons.swap_vert),
+                        child: const AppIconView(AppIcons.swap_vert),
                       )
-                    : const Icon(Icons.swap_vert),
+                    : const AppIconView(AppIcons.swap_vert),
                 label: '传输',
               ),
               const NavigationDestination(
-                icon: Icon(Icons.settings_outlined),
-                selectedIcon: Icon(Icons.settings),
+                icon: AppIconView(AppIcons.settings_outlined),
+                selectedIcon: AppIconView(AppIcons.settings),
                 label: '设置',
               ),
             ],

@@ -7,6 +7,7 @@ import '../services/endpoint_addr.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/glass.dart';
+import '../widgets/app_icons.dart';
 
 /// 连接参数编辑页。
 ///
@@ -105,9 +106,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('恢复默认连接参数？'),
-        content: const Text(
-          '将清除本机保存的服务端地址与 Relay 设置，回到编译期注入的默认值。',
-        ),
+        content: const Text('将清除本机保存的服务端地址与 Relay 设置，回到编译期注入的默认值。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -160,8 +159,8 @@ class _ConnectionPageState extends State<ConnectionPage> {
               Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(
-                    Icons.visibility_off_outlined,
+                  AppIconView(
+                    AppIcons.visibility_off_outlined,
                     size: 18,
                     color: scheme.primary,
                   ),
@@ -193,8 +192,8 @@ class _ConnectionPageState extends State<ConnectionPage> {
                   labelText: 'EndpointId',
                   helperText: '纯 ID，不带引号 / 花括号；n0 模式由 dns.iroh.link 解析',
                   suffixIcon: IconButton(
-                    icon: Icon(
-                      _showId ? Icons.visibility_off : Icons.visibility,
+                    icon: AppIconView(
+                      _showId ? AppIcons.visibility_off : AppIcons.visibility,
                       size: 20,
                     ),
                     tooltip: _showId ? '隐藏' : '显示',
@@ -214,8 +213,10 @@ class _ConnectionPageState extends State<ConnectionPage> {
                   helperText:
                       'JSON 数组：n0 填 []；自建 relay 填 [{"Relay":"https://host:8443/"}]',
                   suffixIcon: IconButton(
-                    icon: Icon(
-                      _showAddrs ? Icons.visibility_off : Icons.visibility,
+                    icon: AppIconView(
+                      _showAddrs
+                          ? AppIcons.visibility_off
+                          : AppIcons.visibility,
                       size: 20,
                     ),
                     tooltip: _showAddrs ? '隐藏' : '显示',
@@ -253,8 +254,10 @@ class _ConnectionPageState extends State<ConnectionPage> {
                   labelText: 'Relay Token',
                   helperText: '仅自建 relay 需要；n0 模式留空',
                   suffixIcon: IconButton(
-                    icon: Icon(
-                      _showToken ? Icons.visibility_off : Icons.visibility,
+                    icon: AppIconView(
+                      _showToken
+                          ? AppIcons.visibility_off
+                          : AppIcons.visibility,
                       size: 20,
                     ),
                     tooltip: _showToken ? '隐藏' : '显示',
@@ -276,7 +279,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Icon(Icons.link),
+                  : const AppIconView(AppIcons.link),
               label: const Text('保存并连接'),
             ),
           ),
@@ -284,7 +287,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
             alignment: Alignment.centerRight,
             child: TextButton.icon(
               onPressed: _saving ? null : () => unawaited(_reset()),
-              icon: const Icon(Icons.restore, size: 16),
+              icon: const AppIconView(AppIcons.restore, size: 16),
               label: const Text('恢复默认'),
             ),
           ),

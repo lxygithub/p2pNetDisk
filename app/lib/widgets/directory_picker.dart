@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/path_utils.dart';
 import '../state/app_state.dart';
 import 'text_input_dialog.dart';
+import '../widgets/app_icons.dart';
 
 /// 选择远端目录：逐级浏览 + 新建 + 「选择此目录」。
 ///
@@ -55,9 +56,9 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
 
     final ok = await widget.state.createDirAt(_cwd, trimmed);
     if (!mounted || ok) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(widget.state.status)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(widget.state.status)));
   }
 
   @override
@@ -80,7 +81,10 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
         ),
         TextButton.icon(
           onPressed: _create,
-          icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+          icon: const AppIconView(
+            AppIcons.create_new_folder_outlined,
+            size: 18,
+          ),
           label: const Text('新建'),
         ),
         FilledButton(
@@ -111,7 +115,10 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
                     if (showUp && i == 0) {
                       return ListTile(
                         dense: true,
-                        leading: const Icon(Icons.arrow_upward, size: 20),
+                        leading: const AppIconView(
+                          AppIcons.arrow_upward,
+                          size: 20,
+                        ),
                         title: const Text('上级目录'),
                         onTap: _goUp,
                       );
@@ -119,9 +126,15 @@ class _DirectoryPickerDialogState extends State<_DirectoryPickerDialog> {
                     final name = dirs[showUp ? i - 1 : i];
                     return ListTile(
                       dense: true,
-                      leading: const Icon(Icons.folder_rounded, size: 20),
+                      leading: const AppIconView(
+                        AppIcons.folder_rounded,
+                        size: 20,
+                      ),
                       title: Text(name, overflow: TextOverflow.ellipsis),
-                      trailing: const Icon(Icons.chevron_right, size: 18),
+                      trailing: const AppIconView(
+                        AppIcons.chevron_right,
+                        size: 18,
+                      ),
                       onTap: () => _enter(name),
                     );
                   },

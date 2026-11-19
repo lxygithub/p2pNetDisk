@@ -1,3 +1,4 @@
+import 'app_icons.dart';
 import 'package:flutter/material.dart';
 
 /// 「已连接但路径还没探测出来」时的中性徽标。
@@ -69,7 +70,7 @@ class OfflineChip extends StatelessWidget {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.cloud_off, size: 14, color: fg),
+              AppIconView(AppIcons.cloud_off, size: 14, color: fg),
               const SizedBox(width: 4),
               Text(
                 '未连接',
@@ -151,8 +152,8 @@ class PathChip extends StatelessWidget {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                direct ? Icons.bolt : Icons.cloud_queue,
+              AppIconView(
+                direct ? AppIcons.bolt : AppIcons.cloud_queue,
                 size: 14,
                 color: fg,
               ),

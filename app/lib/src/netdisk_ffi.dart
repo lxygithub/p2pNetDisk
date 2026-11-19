@@ -269,7 +269,8 @@ class NetdiskClient {
   }
 
   /// 删除文件（服务端移入回收站，不是硬删）。
-  Map<String, dynamic> delete(String path) {    final fn = _deleteFn;
+  Map<String, dynamic> delete(String path) {
+    final fn = _deleteFn;
     if (fn == null) {
       throw StateError('动态库缺少 netdisk_delete：请重新交叉编译 .so');
     }

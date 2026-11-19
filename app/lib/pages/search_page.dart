@@ -4,7 +4,9 @@ import 'package:provider/provider.dart';
 import '../services/search_prefs.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/empty_state.dart';
 import '../widgets/highlighted_text.dart';
+import '../widgets/app_icons.dart';
 
 typedef SearchHit = ({String path, bool isDir});
 
@@ -106,7 +108,7 @@ class _SearchPageState extends State<SearchPage> {
           if (_controller.text.isNotEmpty)
             IconButton(
               tooltip: '清空',
-              icon: const Icon(Icons.close),
+              icon: const AppIconView(AppIcons.close),
               onPressed: () {
                 _controller.clear();
                 _run('');
@@ -117,7 +119,11 @@ class _SearchPageState extends State<SearchPage> {
       body: _query.isEmpty
           ? _historyView()
           : results.isEmpty
-          ? const Center(child: Text('没有匹配的文件'))
+          ? const EmptyState(
+              icon: AppIcons.search,
+              title: '没有匹配的文件',
+              subtitle: '换个关键字，或检查拼写',
+            )
           : Column(
               children: [
                 if (search.truncated)
@@ -141,10 +147,10 @@ class _SearchPageState extends State<SearchPage> {
                       final name = _lastSegment(hit.path);
                       return ListTile(
                         contentPadding: EdgeInsets.zero,
-                        leading: Icon(
+                        leading: AppIconView(
                           hit.isDir
-                              ? Icons.folder_rounded
-                              : Icons.description_outlined,
+                              ? AppIcons.folder_rounded
+                              : AppIcons.description_outlined,
                         ),
                         title: HighlightedText(text: name, query: _query),
                         subtitle: Text(
@@ -165,8 +171,10 @@ class _SearchPageState extends State<SearchPage> {
 
   Widget _historyView() {
     if (_history.isEmpty) {
-      return const Center(
-        child: Text('输入关键字开始搜索', style: TextStyle(fontSize: 13)),
+      return const EmptyState(
+        icon: AppIcons.search,
+        title: '搜索整个网盘',
+        subtitle: '输入文件名或目录名，结果会实时显示',
       );
     }
     return ListView(

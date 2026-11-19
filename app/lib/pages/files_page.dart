@@ -10,11 +10,13 @@ import '../state/app_state.dart';
 import '../theme.dart';
 import '../widgets/breadcrumb.dart';
 import '../widgets/directory_picker.dart';
+import '../widgets/empty_state.dart';
 import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
 import '../widgets/text_input_dialog.dart';
 import 'preview_page.dart';
 import 'search_page.dart';
+import '../widgets/app_icons.dart';
 
 /// 条目类型（列表里目录与文件共用）。
 typedef _Entry = ({String name, bool isDir, int size, String path});
@@ -122,7 +124,7 @@ class _FilesPageState extends State<FilesPage> {
   void _openPreview(String path) {
     final images = [
       for (final e in _state.entries)
-        if (!e.isDir && _FileTile._iconFor(e.name) == Icons.image_outlined)
+        if (!e.isDir && _FileTile._iconFor(e.name) == AppIcons.image_outlined)
           e.path,
     ];
     final index = images.indexOf(path);
@@ -222,7 +224,7 @@ class _FilesPageState extends State<FilesPage> {
       floatingActionButton: (!_selectionMode && s.connected)
           ? FloatingActionButton.extended(
               onPressed: s.busy ? null : _showUploadMenu,
-              icon: const Icon(Icons.add),
+              icon: const AppIconView(AppIcons.add),
               label: const Text('上传'),
             )
           : null,
@@ -235,7 +237,7 @@ class _FilesPageState extends State<FilesPage> {
       actions: [
         IconButton(
           tooltip: '搜索',
-          icon: const Icon(Icons.search),
+          icon: const AppIconView(AppIcons.search),
           onPressed: s.busy ? null : _openSearch,
         ),
         if (s.connected && s.pathSummary != null)
@@ -248,12 +250,12 @@ class _FilesPageState extends State<FilesPage> {
         IconButton(
           tooltip: '新建目录',
           onPressed: s.busy || !s.connected ? null : _newDir,
-          icon: const Icon(Icons.create_new_folder_outlined),
+          icon: const AppIconView(AppIcons.create_new_folder_outlined),
         ),
         IconButton(
           tooltip: '刷新',
           onPressed: s.busy || !s.connected ? null : () => s.refresh(),
-          icon: const Icon(Icons.refresh),
+          icon: const AppIconView(AppIcons.refresh),
         ),
       ],
     );
@@ -266,7 +268,7 @@ class _FilesPageState extends State<FilesPage> {
     return AppBar(
       leading: IconButton(
         tooltip: '退出多选',
-        icon: const Icon(Icons.close),
+        icon: const AppIconView(AppIcons.close),
         onPressed: _exitSelection,
       ),
       title: Text('已选 ${_selected.length} 项'),
@@ -274,7 +276,9 @@ class _FilesPageState extends State<FilesPage> {
         IconButton(
           // 全选之后变成「取消全选」：之前只能退出多选再重进，很别扭。
           tooltip: allSelected ? '取消全选' : '全选',
-          icon: Icon(allSelected ? Icons.deselect : Icons.select_all),
+          icon: AppIconView(
+            allSelected ? AppIcons.deselect : AppIcons.select_all,
+          ),
           onPressed: entries.isEmpty
               ? null
               : allSelected
@@ -302,27 +306,27 @@ class _FilesPageState extends State<FilesPage> {
           child: Row(
             children: [
               _SelectionAction(
-                icon: Icons.download,
+                icon: AppIcons.download,
                 label: '下载',
                 // 目录可以整棵下载，所以这里不能只数文件。
                 enabled: (files.isNotEmpty || dirs.isNotEmpty) && online,
                 onTap: () => _batchDownload(entries),
               ),
               _SelectionAction(
-                icon: Icons.copy_outlined,
+                icon: AppIcons.copy_outlined,
                 label: '复制',
                 enabled: files.isNotEmpty && online,
                 onTap: () => _batchCopy(files),
               ),
               _SelectionAction(
-                icon: Icons.drive_file_move_outline,
+                icon: AppIcons.drive_file_move_outline,
                 label: '移动',
                 // rename 对文件和目录都有效。
                 enabled: (files.isNotEmpty || dirs.isNotEmpty) && online,
                 onTap: () => _batchMove(entries),
               ),
               _SelectionAction(
-                icon: Icons.delete_outline,
+                icon: AppIcons.delete_outline,
                 label: '删除',
                 // 目录也能删（里面的文件进回收站，空壳随后移除）。
                 enabled: (files.isNotEmpty || dirs.isNotEmpty) && online,
@@ -471,13 +475,13 @@ class _FilesPageState extends State<FilesPage> {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
-              leading: const Icon(Icons.upload_file),
+              leading: const AppIconView(AppIcons.upload_file),
               title: const Text('上传文件'),
               subtitle: const Text('可一次选多个'),
               onTap: () => Navigator.pop(ctx, 'files'),
             ),
             ListTile(
-              leading: const Icon(Icons.drive_folder_upload),
+              leading: const AppIconView(AppIcons.drive_folder_upload),
               title: const Text('上传文件夹'),
               subtitle: const Text('保持目录结构；隐藏文件会跳过'),
               onTap: () => Navigator.pop(ctx, 'dir'),
@@ -623,7 +627,7 @@ class _SelectionAction extends StatelessWidget {
     required this.onTap,
   });
 
-  final IconData icon;
+  final AppIcon icon;
   final String label;
   final bool enabled;
   final VoidCallback onTap;
@@ -642,7 +646,7 @@ class _SelectionAction extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 20, color: color),
+              AppIconView(icon, size: 20, color: color),
               const SizedBox(height: 2),
               Text(label, style: TextStyle(fontSize: 11, color: color)),
             ],
@@ -703,59 +707,38 @@ class _FileList extends StatelessWidget {
   Widget _content(BuildContext context) {
     // 有缓存快照时即使还没连上，也把列表渲染出来（配合顶部缓存提示条）。
     if (!state.connected && !state.showingCache) {
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
-        children: [
-          const _EmptyState(
-            icon: Icons.cloud_off,
-            title: '未连接',
-            subtitle: '下拉刷新，或点下面的「重试」',
-          ),
-          const SizedBox(height: 16),
-          Center(
-            child: FilledButton.icon(
-              onPressed: state.busy
-                  ? null
-                  : () {
-                      unawaited(state.bootstrap());
-                    },
-              icon: const Icon(Icons.refresh),
-              label: const Text('重试'),
-            ),
-          ),
-        ],
+      return EmptyState(
+        icon: AppIcons.cloud_off,
+        title: '未连接',
+        subtitle: '网络恢复后点下面的按钮，或直接下拉重试',
+        action: FilledButton.icon(
+          onPressed: state.busy
+              ? null
+              : () {
+                  unawaited(state.bootstrap());
+                },
+          icon: const AppIconView(AppIcons.refresh, size: 18),
+          label: const Text('重试'),
+        ),
       );
     }
 
     if (state.files.isEmpty) {
       // 正在拉列表时的占位骨架，别先闪一句「还没有文件」再跳成真实列表。
       if (state.busy && state.connected) return const _SkeletonList();
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
-        children: const [
-          _EmptyState(
-            icon: Icons.cloud_off,
-            title: '还没有文件',
-            subtitle: '点右下角「上传」把文件传上来',
-          ),
-        ],
+      return const EmptyState(
+        icon: AppIcons.cloud_off,
+        title: '还没有文件',
+        subtitle: '点右下角「上传」，把本地文件传到这里',
       );
     }
 
     final entries = state.entries;
     if (entries.isEmpty) {
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
-        children: const [
-          _EmptyState(
-            icon: Icons.folder_open,
-            title: '此目录为空',
-            subtitle: '上传的文件会放到当前目录',
-          ),
-        ],
+      return const EmptyState(
+        icon: AppIcons.folder_open,
+        title: '此目录为空',
+        subtitle: '上传的文件会放到当前目录',
       );
     }
 
@@ -841,7 +824,7 @@ class _DirTile extends StatelessWidget {
             if (selectionMode)
               Checkbox(value: selected, onChanged: (_) => onToggle())
             else
-              Icon(Icons.folder_rounded, color: scheme.primary),
+              AppIconView(AppIcons.folder_rounded, color: scheme.primary),
             const SizedBox(width: 12),
             Expanded(
               child: SizedBox(
@@ -860,7 +843,7 @@ class _DirTile extends StatelessWidget {
             if (!selectionMode)
               PopupMenuButton<String>(
                 tooltip: '更多',
-                icon: const Icon(Icons.more_vert, size: 20),
+                icon: const AppIconView(AppIcons.more_vert, size: 20),
                 onSelected: (value) {
                   switch (value) {
                     case 'download':
@@ -876,7 +859,7 @@ class _DirTile extends StatelessWidget {
                     value: 'download',
                     child: Row(
                       children: [
-                        Icon(Icons.download, size: 20),
+                        AppIconView(AppIcons.download, size: 18),
                         SizedBox(width: 12),
                         Text('下载整个目录'),
                       ],
@@ -886,7 +869,10 @@ class _DirTile extends StatelessWidget {
                     value: 'rename',
                     child: Row(
                       children: [
-                        Icon(Icons.drive_file_rename_outline, size: 20),
+                        AppIconView(
+                          AppIcons.drive_file_rename_outline,
+                          size: 20,
+                        ),
                         SizedBox(width: 12),
                         Text('重命名'),
                       ],
@@ -896,7 +882,7 @@ class _DirTile extends StatelessWidget {
                     value: 'delete',
                     child: Row(
                       children: [
-                        Icon(Icons.delete_outline, size: 20),
+                        AppIconView(AppIcons.delete_outline, size: 18),
                         SizedBox(width: 12),
                         Text('删除文件夹'),
                       ],
@@ -990,7 +976,7 @@ class _FileTile extends StatelessWidget {
               PopupMenuButton<String>(
                 enabled: !busy,
                 tooltip: '更多操作',
-                icon: const Icon(Icons.more_vert, size: 20),
+                icon: const AppIconView(AppIcons.more_vert, size: 20),
                 onSelected: (v) {
                   switch (v) {
                     case 'download':
@@ -1008,7 +994,7 @@ class _FileTile extends StatelessWidget {
                     value: 'download',
                     child: ListTile(
                       dense: true,
-                      leading: Icon(Icons.download),
+                      leading: AppIconView(AppIcons.download),
                       title: Text('下载'),
                     ),
                   ),
@@ -1016,7 +1002,7 @@ class _FileTile extends StatelessWidget {
                     value: 'copy',
                     child: ListTile(
                       dense: true,
-                      leading: Icon(Icons.copy_outlined),
+                      leading: AppIconView(AppIcons.copy_outlined),
                       title: Text('复制'),
                     ),
                   ),
@@ -1024,7 +1010,7 @@ class _FileTile extends StatelessWidget {
                     value: 'rename',
                     child: ListTile(
                       dense: true,
-                      leading: Icon(Icons.drive_file_rename_outline),
+                      leading: AppIconView(AppIcons.drive_file_rename_outline),
                       title: Text('重命名'),
                     ),
                   ),
@@ -1032,7 +1018,7 @@ class _FileTile extends StatelessWidget {
                     value: 'delete',
                     child: ListTile(
                       dense: true,
-                      leading: Icon(Icons.delete_outline),
+                      leading: AppIconView(AppIcons.delete_outline),
                       title: Text('删除'),
                     ),
                   ),
@@ -1044,7 +1030,7 @@ class _FileTile extends StatelessWidget {
     );
   }
 
-  static IconData _iconFor(String name) {
+  static AppIcon _iconFor(String name) {
     final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
     if (const {
       'jpg',
@@ -1055,18 +1041,18 @@ class _FileTile extends StatelessWidget {
       'bmp',
       'heic',
     }.contains(ext)) {
-      return Icons.image_outlined;
+      return AppIcons.image_outlined;
     }
     if (const {'mp4', 'mkv', 'mov', 'avi', 'webm'}.contains(ext)) {
-      return Icons.movie_outlined;
+      return AppIcons.movie_outlined;
     }
     if (const {'mp3', 'flac', 'wav', 'aac', 'm4a'}.contains(ext)) {
-      return Icons.audiotrack_outlined;
+      return AppIcons.audiotrack_outlined;
     }
     if (const {'zip', 'rar', '7z', 'tar', 'gz'}.contains(ext)) {
-      return Icons.folder_zip_outlined;
+      return AppIcons.folder_zip_outlined;
     }
-    if (ext == 'pdf') return Icons.picture_as_pdf_outlined;
+    if (ext == 'pdf') return AppIcons.picture_as_pdf_outlined;
     if (const {
       'txt',
       'md',
@@ -1076,9 +1062,9 @@ class _FileTile extends StatelessWidget {
       'log',
       'csv',
     }.contains(ext)) {
-      return Icons.description_outlined;
+      return AppIcons.description_outlined;
     }
-    return Icons.insert_drive_file_outlined;
+    return AppIcons.insert_drive_file_outlined;
   }
 }
 
@@ -1102,12 +1088,12 @@ class _FileThumb extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final fallback = Icon(
+    final fallback = AppIconView(
       _FileTile._iconFor(name),
       color: scheme.onSurfaceVariant,
     );
 
-    final isImage = _FileTile._iconFor(name) == Icons.image_outlined;
+    final isImage = _FileTile._iconFor(name) == AppIcons.image_outlined;
     if (!isImage || size <= 0) {
       return SizedBox(width: 32, height: 32, child: Center(child: fallback));
     }
@@ -1124,8 +1110,8 @@ class _FileThumb extends StatelessWidget {
             if (bytes == null) {
               return Container(
                 color: scheme.surfaceContainerHighest,
-                child: Icon(
-                  Icons.image_outlined,
+                child: AppIconView(
+                  AppIcons.image_outlined,
                   size: 18,
                   color: scheme.onSurfaceVariant,
                 ),
@@ -1141,38 +1127,6 @@ class _FileThumb extends StatelessWidget {
             );
           },
         ),
-      ),
-    );
-  }
-}
-
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-  });
-
-  final IconData icon;
-  final String title;
-  final String subtitle;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 48, color: scheme.outline),
-          const SizedBox(height: 12),
-          Text(title, style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          Text(
-            subtitle,
-            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
-          ),
-        ],
       ),
     );
   }
@@ -1223,7 +1177,11 @@ class _CacheBanner extends StatelessWidget {
         ),
         child: Row(
           children: [
-            Icon(Icons.history, size: 16, color: scheme.onSurfaceVariant),
+            AppIconView(
+              AppIcons.history,
+              size: 16,
+              color: scheme.onSurfaceVariant,
+            ),
             const SizedBox(width: 8),
             Expanded(
               child: Text(

@@ -4,7 +4,9 @@ import 'package:provider/provider.dart';
 import '../models/transfer_task.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/empty_state.dart';
 import '../widgets/glass.dart';
+import '../widgets/app_icons.dart';
 
 /// 传输队列页：上传/下载任务列表，支持暂停、优先、重试、移除与批量操作。
 class TransfersPage extends StatefulWidget {
@@ -70,7 +72,11 @@ class _TransfersPageState extends State<TransfersPage> {
               hasFinished: hasFinished,
             ),
       body: s.tasks.isEmpty
-          ? const _EmptyTransfers()
+          ? const EmptyState(
+              icon: AppIcons.swap_vert,
+              title: '还没有传输任务',
+              subtitle: '在「文件」页上传或下载，进度会显示在这里',
+            )
           : ListView.separated(
               padding: kPagePadding,
               itemCount: s.tasks.length,
@@ -111,7 +117,7 @@ class _TransfersPageState extends State<TransfersPage> {
         if (s.tasks.isNotEmpty)
           PopupMenuButton<String>(
             tooltip: '批量操作',
-            icon: const Icon(Icons.more_vert),
+            icon: const AppIconView(AppIcons.more_vert),
             onSelected: (v) {
               switch (v) {
                 case 'pause':
@@ -132,7 +138,7 @@ class _TransfersPageState extends State<TransfersPage> {
                 enabled: hasQueued,
                 child: const ListTile(
                   dense: true,
-                  leading: Icon(Icons.pause_circle_outline),
+                  leading: AppIconView(AppIcons.pause_circle_outline),
                   title: Text('全部暂停'),
                 ),
               ),
@@ -141,7 +147,7 @@ class _TransfersPageState extends State<TransfersPage> {
                 enabled: hasPaused,
                 child: const ListTile(
                   dense: true,
-                  leading: Icon(Icons.play_circle_outline),
+                  leading: AppIconView(AppIcons.play_circle_outline),
                   title: Text('全部开始'),
                 ),
               ),
@@ -150,7 +156,7 @@ class _TransfersPageState extends State<TransfersPage> {
                 enabled: hasFailed,
                 child: const ListTile(
                   dense: true,
-                  leading: Icon(Icons.refresh),
+                  leading: AppIconView(AppIcons.refresh),
                   title: Text('全部重试'),
                 ),
               ),
@@ -159,7 +165,7 @@ class _TransfersPageState extends State<TransfersPage> {
                 enabled: hasFinished,
                 child: const ListTile(
                   dense: true,
-                  leading: Icon(Icons.cleaning_services_outlined),
+                  leading: AppIconView(AppIcons.cleaning_services_outlined),
                   title: Text('清除已完成'),
                 ),
               ),
@@ -167,7 +173,7 @@ class _TransfersPageState extends State<TransfersPage> {
                 value: 'removeAll',
                 child: const ListTile(
                   dense: true,
-                  leading: Icon(Icons.delete_sweep_outlined),
+                  leading: AppIconView(AppIcons.delete_sweep_outlined),
                   title: Text('移除全部'),
                 ),
               ),
@@ -181,41 +187,17 @@ class _TransfersPageState extends State<TransfersPage> {
     return AppBar(
       leading: IconButton(
         tooltip: '退出多选',
-        icon: const Icon(Icons.close),
+        icon: const AppIconView(AppIcons.close),
         onPressed: _exitSelection,
       ),
       title: Text('已选 ${_selected.length} 项'),
       actions: [
         IconButton(
           tooltip: '移除',
-          icon: const Icon(Icons.delete_outline),
+          icon: const AppIconView(AppIcons.delete_outline),
           onPressed: _selected.isEmpty ? null : () => _removeSelected(s),
         ),
       ],
-    );
-  }
-}
-
-class _EmptyTransfers extends StatelessWidget {
-  const _EmptyTransfers();
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.swap_vert, size: 48, color: scheme.outline),
-          const SizedBox(height: 12),
-          Text('没有传输任务', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          Text(
-            '在「文件」页上传或下载后，任务会出现在这里',
-            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
-          ),
-        ],
-      ),
     );
   }
 }
@@ -265,10 +247,10 @@ class _TaskTile extends StatelessWidget {
                   onChanged: running ? null : (_) => onToggle(),
                   visualDensity: VisualDensity.compact,
                 ),
-              Icon(
+              AppIconView(
                 task.kind == TransferKind.upload
-                    ? Icons.upload_file
-                    : Icons.download,
+                    ? AppIcons.upload_file
+                    : AppIcons.download,
                 size: 20,
                 color: done
                     ? scheme.primary
@@ -351,31 +333,34 @@ class _TaskTile extends StatelessWidget {
                 if (queued) ...[
                   TextButton.icon(
                     onPressed: onPrioritize,
-                    icon: const Icon(Icons.vertical_align_top, size: 16),
+                    icon: const AppIconView(
+                      AppIcons.vertical_align_top,
+                      size: 16,
+                    ),
                     label: const Text('优先'),
                   ),
                   TextButton.icon(
                     onPressed: onPause,
-                    icon: const Icon(Icons.pause, size: 16),
+                    icon: const AppIconView(AppIcons.pause, size: 16),
                     label: const Text('暂停'),
                   ),
                 ],
                 if (paused)
                   TextButton.icon(
                     onPressed: onResume,
-                    icon: const Icon(Icons.play_arrow, size: 16),
+                    icon: const AppIconView(AppIcons.play_arrow, size: 16),
                     label: const Text('开始'),
                   ),
                 if (failed)
                   TextButton.icon(
                     onPressed: onRetry,
-                    icon: const Icon(Icons.refresh, size: 16),
+                    icon: const AppIconView(AppIcons.refresh, size: 16),
                     label: const Text('重试'),
                   ),
                 TextButton.icon(
                   onPressed: onRemove,
                   style: TextButton.styleFrom(foregroundColor: scheme.error),
-                  icon: const Icon(Icons.delete_outline, size: 16),
+                  icon: const AppIconView(AppIcons.delete_outline, size: 16),
                   label: const Text('移除'),
                 ),
               ],

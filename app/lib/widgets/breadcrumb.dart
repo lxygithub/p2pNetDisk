@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../state/app_state.dart';
+import '../widgets/app_icons.dart';
 
 /// 路径面包屑：`/ › photos › 2026`，每段可点回对应层级。
 ///
@@ -26,7 +27,7 @@ class Breadcrumb extends StatelessWidget {
             IconButton(
               tooltip: '上一级',
               visualDensity: VisualDensity.compact,
-              icon: const Icon(Icons.arrow_upward, size: 18),
+              icon: const AppIconView(AppIcons.arrow_upward, size: 18),
               onPressed: s.busy ? null : s.goUp,
             ),
             Expanded(
@@ -44,8 +45,8 @@ class Breadcrumb extends StatelessWidget {
                       child: const Text('/'),
                     ),
                     for (var i = 0; i < parts.length; i++) ...[
-                      Icon(
-                        Icons.chevron_right,
+                      AppIconView(
+                        AppIcons.chevron_right,
                         size: 16,
                         color: scheme.outline,
                       ),

@@ -1273,6 +1273,21 @@ Android 的开屏 logo 由系统 splash 持有，**Flutter 首帧一开始渲染
 
 **验证**：`flutter analyze` 无问题、`flutter test` 36 passed。纯 Dart 改动。
 
+### 4.27 UI 改版：自绘图标 + 居中空白页
+
+- **图标全部自绘**：`widgets/app_icons.dart` 用 `CustomPainter` 以 24×24 画布
+  手绘 47 种图标，统一 1.7px 圆头描边，不依赖 Material Icons 字体、不引第三方包。
+  对外暴露 `AppIcons.xxx` 语义常量（沿用 Material 命名便于替换）和 `AppIconView`
+  widget。项目里已无 `Icons.*` 系统图标引用。
+- **空白页严格居中**：`widgets/empty_state.dart` 用 `LayoutBuilder` +
+  `ConstrainedBox(minHeight: 视口高)` + `Center`，解决「把 Center 放进 ListView
+  只横向居中、文字贴顶」的问题；保留 `AlwaysScrollableScrollPhysics` 让下拉刷新可用。
+  文件页 / 传输页 / 搜索页统一使用。
+- **主题精修**：品牌色改为偏靛蓝紫（#5B6EF5），补齐完整字体层级（收紧标题字距、
+  加大正文行高），底部导航加大高度、圆角指示器、选中态配色。
+
+**验证**：`flutter analyze` 无问题、`flutter test` 36 passed。视觉效果需重打 APK 确认。
+
 ## 5. 平台落地（待工具链）
 
 **Windows 桌面**（本机缺 VS 2022）：

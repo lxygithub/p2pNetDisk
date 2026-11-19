@@ -10,6 +10,7 @@ import 'connection_page.dart';
 import '../theme.dart';
 import '../widgets/glass.dart';
 import '../widgets/path_chip.dart';
+import '../widgets/app_icons.dart';
 
 /// 设置页：连接状态、链路信息、后台运行与关于。
 ///
@@ -84,9 +85,7 @@ class _SettingsPageState extends State<SettingsPage>
     if (dir == null || dir.isEmpty) return;
     final ok = await s.setDownloadRoot(dir);
     if (!mounted) return;
-    _snack(
-      ok ? '下载位置已更新' : '该目录不可写（Android 11+ 公共目录需要系统授权），已保留原位置',
-    );
+    _snack(ok ? '下载位置已更新' : '该目录不可写（Android 11+ 公共目录需要系统授权），已保留原位置');
   }
 
   Future<void> _resetDownloadDir() async {
@@ -181,7 +180,7 @@ class _SettingsPageState extends State<SettingsPage>
                 width: double.infinity,
                 child: OutlinedButton.icon(
                   onPressed: _openConnectionPage,
-                  icon: const Icon(Icons.tune, size: 18),
+                  icon: const AppIconView(AppIcons.tune, size: 18),
                   label: const Text('编辑连接参数'),
                 ),
               ),
@@ -196,7 +195,7 @@ class _SettingsPageState extends State<SettingsPage>
                           height: 16,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
-                      : const Icon(Icons.link),
+                      : const AppIconView(AppIcons.link),
                   label: Text(s.connected ? '重新连接' : '连接'),
                 ),
               ),
@@ -297,10 +296,7 @@ class _SettingsPageState extends State<SettingsPage>
     return _SectionCard(
       title: '下载',
       children: [
-        _InfoRow(
-          label: '保存到',
-          value: path.isEmpty ? '默认位置（首次下载时创建）' : path,
-        ),
+        _InfoRow(label: '保存到', value: path.isEmpty ? '默认位置（首次下载时创建）' : path),
         _InfoRow(
           label: '卸载后',
           value: path.isEmpty
@@ -332,7 +328,7 @@ class _SettingsPageState extends State<SettingsPage>
             width: double.infinity,
             child: FilledButton.icon(
               onPressed: _grantPublicStorage,
-              icon: const Icon(Icons.folder_special, size: 18),
+              icon: const AppIconView(AppIcons.folder_special, size: 18),
               label: const Text('授予公共目录访问'),
             ),
           ),
@@ -342,7 +338,7 @@ class _SettingsPageState extends State<SettingsPage>
           width: double.infinity,
           child: OutlinedButton.icon(
             onPressed: _pickDownloadDir,
-            icon: const Icon(Icons.folder_open, size: 18),
+            icon: const AppIconView(AppIcons.folder_open, size: 18),
             label: const Text('选择保存位置'),
           ),
         ),
@@ -351,7 +347,7 @@ class _SettingsPageState extends State<SettingsPage>
           width: double.infinity,
           child: TextButton.icon(
             onPressed: _resetDownloadDir,
-            icon: const Icon(Icons.restore, size: 18),
+            icon: const AppIconView(AppIcons.restore, size: 18),
             label: const Text('恢复默认位置'),
           ),
         ),
@@ -394,7 +390,7 @@ class _SettingsPageState extends State<SettingsPage>
             width: double.infinity,
             child: FilledButton.icon(
               onPressed: _requestIgnoreBattery,
-              icon: const Icon(Icons.battery_saver_outlined),
+              icon: const AppIconView(AppIcons.battery_saver_outlined),
               label: const Text('关闭电池优化'),
             ),
           ),
@@ -404,7 +400,7 @@ class _SettingsPageState extends State<SettingsPage>
           width: double.infinity,
           child: OutlinedButton.icon(
             onPressed: _openAutoStart,
-            icon: const Icon(Icons.tune),
+            icon: const AppIconView(AppIcons.tune),
             label: const Text('自启动 / 后台管理设置'),
           ),
         ),

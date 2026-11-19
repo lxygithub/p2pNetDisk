@@ -10,6 +10,7 @@ import '../models/transfer_task.dart';
 import '../state/app_state.dart';
 import '../widgets/glass.dart';
 import '../widgets/text_input_dialog.dart';
+import '../widgets/app_icons.dart';
 
 /// 文件预览。
 ///
@@ -221,19 +222,19 @@ class _PreviewPageState extends State<PreviewPage> {
         actions: [
           IconButton(
             tooltip: '下载',
-            icon: const Icon(Icons.download_outlined),
+            icon: const AppIconView(AppIcons.download_outlined),
             onPressed: () => unawaited(_download()),
           ),
           PopupMenuButton<String>(
             tooltip: '更多操作',
-            icon: const Icon(Icons.more_vert),
+            icon: const AppIconView(AppIcons.more_vert),
             onSelected: _onAction,
             itemBuilder: (_) => const [
               PopupMenuItem(
                 value: 'rename',
                 child: ListTile(
                   dense: true,
-                  leading: Icon(Icons.drive_file_rename_outline),
+                  leading: AppIconView(AppIcons.drive_file_rename_outline),
                   title: Text('重命名'),
                 ),
               ),
@@ -241,7 +242,7 @@ class _PreviewPageState extends State<PreviewPage> {
                 value: 'delete',
                 child: ListTile(
                   dense: true,
-                  leading: Icon(Icons.delete_outline),
+                  leading: AppIconView(AppIcons.delete_outline),
                   title: Text('删除'),
                 ),
               ),
@@ -266,7 +267,12 @@ class _PreviewPageState extends State<PreviewPage> {
                   _ZoomableImage(key: ValueKey(_images[i]), remote: _images[i]),
             ),
           ),
-          Positioned(left: 0, right: 0, bottom: 0, child: Center(child: _hint())),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Center(child: _hint()),
+          ),
         ],
       );
     }
@@ -278,8 +284,8 @@ class _PreviewPageState extends State<PreviewPage> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                Icons.insert_drive_file_outlined,
+              AppIconView(
+                AppIcons.insert_drive_file_outlined,
                 size: 44,
                 color: Theme.of(context).colorScheme.outline,
               ),
@@ -372,8 +378,8 @@ class _PreviewPageState extends State<PreviewPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              Icons.error_outline,
+            AppIconView(
+              AppIcons.error_outline,
               color: Theme.of(context).colorScheme.error,
             ),
             const SizedBox(height: 8),
@@ -381,7 +387,7 @@ class _PreviewPageState extends State<PreviewPage> {
             const SizedBox(height: 14),
             FilledButton.icon(
               onPressed: onRetry,
-              icon: const Icon(Icons.refresh, size: 18),
+              icon: const AppIconView(AppIcons.refresh, size: 18),
               label: const Text('重试'),
             ),
           ],
@@ -473,8 +479,8 @@ class _ZoomableImageState extends State<_ZoomableImage> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                Icons.broken_image_outlined,
+              AppIconView(
+                AppIcons.broken_image_outlined,
                 size: 40,
                 color: Theme.of(context).colorScheme.error,
               ),
@@ -489,7 +495,7 @@ class _ZoomableImageState extends State<_ZoomableImage> {
                   });
                   _load();
                 },
-                icon: const Icon(Icons.refresh, size: 18),
+                icon: const AppIconView(AppIcons.refresh, size: 18),
                 label: const Text('重试'),
               ),
             ],
