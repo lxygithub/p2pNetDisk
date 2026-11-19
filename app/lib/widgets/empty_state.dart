@@ -17,7 +17,7 @@ class EmptyState extends StatelessWidget {
     this.action,
   });
 
-  final AppIcon icon;
+  final IconData icon;
   final String title;
   final String subtitle;
 

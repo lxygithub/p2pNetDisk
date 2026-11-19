@@ -627,7 +627,7 @@ class _SelectionAction extends StatelessWidget {
     required this.onTap,
   });
 
-  final AppIcon icon;
+  final IconData icon;
   final String label;
   final bool enabled;
   final VoidCallback onTap;
@@ -1030,7 +1030,7 @@ class _FileTile extends StatelessWidget {
     );
   }
 
-  static AppIcon _iconFor(String name) {
+  static IconData _iconFor(String name) {
     final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
     if (const {
       'jpg',

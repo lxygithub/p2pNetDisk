@@ -15,8 +15,10 @@ import '../services/list_cache.dart';
 import '../services/path_utils.dart';
 import '../services/storage_access.dart';
 import '../services/transfer_notifications.dart';
+import '../services/theme_prefs.dart';
 import '../services/transfer_store.dart';
 import '../src/netdisk_worker.dart';
+import '../theme.dart';
 
 /// 默认走 n0 官方公共 relay（实测 aps1-1/euc1-1 握手 8/8，自建港服仅 2/8）。
 const kDefaultRelay = 'n0';
@@ -108,6 +110,23 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool get endpointConfigured {
     final id = splitEndpointAddr(serverAddr).id.trim();
     return id.isNotEmpty && id != 'YOUR_ENDPOINT_ID';
+  }
+
+  /// 当前主题风格（切换后 main() 会重建 MaterialApp）。
+  AppTheme appTheme = AppTheme.ocean;
+
+  /// 启动时读取保存的主题偏好。
+  Future<void> restoreTheme() async {
+    appTheme = await ThemePrefs.read();
+    notifyListeners();
+  }
+
+  /// 切换主题并持久化。
+  Future<void> setTheme(AppTheme theme) async {
+    if (appTheme == theme) return;
+    appTheme = theme;
+    notifyListeners();
+    await ThemePrefs.save(theme);
   }
 
   /// 当前显示的列表是否来自本地缓存（还没被真实列表替换）。

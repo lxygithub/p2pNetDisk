@@ -230,6 +230,8 @@ class _SettingsPageState extends State<SettingsPage>
           const SizedBox(height: 16),
           _downloadCard(s),
           const SizedBox(height: 16),
+          _appearanceCard(s),
+          const SizedBox(height: 16),
           _backgroundCard(),
           const SizedBox(height: 16),
           _SectionCard(
@@ -418,6 +420,46 @@ class _SettingsPageState extends State<SettingsPage>
       ],
     );
   }
+}
+
+/// 外观主题切换：保留原来的「深邃蓝」，新增「清新自然」。
+Widget _appearanceCard(AppState s) {
+  return _SectionCard(
+    title: '外观',
+    children: [
+      Builder(
+        builder: (context) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '选择配色风格，切换后立即生效并记住',
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 12),
+            SegmentedButton<AppTheme>(
+              segments: [
+                ButtonSegment(
+                  value: AppTheme.ocean,
+                  label: Text(AppTheme.ocean.label),
+                ),
+                ButtonSegment(
+                  value: AppTheme.nature,
+                  label: Text(AppTheme.nature.label),
+                ),
+              ],
+              selected: {s.appTheme},
+              onSelectionChanged: (set) {
+                if (set.isNotEmpty) unawaited(s.setTheme(set.first));
+              },
+            ),
+          ],
+        ),
+      ),
+    ],
+  );
 }
 
 class _SectionCard extends StatelessWidget {

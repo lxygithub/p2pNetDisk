@@ -44,16 +44,19 @@ class NetdiskApp extends StatelessWidget {
         final state = AppState(savedConfig: savedConfig);
         // 启动即自动连接并拉列表，用户不用先点「连接」。
         if (autoConnect) unawaited(state.bootstrap());
+        unawaited(state.restoreTheme());
         return state;
       },
-      child: MaterialApp(
-        title: 'p2pNetDisk',
-        debugShowCheckedModeBanner: false,
-        builder: (context, child) =>
-            GlassBackground(child: child ?? const SizedBox.shrink()),
-        theme: buildAppTheme(Brightness.light),
-        darkTheme: buildAppTheme(Brightness.dark),
-        home: const HomeShell(),
+      child: Consumer<AppState>(
+        builder: (context, state, _) => MaterialApp(
+          title: 'p2pNetDisk',
+          debugShowCheckedModeBanner: false,
+          builder: (context, child) =>
+              GlassBackground(child: child ?? const SizedBox.shrink()),
+          theme: buildAppTheme(Brightness.light, style: state.appTheme),
+          darkTheme: buildAppTheme(Brightness.dark, style: state.appTheme),
+          home: const HomeShell(),
+        ),
       ),
     );
   }

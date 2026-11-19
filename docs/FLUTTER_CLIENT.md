@@ -1288,6 +1288,32 @@ Android 的开屏 logo 由系统 splash 持有，**Flutter 首帧一开始渲染
 
 **验证**：`flutter analyze` 无问题、`flutter test` 36 passed。视觉效果需重打 APK 确认。
 
+### 4.28 图标字体与主题切换
+
+**图标字体**：`widgets/app_icons.dart` 改用 **Remix Icon v4.9.1** 字体图标
+（53 个 `AppIcons.xxx` 语义常量映射到字体码点）。选它而不是 iconfont 是因为
+后者图标由各设计师上传、授权参差；Remix Icon 是 Remix Design 的开源项目，
+Remix Icon License 1.0 明确允许商用与移动应用，许可证存在 `assets/fonts/REMIXICON_LICENSE.txt`。
+
+- 字体文件 `assets/fonts/remixicon.ttf`（613KB），在 pubspec 的 `fonts` 里声明为
+  `RemixIcon` 字体族，**不需要 flutter_svg 等第三方 Dart 依赖**。
+- 对外接口（`AppIcons.xxx`、`AppIconView`）保持不变，业务代码零改动。
+- `AppIconView.stroke` 参数保留以兼容旧调用，但字体图标线宽由字体决定。
+
+**主题切换**：`AppTheme` 枚举两个风格：
+
+| 风格 | 品牌色 | 背景 |
+|---|---|---|
+| 深邃蓝（原主题） | #5B6EF5 | 冷调蓝紫渐变 |
+| 清新自然 | #4E9A6E | 米白/浅绿、深色为墨绿 |
+
+- 主题偏好存在 `services/theme_prefs.dart` 的 `theme.json`，独立于连接配置；
+- `main()` 启动时 `restoreTheme()`，用 `Consumer<AppState>` 响应切换，立即重建 MaterialApp；
+- 设置页「外观」卡片用 `SegmentedButton` 切换；
+- `GlassBackground` 按主题切换背景渐变色。
+
+**验证**：`flutter analyze` 无问题、`flutter test` 36 passed。字体渲染与配色效果需重打 APK 确认。
+
 ## 5. 平台落地（待工具链）
 
 **Windows 桌面**（本机缺 VS 2022）：

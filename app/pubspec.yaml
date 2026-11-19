@@ -82,6 +82,12 @@ flutter:
   assets:
     - assets/images/logo.png
 
+  # Remix Icon v4.9.1 图标字体（Remix Icon License 1.0，允许商用/移动应用）
+  fonts:
+    - family: RemixIcon
+      fonts:
+        - asset: assets/fonts/remixicon.ttf
+
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
 

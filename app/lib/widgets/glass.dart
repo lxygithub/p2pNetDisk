@@ -2,6 +2,8 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 
+import '../theme.dart';
+
 /// 毛玻璃背景：柔和渐变 + 两团径向光斑，作为整套 UI 的底。
 ///
 /// 光斑用 `RadialGradient` 而不是 `ImageFilter.blur` 画圆 —— 后者在低端机上
@@ -15,6 +17,20 @@ class GlassBackground extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final dark = scheme.brightness == Brightness.dark;
+    final nature = scheme.primary.toARGB32() == AppTheme.nature.seed;
+
+    // 自然主题用米白/浅绿与深墨绿，深邃蓝保持原来的冷色调。
+    final colors = dark
+        ? (nature
+              ? const [Color(0xFF0C1712), Color(0xFF14251C), Color(0xFF0A1410)]
+              : const [Color(0xFF0B0F1A), Color(0xFF141A2C), Color(0xFF0A0E17)])
+        : (nature
+              ? const [Color(0xFFF1F7EF), Color(0xFFFAFBF5), Color(0xFFE7F1E6)]
+              : const [
+                  Color(0xFFEDF1FF),
+                  Color(0xFFF8FAFF),
+                  Color(0xFFE8EEFF),
+                ]);
 
     return Stack(
       children: [
@@ -24,17 +40,7 @@ class GlassBackground extends StatelessWidget {
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
-                colors: dark
-                    ? const [
-                        Color(0xFF0B0F1A),
-                        Color(0xFF141A2C),
-                        Color(0xFF0A0E17),
-                      ]
-                    : const [
-                        Color(0xFFEDF1FF),
-                        Color(0xFFF8FAFF),
-                        Color(0xFFE8EEFF),
-                      ],
+                colors: colors,
               ),
             ),
           ),

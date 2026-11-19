@@ -1,12 +1,28 @@
 import 'package:flutter/material.dart';
 
+/// 可选主题风格。
+enum AppTheme {
+  ocean('深邃蓝', 0xFF5B6EF5),
+  nature('清新自然', 0xFF4E9A6E);
+
+  const AppTheme(this.label, this.seed);
+
+  final String label;
+  final int seed;
+
+  static AppTheme fromName(String? name) => AppTheme.values.firstWhere(
+    (t) => t.name == name,
+    orElse: () => AppTheme.ocean,
+  );
+}
+
 /// 应用主题。Material 3 + 单一品牌色派生，统一圆角与留白。
-///
-/// 品牌色用偏靛的蓝紫（#5B6EF5），比原来的纯蓝更有层次，
-/// 和毛玻璃背景的冷色调也更协调。
-ThemeData buildAppTheme(Brightness brightness) {
+ThemeData buildAppTheme(
+  Brightness brightness, {
+  AppTheme style = AppTheme.ocean,
+}) {
   final scheme = ColorScheme.fromSeed(
-    seedColor: const Color(0xFF5B6EF5),
+    seedColor: Color(style.seed),
     brightness: brightness,
   );
 
