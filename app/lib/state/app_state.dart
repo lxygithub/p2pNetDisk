@@ -147,11 +147,15 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       for (var attempt = 1; attempt <= 3; attempt++) {
         await connect();
         if (connected) {
-          await refresh(firstLoad: true);
+          // connect 阶段已经顺带拉过列表了（ping 与首屏 list 合并），
+          // 没必要再发一次同样的 RPC。
+          if (!_connectFetchedList) {
+            await refresh(firstLoad: true);
+          }
           return;
         }
         if (attempt < 3) {
-          final wait = Duration(seconds: attempt * 2);
+          final wait = Duration(seconds: attempt);
           status = '连接失败，${wait.inSeconds} 秒后重试（$attempt/3）…';
           notifyListeners();
           await Future<void>.delayed(wait);
@@ -544,6 +548,34 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     });
   }
 
+  /// .so 版本只会变在重新打包时，进程内校验一次就够了。
+  /// 之前每次重连都发一次 version() RPC，纯浪费一个 isolate 往返。
+  bool _libVersionChecked = false;
+
+  /// connect 阶段已经顺带把列表拉回来了，bootstrap 就不用再 refresh 一次。
+  bool _connectFetchedList = false;
+
+  /// 把一次成功的 list 结果应用到界面状态（connect 预取与下拉刷新共用）。
+  void _applyListResult(
+    List<({String path, int size, bool isDir})> list, {
+    required int elapsedMs,
+    required bool setStatus,
+  }) {
+    files = list;
+    showingCache = false;
+    cacheTime = null;
+    lastListMs = elapsedMs;
+    rpcHealthy = true;
+    // 当前目录可能已被删除/重命名，退回根目录避免停在空视图。
+    if (cwd.isNotEmpty && !files.any((f) => f.path.startsWith(cwd))) {
+      cwd = '';
+    }
+    unawaited(ListCache.write(serverAddr.hashCode.toString(), files));
+    if (setStatus) {
+      status = '共 ${files.length} 个文件 · 列表 ${elapsedMs}ms';
+    }
+  }
+
   Future<void> _doConnect() async {
     for (var attempt = 1; attempt <= 2; attempt++) {
       final error = await _attemptConnect();
@@ -576,13 +608,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// 单次连接尝试。成功返回 null，失败返回错误文本（不直接覆盖 status）。
   Future<String?> _attemptConnect() async {
+    // 每次连接都重新判定「列表是否在这次连接里拉到的」，避免上一次的
+    // 标记残留，让后续 refresh 误以为已经拉过而跳过。
+    _connectFetchedList = false;
+
     // 先释放旧的 endpoint 句柄。
     //
     // 掉线时 worker 通常没「卡死」，connect() 会复用它，旧的 iroh endpoint
     // 就一直活着；再 init 一个同身份（同一 secret）的新 endpoint，两者的
     // relay 注册/连接互相干扰，重连就永远失败 —— 表现正是「杀进程重开才好」。
     // 必须显式 netdisk_close 把旧 endpoint drop 掉。
-    if (!_worker.isStuck) {
+    if (!_worker.isStuck && _worker.isRunning) {
       await _worker.closeConnection();
       // relay/QUIC 侧清理旧连接需要一点时间，太紧地接着 bind 容易被判成重复连接。
       await Future<void>.delayed(const Duration(milliseconds: 300));
@@ -608,29 +644,40 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     try {
       await _worker.start(libraryPath: Platform.environment['NETDISK_FFI_DLL']);
 
-      // 前置校验：确认打包进 APK 的 .so 与当前 UI 版本匹配。
-      final ver = await _worker.version();
-      if (ver == null || !ver.contains('n0')) {
-        return '动态库过旧（不支持 n0）：请重新交叉编译 .so 后再打 APK';
+      // .so 版本校验：进程内只做一次，后面重连直接跳过。
+      if (!_libVersionChecked) {
+        final ver = await _worker.version();
+        if (ver == null || !ver.contains('n0')) {
+          return '动态库过旧（不支持 n0）：请重新交叉编译 .so 后再打 APK';
+        }
+        _libVersionChecked = true;
       }
 
-      status = '正在建立 endpoint…';
+      status = '正在连接…';
       notifyListeners();
       await _worker.init(relay, token, serverAddr);
 
-      // `init` 只是把本地 endpoint 建起来（打洞 / relay 注册），**不代表能连到
-      // 服务端**。之前这里直接 `connected = true`，链路其实不通时界面就显示
-      // 「已连接」，下拉刷新又超时 —— 也就是所谓的「虚假已连接」。
-      // 用一次真实 RPC 验证：ping 通才算连上。
+      // 关键优化：把原来的 ping(验证) + 首屏 refresh(list) 两次往返合并成一次。
       //
-      // 给 30s：打洞失败只能走 relay 时，端到端 RTT 实测能到 2s 以上
-      // （家宽 CGNAT + 海外 relay），QUIC 握手 + 首包 10s 都不够。
-      // 宁可慢一点连上，也不要让「明明能通」的连接被判死。
-      await _worker.ping(timeLimit: const Duration(seconds: 30));
+      // `init` 只把本地 endpoint 建起来，**不代表能连到服务端** —— 这正是
+      // 之前「虚假已连接」的成因。但用 ping 单独验证、回头 refresh 再 list
+      // 是两次完整往返，弱网下（relay RTT 2s）等于白等一轮。
+      // 直接 list：成功即证明 RPC 通道可用，拿到的列表顺手填进首屏。
+      final sw = Stopwatch()..start();
+      final fetched = await _worker.list(
+        timeLimit: const Duration(seconds: 30),
+        maxAttempts: 2,
+      );
+      _applyListResult(
+        fetched,
+        elapsedMs: sw.elapsedMilliseconds,
+        setStatus: false,
+      );
+      _connectFetchedList = true;
 
       connected = true;
       rpcHealthy = true;
-      status = '已连接';
+      status = '已连接 · ${files.length} 个文件';
       _startHeartbeat();
       unawaited(_syncTransferPool());
       // 路径摘要只在 RPC 成功后才可信，主动探一次，顶部才有状态可显示。
@@ -823,19 +870,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           }
         },
       );
-      files = list;
-      showingCache = false;
-      cacheTime = null;
-      lastListMs = sw.elapsedMilliseconds;
-      rpcHealthy = true;
-      // 当前目录可能已被删除/重命名，退回根目录避免停在空视图。
-      if (cwd.isNotEmpty && !files.any((f) => f.path.startsWith(cwd))) {
-        cwd = '';
-      }
-      if (!silent) {
-        status = '共 ${files.length} 个文件 · 列表 ${lastListMs}ms';
-      }
-      unawaited(ListCache.write(serverAddr.hashCode.toString(), files));
+      _connectFetchedList = false;
+      _applyListResult(
+        list,
+        elapsedMs: sw.elapsedMilliseconds,
+        setStatus: !silent,
+      );
     } catch (e) {
       rpcHealthy = false;
       // worker 被一条取消不了的 FFI 调用堵死了。此时再发请求只会排队，

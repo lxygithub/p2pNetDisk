@@ -1255,6 +1255,24 @@ Android 的开屏 logo 由系统 splash 持有，**Flutter 首帧一开始渲染
 真正需要网络的步骤（建 endpoint、拉列表）本来就在 `unawaited(bootstrap())`
 里跑，不阻塞首帧。
 
+### 4.26 重连链路提速
+
+冷启动到首页可用原本是 7 步串行：`close → start → version → init → ping → refresh → 重试`。
+优化后砍到 4 步（都去掉了纯等待）：
+
+- **ping 与首屏 list 合并**：两者都是「证明服务端可达」的往返。现在 `init` 之后
+  直接一次 `list`，成功即证明 RPC 通道可用，列表顺手填进首屏；
+  `bootstrap` 看到 `_connectFetchedList` 就不再重复 `refresh`。弱网下省掉一整轮 RTT。
+- **version 校验只做一次**：`.so` 只在重新打包时变，进程内缓存 `_libVersionChecked`，
+  后续重连不再发 version RPC。
+- **冷启动跳过 300ms**：那 300ms 本来是给「关闭旧 endpoint」留的清理时间，
+  首次启动时 worker 根本没运行过，白等。改成 `closeConnection` 真的执行过才等。
+- **重试退避 2s/4s → 1s/2s**，失败反馈更快。
+
+状态文案也收敛成「正在连接…」→「已连接 · N 个文件」，少了中间态闪烁。
+
+**验证**：`flutter analyze` 无问题、`flutter test` 36 passed。纯 Dart 改动。
+
 ## 5. 平台落地（待工具链）
 
 **Windows 桌面**（本机缺 VS 2022）：
